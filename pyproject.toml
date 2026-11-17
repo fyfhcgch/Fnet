@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fnet"
+name = "fnet-ctf"
 version = "2.19.0"
 description = "Fnet - 开源 CTF 网络流量分析工具箱（WebUI，Linux/macOS/Windows）"
 readme = "README.md"

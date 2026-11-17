@@ -50,5 +50,8 @@
 ## 分发与生态
 
 - [x] **Docker 镜像**：内置 `tshark` 与可选工具，一条命令启动 WebUI
-- [ ] **包发布**：构建配置与 GitHub Actions 发布工作流已完成；实际上传到
-      PyPI 仍需要维护者配置账号或 Trusted Publisher 凭据，代码侧无剩余工作
+- [x] **包发布准备**：PyPI 名称 `fnet` 已被其他项目占用，发行名改为
+      `fnet-ctf`（命令仍是 `fnet`）；`pyproject.toml`、`publish.yml`、
+      `docs/RELEASE.md` 与本地 `build`/`twine check` 均已验证
+- [ ] **实际上传 PyPI**：仍需要维护者在 PyPI 配置 `fnet-ctf` 的 Trusted
+      Publisher（或账号凭据）并打 `v*` 标签；没有凭据时无法由代码侧完成

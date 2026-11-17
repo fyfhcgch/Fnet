@@ -2,8 +2,8 @@ name: Publish to PyPI
 
 # Manual or tag driven release.  The actual upload uses PyPI Trusted
 # Publishing (OIDC), so no API token is stored in the repository.  Configure
-# the `pypi` environment and the trusted publisher on PyPI before the first
-# release; see docs/RELEASE.md.
+# the `pypi` environment and the trusted publisher for `fnet-ctf` on PyPI
+# before the first release; see docs/RELEASE.md.
 on:
   workflow_dispatch:
   push:
@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/fnet
+      url: https://pypi.org/p/fnet-ctf
     permissions:
       id-token: write
     steps:

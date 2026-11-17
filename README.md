@@ -46,9 +46,11 @@ WebUI 顶栏可切换中文 / English；大文件上传显示进度并可按 `Es
 分析过程中可在功能边界暂停/继续，也可在“任务历史”里对比两个任务的结果。
 工具栏的“实时抓包”会枚举 `tshark -D` 的网卡，停止后可直接送入分析。
 
-也可以安装成命令：
+也可以安装成命令（PyPI 发行名为 `fnet-ctf`，安装后仍是 `fnet` 命令）：
 
 ```bash
+pipx install fnet-ctf
+# 或从源码
 python3 -m pip install .
 fnet
 ```
