@@ -45,7 +45,7 @@ class SiteVersionTest(unittest.TestCase):
 
     def test_pages_source_excludes_developer_files(self):
         config = SITE_CONFIG.read_text(encoding="utf-8")
-        for name in ("README.md", "TODO.md", "tests", "fnet"):
+        for name in ("README.md", "tests", "fnet"):
             self.assertRegex(config, rf"(?ms)^exclude:.*^\s*-\s*{re.escape(name)}\s*$")
 
     def test_page_layout_override_applies_homepage_hero(self):

@@ -1,6 +1,6 @@
 """Command line entry point (``fnet`` / ``python -m fnet``).
 
-Two modes:
+Modes:
 
 ``fnet [capture.pcapng]``
     Start the local WebUI and open the browser.  Optionally pre-select a
@@ -8,6 +8,14 @@ Two modes:
 
 ``fnet -C capture.pcapng --features checkBox_10,http.extract``
     Run the analysis headless and stream the log to stdout.
+
+``fnet --mcp``
+    Serve the MCP (Model Context Protocol) tools over stdio (JSON-RPC 2.0,
+    newline-delimited); optional positional capture pre-loads the default
+    ``pcap_path`` for the ``analyze`` tool.
+
+``fnet --pcap-over-ip 18000``
+    Listen for PCAP-over-IP streams and analyse every received capture.
 """
 from __future__ import annotations
 
@@ -38,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=None, help="使用指定的 config.ini")
     parser.add_argument("--features", default="",
                         help="逗号分隔的功能（checkBox_10 或 http.extract），默认全部默认勾选项")
-    parser.add_argument("--all", action="store_true", help="运行全部 37 个功能")
+    parser.add_argument("--all", action="store_true", help="运行全部 45 个功能")
     parser.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
                         help="传给分析功能的额外参数，可重复")
     parser.add_argument("--json", action="store_true",
@@ -54,6 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="对比两个任务的 findings（输出新增/消失项）")
     parser.add_argument("--wpa-psk", default="",
                         help="已知 WPA/WPA2 PSK，用于解密 802.11 数据帧")
+    parser.add_argument("--mcp", action="store_true",
+                        help="以 MCP（Model Context Protocol）stdio 模式运行，"
+                             "供 Claude 等 LLM 客户端调用；位置参数 pcap 可预载默认流量包")
+    parser.add_argument("--pcap-over-ip", type=int, default=None, metavar="PORT",
+                        help="监听 127.0.0.1:PORT 接收 PCAP-over-IP 字节流，"
+                             "收到 pcap 后自动创建分析任务（地址可用 --host/config 覆盖）")
     parser.add_argument("--keytab", default="",
                         help="Kerberos keytab，用于解密 AS/TGS 响应与 PAC")
     parser.add_argument("--kerberos-password", default="",
@@ -307,6 +321,71 @@ def serve(args, runtime) -> int:
     return 0
 
 
+def run_mcp(args, runtime) -> int:
+    """``--mcp``：stdio MCP server；stdout 只输出 JSON-RPC 协议消息。"""
+    from fnet.mcp_server import MCPServer
+
+    default_features: list[str] | None = None
+    if args.features or args.all:
+        try:
+            default_features = select_features(args.features, args.all)
+        except SystemExit as exc:
+            print(str(exc.code), file=sys.stderr)
+            return 2
+    default_pcap = ""
+    if args.capture:
+        capture = Path(args.capture).expanduser()
+        if capture.is_file():
+            default_pcap = str(capture.resolve())
+        else:
+            print(f"警告: 流量包不存在: {capture}", file=sys.stderr)
+    server = MCPServer(runtime=runtime, default_pcap=default_pcap,
+                       default_features=default_features)
+    server.serve()
+    return 0
+
+
+def run_pcapoip(args, runtime) -> int:
+    """``--pcap-over-ip PORT``：监听 TCP 接收 pcap 字节流并自动分析。"""
+    from fnet.pcapoip import PcapOverIPServer
+
+    checkboxes = select_features(args.features, args.all)
+    if not checkboxes:
+        print("没有选择任何功能", file=sys.stderr)
+        return 2
+    params = _collect_params(args)
+    server = PcapOverIPServer(runtime, args.pcap_over_ip, host=args.host,
+                              features=checkboxes, params=params,
+                              shards=max(1, args.shards))
+    try:
+        server.start()
+    except OSError as exc:
+        logger.error(f"无法在 {server.host}:{server.port} 启动 PCAP-over-IP 监听: {exc}")
+        print(f"无法在 {server.host}:{server.port} 启动 PCAP-over-IP 监听: {exc}",
+              file=sys.stderr)
+        return 1
+    print(f"PCAP-over-IP 监听 {server.host}:{server.port}"
+          "（如需监听其他地址: fnet --host 0.0.0.0 --pcap-over-ip PORT）",
+          file=sys.stderr)
+    print(f"收到 pcap 后自动分析 {len(checkboxes)} 个功能；Ctrl+C 退出",
+          file=sys.stderr)
+    try:
+        while True:
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        print("\n正在停止 PCAP-over-IP 监听…", file=sys.stderr)
+    finally:
+        server.stop()
+    for job in server.jobs:
+        state = f"{job.status}（已完成 {len(job.completed)}/{len(job.features)}）" \
+            if job.status in ("paused", "interrupted") else job.status
+        print(f"任务 {job.id}: {state} | 输出目录: {job.output_dir}",
+              file=sys.stderr)
+    if server.jobs:
+        print("未完成的任务可用 fnet --resume <job-id> 继续", file=sys.stderr)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -335,6 +414,10 @@ def main(argv: list[str] | None = None) -> int:
         print("缺失工具: " + (", ".join(missing) if missing else "无"))
         return 0
 
+    if args.mcp:
+        return run_mcp(args, runtime)
+    if args.pcap_over_ip is not None:
+        return run_pcapoip(args, runtime)
     if args.cli:
         return run_headless(args, runtime)
     if args.resume:

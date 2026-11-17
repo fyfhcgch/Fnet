@@ -29,6 +29,7 @@ KINDS: tuple[dict[str, str], ...] = (
     {"key": "dns", "name": "DNS", "level": "warn"},
     {"key": "file", "name": "文件", "level": "info"},
     {"key": "protocol", "name": "协议", "level": "info"},
+    {"key": "tls_fingerprint", "name": "TLS 指纹", "level": "info"},
     {"key": "rule", "name": "自定义规则", "level": "warn"},
     {"key": "log", "name": "日志", "level": "info"},
     {"key": "other", "name": "其他", "level": "info"},
@@ -55,7 +56,7 @@ def _clean(value, limit: int) -> str:
 
 def make(kind: str, summary: str, *, frame="", detail: str = "",
          level: str = "info", feature: str = "", checkbox: str = "",
-         extra: dict | None = None) -> dict:
+         capture: str = "", extra: dict | None = None) -> dict:
     """Build one finding record with clipped, JSON-safe fields."""
     kind = str(kind or "other").strip().lower()
     if kind not in KIND_KEYS:
@@ -70,6 +71,9 @@ def make(kind: str, summary: str, *, frame="", detail: str = "",
         "summary": _clean(summary, MAX_SUMMARY),
         "detail": _clean(detail, MAX_DETAIL),
         "time": _dt.datetime.now().strftime("%H:%M:%S"),
+        #: Capture-side timestamp (e.g. ``frame.time``) when a handler can
+        #: supply it; the WebUI timeline prefers it over the wall-clock time.
+        "capture": _clean(capture, 40),
         "feature": _clean(feature, 120),
         "checkbox": _clean(checkbox, 40),
     }
@@ -99,6 +103,7 @@ def normalise(record, feature: str = "", checkbox: str = "") -> dict | None:
         "summary": summary,
         "detail": _clean(record.get("detail") or "", MAX_DETAIL),
         "time": _clean(record.get("time") or "", 40),
+        "capture": _clean(record.get("capture") or "", 40),
         "feature": _clean(record.get("feature") or feature, 120),
         "checkbox": _clean(record.get("checkbox") or checkbox, 40),
     }

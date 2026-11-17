@@ -33,10 +33,20 @@ def payload_text(value: str | bytes) -> str:
 
 
 def printable_ratio(data: bytes) -> float:
+    """Fraction of bytes that look like real text (ASCII + tab/newline/CR).
+
+    Bytes above 127 are deliberately *not* counted: counting them made
+    random ciphertext look ~75% printable and defeated the noise filters of
+    the decryption handlers.
+
+    实际计算委托给 ``fnet.utils.accel``：有关键字扫描的编码变换热点做了
+    可选 CUDA/JIT 加速；加速不可用或关闭时回退到本模块的纯 Python 实现，
+    结果逐位一致（延迟导入避免循环依赖）。
+    """
     if not data:
         return 0.0
-    good = sum(32 <= b < 127 or b in (9, 10, 13) or b > 127 for b in data)
-    return good / len(data)
+    from fnet.utils import accel
+    return accel.printable_ratio(data)
 
 
 def follow_stream(tshark: str, pcap: str | Path, index: int, mode: str = "ascii") -> str:

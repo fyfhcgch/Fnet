@@ -18,14 +18,17 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import hmac
 import ipaddress
 import os
 import re
+import struct
 import tempfile
 from collections import Counter
 from pathlib import Path
 
 from fnet.tools.runner import find_tool, run
+from fnet.utils.crypto import aes_encrypt_block, aes_gcm_decrypt
 
 PEM_RE = re.compile(
     r"-----BEGIN ([A-Z0-9 ]+)-----\r?\n(.*?)-----END \1-----", re.S)
@@ -551,3 +554,556 @@ def quic_connections(rows, *, limit: int = 400) -> list[dict]:
     result = sorted(connections.values(),
                     key=lambda item: item["frames"], reverse=True)
     return result[:limit]
+
+
+# ---------------------------------------------------------------------------
+# QUIC Initial packets without a keylog (RFC 8446 §7.1, RFC 9001 §5.2/§5.4)
+# ---------------------------------------------------------------------------
+#: Per-version Initial salts.  Every QUIC Initial uses these public constants,
+#: so the CRYPTO frames (and therefore the Client Hello) can be recovered
+#: without any keylog.  draft-29 predates QUIC v2 but shares the v1 scheme.
+QUIC_INITIAL_SALTS = {
+    0x00000001: bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a"),
+    0x6B3343CF: bytes.fromhex("0dede3def700a6db819381be6e269dcbf9bd2ed9"),
+    0x709A50C4: bytes.fromhex("0dede3def700a6db819381be6e269dcbf9bd2ed9"),
+    0xFF00001D: bytes.fromhex("afbfec289943d24c9a5e5fee14bd0efa5dfab56f"),
+}
+#: HKDF label variants per family: ``(label prefix, key prefix)``.  RFC 9369
+#: renames the QUIC v2 labels to the ``tls13quicv2 `` prefix; some early
+#: implementations (and Fnet's own sample generator) instead used
+#: ``tls13 `` + ``quicv2…``, so both are tried and the AEAD tag decides.
+QUIC_LABEL_VARIANTS = {
+    "v1": (("tls13 ", "quic"),),
+    "v2": (("tls13quicv2 ", "quic"), ("tls13 ", "quicv2")),
+}
+
+
+def hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
+    return hmac.new(salt, ikm, hashlib.sha256).digest()
+
+
+def hkdf_expand(secret: bytes, info: bytes, length: int) -> bytes:
+    out = b""
+    block = b""
+    counter = 1
+    while len(out) < length:
+        block = hmac.new(secret, block + info + bytes([counter]),
+                         hashlib.sha256).digest()
+        out += block
+        counter += 1
+    return out[:length]
+
+
+def hkdf_expand_label(secret: bytes, label: bytes, length: int,
+                      context: bytes = b"") -> bytes:
+    """RFC 8446 §7.1 HKDF-Expand-Label; ``label`` already carries its prefix."""
+    info = (struct.pack("!H", length) + bytes([len(label)]) + label
+            + bytes([len(context)]) + context)
+    return hkdf_expand(secret, info, length)
+
+
+def _quic_varint(data: bytes, offset: int) -> tuple[int, int]:
+    first = data[offset]
+    length = 1 << (first >> 6)
+    if offset + length > len(data):
+        raise ValueError("截断的 QUIC varint")
+    value = first & 0x3F
+    for shift in range(1, length):
+        value = (value << 8) | data[offset + shift]
+    return value, offset + length
+
+
+def _unprotect_quic_initial(packet: bytes, pn_offset: int,
+                            keys: dict) -> bytes | None:
+    """Remove header protection and decrypt one Initial payload (AES-GCM)."""
+    # The mask sample starts at pn_offset + 4 regardless of the PN length
+    # (RFC 9001 §5.4.2); the packet number length is recovered from the
+    # unmasked first byte.
+    sample = packet[pn_offset + 4:pn_offset + 20]
+    if len(sample) < 16:
+        return None
+    mask = aes_encrypt_block(sample, keys["hp"])
+    first = packet[0] ^ (mask[0] & 0x0F)
+    pn_len = (first & 0x03) + 1
+    if pn_offset + pn_len + 16 > len(packet):
+        return None
+    pn_raw = bytes(a ^ b for a, b in
+                   zip(packet[pn_offset:pn_offset + pn_len], mask[1:1 + pn_len]))
+    pn = int.from_bytes(pn_raw, "big")
+    nonce = bytes(a ^ b for a, b in zip(keys["iv"], pn.to_bytes(12, "big")))
+    aad = bytes([first]) + packet[1:pn_offset] + pn_raw
+    plain, ok = aes_gcm_decrypt(packet[pn_offset + pn_len:], keys["key"],
+                                nonce, aad)
+    return plain if ok else None
+
+
+def _quic_crypto_frames(plain: bytes) -> list[tuple[int, bytes]]:
+    """``[(offset, data)]`` for the CRYPTO frames in one decrypted payload."""
+    chunks: list[tuple[int, bytes]] = []
+    try:
+        pos = 0
+        while pos < len(plain):
+            frame_type, pos = _quic_varint(plain, pos)
+            if frame_type in (0x00, 0x01):          # PADDING / PING
+                continue
+            if frame_type in (0x02, 0x03):          # ACK / ACK_ECN
+                _largest, pos = _quic_varint(plain, pos)
+                _delay, pos = _quic_varint(plain, pos)
+                count, pos = _quic_varint(plain, pos)
+                for _ in range(min(count, 64)):
+                    _gap, pos = _quic_varint(plain, pos)
+                    _range, pos = _quic_varint(plain, pos)
+                if frame_type == 0x03:
+                    for _ in range(3):
+                        _ecn, pos = _quic_varint(plain, pos)
+                continue
+            if frame_type == 0x06:                  # CRYPTO
+                offset, pos = _quic_varint(plain, pos)
+                length, pos = _quic_varint(plain, pos)
+                if pos + length > len(plain):
+                    break
+                chunks.append((offset, plain[pos:pos + length]))
+                pos += length
+                continue
+            break                                   # unknown frame: stop
+    except (ValueError, IndexError):
+        return chunks
+    return chunks
+
+
+def quic_initial_crypto(packet) -> dict | None:
+    """Decrypt one QUIC long-header Initial packet without a keylog.
+
+    Derives the RFC 9001 Initial protection keys from the DCID (HKDF-Extract
+    with the version's known salt, then ``client in``/``server in`` and
+    ``quic key``/``quic iv``/``quic hp``), strips header protection and
+    AES-GCM-decrypts the payload.  Returns ``{"version", "dcid", "scid",
+    "crypto": [(offset, bytes)]}`` or ``None`` for Retry/version-negotiation/
+    unsupported versions/decryption failures (never raises).
+    """
+    try:
+        return _quic_initial_crypto(bytes(packet or b""))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _quic_initial_crypto(packet: bytes) -> dict | None:
+    if len(packet) < 6 or not packet[0] & 0x80 or not packet[0] & 0x40:
+        return None                                  # short/short-header
+    version = int.from_bytes(packet[1:5], "big")
+    if version == 0:                                 # version negotiation
+        return None
+    salt = QUIC_INITIAL_SALTS.get(version)
+    if salt is None:
+        return None
+    # v1 Initial is 0b00 and Retry 0b11; RFC 9369 swaps them (Initial 0b01).
+    initial_type = 1 if version in QUIC_V2_VERSIONS else 0
+    if (packet[0] >> 4) & 0x03 != initial_type:
+        return None                                  # Retry/0-RTT/Handshake
+    offset = 5
+    dcid_len = packet[offset]
+    offset += 1
+    dcid = packet[offset:offset + dcid_len]
+    offset += dcid_len
+    scid_len = packet[offset]
+    offset += 1
+    scid = packet[offset:offset + scid_len]
+    offset += scid_len
+    token_len, offset = _quic_varint(packet, offset)
+    offset += token_len
+    payload_len, offset = _quic_varint(packet, offset)
+    pn_offset = offset
+    if pn_offset + 21 > len(packet):
+        return None
+    end = min(pn_offset + payload_len, len(packet))
+    initial_secret = hkdf_extract(salt, dcid)
+    family = "v2" if version in QUIC_V2_VERSIONS else "v1"
+    for label_prefix, key_prefix in QUIC_LABEL_VARIANTS[family]:
+        for role in ("client", "server"):
+            secret = hkdf_expand_label(
+                initial_secret, (label_prefix + role + " in").encode("ascii"), 32)
+            keys = {
+                "key": hkdf_expand_label(
+                    secret,
+                    (label_prefix + key_prefix + " key").encode("ascii"), 16),
+                "iv": hkdf_expand_label(
+                    secret,
+                    (label_prefix + key_prefix + " iv").encode("ascii"), 12),
+                "hp": hkdf_expand_label(
+                    secret,
+                    (label_prefix + key_prefix + " hp").encode("ascii"), 16),
+            }
+            plain = _unprotect_quic_initial(packet[:end], pn_offset, keys)
+            if plain is None:
+                continue
+            return {
+                "version": version,
+                "dcid": dcid.hex(),
+                "scid": scid.hex(),
+                "crypto": _quic_crypto_frames(plain),
+            }
+    return None
+
+
+def quic_initial_fingerprints(packets, *, protocol: str = "q") -> list[dict]:
+    """Recover Client Hellos from raw QUIC Initial datagrams (no keylog).
+
+    ``packets`` holds raw UDP payloads, optionally as ``(label, bytes)`` tuples
+    where ``label`` is e.g. the frame number.  CRYPTO frame data is aggregated
+    per ``(version, dcid)``; the reassembled handshake stream is parsed with
+    :func:`parse_client_hello` and fingerprinted (JA3/JA4, ``q`` prefix per the
+    JA4+ spec for QUIC).  Only connections whose Client Hello could be
+    reassembled are returned; everything else is silently skipped.
+    """
+    streams: dict[tuple[int, str], dict[int, bytes]] = {}
+    labels: dict[tuple[int, str], list[str]] = {}
+    scids: dict[tuple[int, str], str] = {}
+    for item in packets or []:
+        if isinstance(item, (bytes, bytearray)):
+            label, raw = "", bytes(item)
+        else:
+            label, raw = str(item[0]), bytes(item[1])
+        parsed = quic_initial_crypto(raw)
+        if not parsed:
+            continue
+        key = (parsed["version"], parsed["dcid"])
+        bucket = streams.setdefault(key, {})
+        for offset, data in parsed["crypto"]:
+            bucket[offset] = data
+        scids.setdefault(key, parsed["scid"])
+        if label:
+            names = labels.setdefault(key, [])
+            if label not in names:
+                names.append(label)
+    results: list[dict] = []
+    for (version, dcid), bucket in streams.items():
+        stream = b""
+        for offset in sorted(bucket):
+            data = bucket[offset]
+            if offset + len(data) <= len(stream):
+                continue                    # duplicate / already covered
+            if offset > len(stream):        # gap: pad and keep going
+                stream += b"\x00" * (offset - len(stream))
+                stream += data
+            else:
+                stream = stream[:offset] + data
+        if not stream.startswith(b"\x01"):  # handshake must start with CH
+            continue
+        hello = parse_client_hello(stream)
+        if not hello:
+            continue
+        fp = fingerprints(hello, protocol=protocol)
+        key = (version, dcid)
+        results.append({
+            "version": version,
+            "version_name": quic_version_name(version),
+            "dcid": dcid,
+            "scid": scids.get(key, ""),
+            "frames": labels.get(key, []),
+            "sni": fp["sni"],
+            "alpn": hello.get("alpn") or [],
+            "ja3": fp["ja3"],
+            "ja4": fp["ja4"],
+            "hello": hello,
+        })
+    return results
+
+
+# ---------------------------------------------------------------------------
+# TLS fingerprinting: JA3 / JA3S / JA4 / JA4S
+# ---------------------------------------------------------------------------
+# JA3 follows the Salesforce definition (MD5 over "TLSVersion,Ciphers,
+# Extensions,EllipticCurves,EllipticCurvePointFormats"); JA4/JA4S follow the
+# FoxIO JA4+ specification (https://github.com/FoxIO-LLC/ja4).  Everything is
+# computed from plain dictionaries so callers can feed either the byte-level
+# parsers below or tshark field values.
+
+#: GREASE values (RFC 8701) that JA4 ignores wherever it sees them.
+GREASE_VALUES = frozenset(((value << 4) | 0xA) * 0x101 for value in range(16))
+#: JA4 short version codes for known protocol versions.
+JA4_VERSIONS = {
+    0x0002: "s2", 0x0300: "s3", 0x0301: "10", 0x0302: "11",
+    0x0303: "12", 0x0304: "13",
+    0xFEFF: "d1", 0xFEFD: "d2", 0xFEFC: "d3",
+}
+_EMPTY_HASH = "000000000000"
+_RECORD_CONTENTS = (0x14, 0x15, 0x16, 0x17)
+_DTLS_VERSIONS = (0xFEFF, 0xFEFD, 0xFEFC)
+
+
+def _hex4(value: int) -> str:
+    return f"{value & 0xFFFF:04x}"
+
+
+def _sha12(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _alnum_byte(value: int) -> bool:
+    return (0x30 <= value <= 0x39) or (0x41 <= value <= 0x5A) \
+        or (0x61 <= value <= 0x7A)
+
+
+def _alpn_tag(value) -> str:
+    """JA4 ALPN tag: first/last alphanumeric char, hex fallback, or ``00``."""
+    raw = bytes(value) if isinstance(value, (bytes, bytearray)) else \
+        str(value or "").encode("latin-1", "replace")
+    if not raw:
+        return "00"
+    if _alnum_byte(raw[0]) and _alnum_byte(raw[-1]):
+        return raw[:1].decode("ascii") + raw[-1:].decode("ascii")
+    hexs = raw.hex()
+    return hexs[0] + hexs[-1] if hexs else "00"
+
+
+def _ja4_version(hello: dict) -> str:
+    """JA4 version: highest non-GREASE supported_versions, else the hello one."""
+    supported = [value for value in (hello.get("supported_versions") or [])
+                 if value and value not in GREASE_VALUES]
+    version = max(supported) if supported else (hello.get("version") or 0)
+    return JA4_VERSIONS.get(version, "00")
+
+
+def _split_record(data: bytes) -> bytes:
+    """Return the handshake payload of a TLS/DTLS record (or bare input)."""
+    data = bytes(data or b"")
+    if len(data) >= 13 and data[0] == 0x16 and \
+            int.from_bytes(data[1:3], "big") in _DTLS_VERSIONS:
+        return data[13:13 + int.from_bytes(data[11:13], "big")]
+    if len(data) >= 5 and data[0] in _RECORD_CONTENTS:
+        return data[5:5 + int.from_bytes(data[3:5], "big")]
+    return data
+
+
+def _first_handshake(body: bytes, handshake_type: int) -> bytes | None:
+    """First handshake message of ``handshake_type`` inside a record payload."""
+    offset = 0
+    while offset + 4 <= len(body):
+        kind = body[offset]
+        length = int.from_bytes(body[offset + 1:offset + 4], "big")
+        start, end = offset + 4, offset + 4 + length
+        if kind == handshake_type:
+            return body[start:end if end <= len(body) else len(body)]
+        if end > len(body):
+            return None
+        offset = end
+    return None
+
+
+def _parse_extensions(body: bytes, offset: int, total: int) -> list[tuple]:
+    """``[(type, payload), ...]`` from an extension block, best effort."""
+    extensions: list[tuple] = []
+    end = min(offset + total, len(body))
+    pos = offset
+    while pos + 4 <= end:
+        etype = int.from_bytes(body[pos:pos + 2], "big")
+        length = int.from_bytes(body[pos + 2:pos + 4], "big")
+        extensions.append((etype, body[pos + 4:pos + 4 + length]))
+        pos += 4 + length
+    return extensions
+
+
+def _numbers(payload: bytes, width: int) -> list[int]:
+    values = []
+    for pos in range(0, len(payload) - width + 1, width):
+        values.append(int.from_bytes(payload[pos:pos + width], "big"))
+    return values
+
+
+def _from_extensions(extensions: list[tuple]) -> dict:
+    """Decode the fingerprint-relevant extensions into hello dict fields."""
+    hello: dict = {"sni": "", "alpn": [], "curves": [], "formats": [],
+                   "sig_algs": [], "supported_versions": []}
+    for etype, payload in extensions:
+        try:
+            if etype == 0:                       # server_name
+                names = int.from_bytes(payload[0:2], "big")
+                pos, end = 2, min(2 + names, len(payload))
+                while pos + 3 <= end:
+                    name_type = payload[pos]
+                    length = int.from_bytes(payload[pos + 1:pos + 3], "big")
+                    if name_type == 0:
+                        hello["sni"] = payload[pos + 3:pos + 3 + length] \
+                            .decode("utf-8", "replace")
+                    pos += 3 + length
+            elif etype == 10:                    # supported_groups
+                hello["curves"] = _numbers(payload[2:], 2)
+            elif etype == 11:                    # ec_point_formats
+                hello["formats"] = list(payload[1:1 + payload[0]]) \
+                    if payload else []
+            elif etype == 13:                    # signature_algorithms
+                hello["sig_algs"] = _numbers(payload[2:], 2)
+            elif etype == 16:                    # application_layer_protocol_negotiation
+                names = int.from_bytes(payload[0:2], "big")
+                pos, end = 2, min(2 + names, len(payload))
+                while pos + 1 <= end:
+                    length = payload[pos]
+                    hello["alpn"].append(
+                        payload[pos + 1:pos + 1 + length].decode("latin-1"))
+                    pos += 1 + length
+            elif etype == 43:                    # supported_versions (client)
+                hello["supported_versions"] = _numbers(payload[1:], 2)
+        except (IndexError, ValueError):
+            continue
+    return hello
+
+
+def parse_client_hello(data: bytes) -> dict | None:
+    """Minimal Client Hello parser (record or handshake message as input).
+
+    Returns ``{"version", "ciphers", "extensions", "curves", "formats",
+    "sig_algs", "supported_versions", "sni", "alpn"}`` or ``None`` when the
+    bytes are not a usable Client Hello.
+    """
+    body = _split_record(data)
+    hello_body = _first_handshake(body, 1) if body else None
+    if not hello_body or len(hello_body) < 34:
+        return None
+    try:
+        version = int.from_bytes(hello_body[0:2], "big")
+        offset = 34
+        offset += 1 + hello_body[offset]              # legacy_session_id
+        if offset + 2 > len(hello_body):
+            return None
+        cipher_len = int.from_bytes(hello_body[offset:offset + 2], "big")
+        offset += 2
+        ciphers = _numbers(hello_body[offset:offset + cipher_len], 2)
+        offset += cipher_len
+        if offset >= len(hello_body):
+            return None
+        offset += 1 + hello_body[offset]              # compression methods
+        extensions: list[tuple] = []
+        if offset + 2 <= len(hello_body):
+            extensions = _parse_extensions(
+                hello_body, offset + 2,
+                int.from_bytes(hello_body[offset:offset + 2], "big"))
+    except (IndexError, ValueError):
+        return None
+    hello = {"version": version, "ciphers": ciphers,
+             "extensions": [etype for etype, _payload in extensions]}
+    hello.update(_from_extensions(extensions))
+    return hello
+
+
+def parse_server_hello(data: bytes) -> dict | None:
+    """Minimal Server Hello parser returning the JA3S/JA4S relevant fields."""
+    body = _split_record(data)
+    hello_body = _first_handshake(body, 2) if body else None
+    if not hello_body or len(hello_body) < 39:
+        return None
+    try:
+        version = int.from_bytes(hello_body[0:2], "big")
+        offset = 34
+        offset += 1 + hello_body[offset]              # legacy_session_id_echo
+        if offset + 3 > len(hello_body):
+            return None
+        cipher = int.from_bytes(hello_body[offset:offset + 2], "big")
+        offset += 2
+        if offset >= len(hello_body):
+            return None
+        offset += 1 + hello_body[offset]              # compression methods
+        extensions: list[tuple] = []
+        if offset + 2 <= len(hello_body):
+            extensions = _parse_extensions(
+                hello_body, offset + 2,
+                int.from_bytes(hello_body[offset:offset + 2], "big"))
+    except (IndexError, ValueError):
+        return None
+    hello = {"version": version, "ciphers": [cipher] if cipher else [],
+             "extensions": [etype for etype, _payload in extensions],
+             "sni": ""}
+    decoded = _from_extensions(extensions)
+    for etype, payload in extensions:
+        if etype == 16 and payload:                    # server picks one ALPN
+            decoded["alpn"] = [payload[1:1 + payload[0]].decode("latin-1")]
+        elif etype == 43 and len(payload) == 2:        # negotiated version
+            decoded["supported_versions"] = [int.from_bytes(payload, "big")]
+    hello["alpn"] = decoded.pop("alpn", [])
+    hello["supported_versions"] = decoded.pop("supported_versions", [])
+    return hello
+
+
+def ja3_string(client_hello: dict) -> str:
+    """ JA3 string: ``TLSVersion,Ciphers,Extensions,Curves,PointFormats``."""
+    hello = client_hello or {}
+
+    def dash(values) -> str:
+        return "-".join(str(value) for value in values or [])
+
+    return ",".join([
+        str(hello.get("version") or 0),
+        dash(hello.get("ciphers")),
+        dash(hello.get("extensions")),
+        dash(hello.get("curves")),
+        dash(hello.get("formats")),
+    ])
+
+
+def ja3(client_hello: dict) -> str:
+    return hashlib.md5(ja3_string(client_hello).encode("utf-8")).hexdigest()
+
+
+def ja3s(server_hello: dict) -> str:
+    """JA3S: MD5 over ``version,cipher,extensions`` of the Server Hello."""
+    hello = server_hello or {}
+    extensions = "-".join(str(value) for value in hello.get("extensions") or [])
+    text = f"{hello.get('version') or 0},{(hello.get('ciphers') or [0])[0]},{extensions}"
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
+def ja4(client_hello: dict, *, protocol: str = "t") -> str:
+    """JA4 per the FoxIO JA4+ spec, e.g. ``t13d1516h2_8daaf6152771_b0…``."""
+    hello = client_hello or {}
+    ciphers = [value for value in hello.get("ciphers") or []
+               if value not in GREASE_VALUES]
+    extensions = [value for value in hello.get("extensions") or []
+                  if value not in GREASE_VALUES]
+    if ciphers:
+        cipher_hash = _sha12(",".join(sorted(_hex4(value) for value in ciphers)))
+        cipher_len = f"{min(len(ciphers), 99):02d}"
+    else:
+        cipher_hash, cipher_len = _EMPTY_HASH, "00"
+    if extensions:
+        codes = sorted(_hex4(value) for value in extensions
+                       if value not in (0x0000, 0x0010))
+        joined = ",".join(codes)
+        if 13 in extensions:                           # signature_algorithms
+            sigs = [_hex4(value) for value in hello.get("sig_algs") or []
+                    if value not in GREASE_VALUES]
+            joined = f"{joined}_{','.join(sigs)}"
+        ext_hash = _sha12(joined) if joined else _EMPTY_HASH
+        ext_len = f"{min(len(extensions), 99):02d}"
+    else:
+        ext_hash, ext_len = _EMPTY_HASH, "00"
+    alpns = hello.get("alpn") or [""]
+    sni = "d" if hello.get("sni") else "i"
+    return (f"{protocol}{_ja4_version(hello)}{sni}{cipher_len}{ext_len}"
+            f"{_alpn_tag(alpns[0])}_{cipher_hash}_{ext_hash}")
+
+
+def ja4s(server_hello: dict, *, protocol: str = "t") -> str:
+    """JA4S per the FoxIO JA4+ spec, e.g. ``t120400_c030_4e8089b08790``."""
+    hello = server_hello or {}
+    codes = [_hex4(value) for value in hello.get("extensions") or []]
+    ext_hash = _sha12(",".join(codes)) if codes else _EMPTY_HASH
+    cipher = _hex4((hello.get("ciphers") or [0])[0])
+    alpns = hello.get("alpn") or [""]
+    return (f"{protocol}{_ja4_version(hello)}"
+            f"{min(len(codes), 99):02d}{_alpn_tag(alpns[0])}"
+            f"_{cipher}_{ext_hash}")
+
+
+def fingerprints(client_hello: dict, server_hello: dict | None = None,
+                 *, protocol: str = "t") -> dict:
+    """Bundle all fingerprints of one handshake for logs, CSV and findings."""
+    hello = client_hello or {}
+    result = {
+        "sni": hello.get("sni") or "",
+        "ja3": ja3(hello),
+        "ja3_string": ja3_string(hello),
+        "ja4": ja4(hello, protocol=protocol),
+    }
+    if server_hello:
+        result["ja3s"] = ja3s(server_hello)
+        result["ja4s"] = ja4s(server_hello, protocol=protocol)
+    return result

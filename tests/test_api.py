@@ -88,14 +88,14 @@ class ApiTest(unittest.TestCase):
     def test_meta_payload(self):
         status, meta = self.json_request("/api/meta")
         self.assertEqual(status, 200)
-        self.assertEqual(len(meta["features"]), 37)
+        self.assertEqual(len(meta["features"]), 46)
         self.assertEqual(len(meta["categories"]), 13)
         self.assertEqual(meta["initial"], {"pcap": "", "features": []})
         self.assertIn("tshark", meta["tools"])
         self.assertIn("report", meta)
         self.assertEqual([item["key"] for item in meta["report"]["sections"]],
-                         ["summary", "features", "findings", "log",
-                          "artifacts", "params"])
+                         ["summary", "features", "findings", "timeline",
+                          "iocs", "attack", "log", "artifacts", "params"])
         self.assertNotIn("params", meta["report"]["default_sections"])
         kinds = {item["key"] for item in meta["findings"]["kinds"]}
         self.assertIn("hash", kinds)

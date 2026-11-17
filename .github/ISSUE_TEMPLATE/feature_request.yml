@@ -41,7 +41,7 @@ body:
     attributes:
       label: 确认
       options:
-        - label: 我已检索过现有 Issue 与 `TODO.md`
+        - label: 我已检索过现有 Issue 与 `docs/FEATURES.md`
           required: true
         - label: 我愿意提交 PR 实现它
           required: false

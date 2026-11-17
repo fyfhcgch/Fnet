@@ -2,10 +2,10 @@
 layout: page
 title: 功能清单
 permalink: /manual/features/
-description: Fnet 37 项分析功能与附加处理器的用途、复选框编号和依赖。
+description: Fnet 46 项分析功能与附加处理器的用途、复选框编号和依赖。
 ---
 
-Fnet 有 **37 个复选框功能**，按 **13 个分类**组织；另有若干不带复选框的深度
+Fnet 有 **46 个复选框功能**，按 **13 个分类**组织；另有若干不带复选框的深度
 处理器，用 `--features` 或“专项功能”菜单调用。★ 表示默认勾选。
 
 想按赛题类型挑选功能，可以直接看文末的[选择建议](#选择建议)。
@@ -42,12 +42,14 @@ Webshell 解密（冰蝎 3.x/4.x、哥斯拉、蚁剑、菜刀、内存马）没
 | SQL二分盲注增强 | `checkBox_46` | 针对二分法盲注，按字符区间推断结果 |
 | SQL盲注日志分析 | `checkBox_34` | 从已保存的盲注日志回推注入内容 |
 
-## C2 / 远控（2）
+## C2 / 远控（4）
 
 | 功能 | 复选框 | 说明 |
 | --- | --- | --- |
 | Cobalt Strike流量分析 | `checkBox_15` | beacon 元数据与任务解密，需要 `.cobaltstrike.beacon_keys` |
 | WINRM流量解密 | `checkBox_43` | 用 NTLM hash 或密码还原 WinRM 认证与命令 |
+| Meterpreter会话分析 | `checkBox_55` | Meterpreter/metsvc TCP TLV 会话识别，提取命令 ID、字符串参数与时间线 |
+| Sliver/meterpreter C2扩展 | `checkBox_56` | Sliver HTTP/DNS/mTLS beacon 识别与 meterpreter staging/加密传输分析；`sliver_session_key` / `meterpreter_symkey` 解密会话载荷，`sliver_dns_domain` 指定已知 DNS beacon 域名 |
 
 ## 认证与凭据（2）
 
@@ -56,7 +58,7 @@ Webshell 解密（冰蝎 3.x/4.x、哥斯拉、蚁剑、菜刀、内存马）没
 | NTLM HASH提取 | `checkBox_39` | 从 NTLMSSP 认证中提取 NetNTLM 哈希（hashcat 格式） |
 | Kerberos解析破解 | `checkBox_45` | 提取 AS-REQ/AS-REP/TGS-REP，生成 18200/13100/19800/19900 哈希；可用 keytab、账号口令或原始密钥解密响应（19600/19700），解析 PAC、NTLM 哈希与用户时间线 |
 
-## 协议流量（10）
+## 协议流量（16）
 
 | 功能 | 复选框 | 说明 |
 | --- | --- | --- |
@@ -70,6 +72,12 @@ Webshell 解密（冰蝎 3.x/4.x、哥斯拉、蚁剑、菜刀、内存马）没
 | MYSQL数据分析 | `checkBox_37` | `mysql_native_password` / `caching_sha2_password` 握手、查询、结果集、`LOAD DATA LOCAL INFILE` 上传文件与 `LOAD_FILE()` 读取内容 |
 | ARP协议分析 | `checkBox_44` | IP/MAC 冲突、免费 ARP 与异常字段 |
 | 4G/5G通信协议分析 | `checkBox_41` | GTP 隧道与错误 TEID 检测 |
+| LDAP流量分析 | `checkBox_48` | LDAP 绑定凭据/SASL 机制、查询 base/filter、条目属性（AD 账号等）与 StartTLS 告警 |
+| SMB流量分析 | `checkBox_49` | SMB2/3 共享与会话、NTLM 身份、文件读写还原落盘、加密/压缩告警 |
+| MongoDB流量分析 | `checkBox_50` | OP_MSG 命令与集合、SCRAM 认证交换、GridFS 文件还原落盘 |
+| PostgreSQL流量分析 | `checkBox_51` | 查询语句与参数、结果摘要、明文口令消息与 COPY 数据 |
+| Redis流量分析 | `checkBox_52` | RESP 命令、AUTH/ACL 凭据、敏感键读取与写入值摘要（支持非标准端口） |
+| SSH流量分析 | `checkBox_53` | SSH 版本交换、KEXINIT 算法协商、userauth 用户名/方法/口令与爆破时间线 |
 
 ## 工控协议（7）
 
@@ -106,12 +114,13 @@ Webshell 解密（冰蝎 3.x/4.x、哥斯拉、蚁剑、菜刀、内存马）没
 
 QUIC 识别与解密由该项自动调用（`tls.quic`），不需要额外勾选。
 
-## 杂项（2）
+## 杂项（3）
 
 | 功能 | 复选框 | 说明 |
 | --- | --- | --- |
 | SCSI传输数据提取 | `checkBox_36` | SCSI 读写数据提取 |
 | IPID数据分析 | `checkBox_31` | IP ID 字段的隐蔽信道分析，通常关闭 |
+| 日志证据关联 | `checkBox_54` | 导入 Suricata eve.json / Zeek 日志，归一化并与流量发现按 IP/端口关联 |
 
 ## RDP 重放（1）
 

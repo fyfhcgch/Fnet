@@ -1,6 +1,6 @@
 # 功能说明
 
-Fnet 共 **37 个分析功能**、**13 个分类**。WebUI 侧栏按分类折叠展示；CLI 用
+Fnet 共 **46 个分析功能**、**13 个分类**。WebUI 侧栏按分类折叠展示；CLI 用
 复选框编号（`checkBox_10`）或 handler（`text_scan.keyword_scan`）选择。
 
 ```bash
@@ -71,6 +71,15 @@ python3 -m fnet -C x.pcap --features webshell.decrypt \
 | --- | --- | --- | --- | --- |
 | `checkBox_15` | `cs.analyze` | Cobalt Strike流量分析 | `cryptography` | 解析 beacon 元数据/任务，使用 `.cobaltstrike.beacon_keys` 解密 |
 | `checkBox_43` | `winrm.decrypt` | WINRM流量解密 | — | 从 NTLM 认证还原 WinRM 凭据；支持 hash 或明文密码 |
+| `checkBox_55` | `meterpreter.analyze` | Meterpreter会话分析 | — | Meterpreter/metsvc TCP TLV 会话识别：命令 ID、字符串参数、异常与命令时间线；不认识的 TLV type 显示 hex |
+| `checkBox_56` | `c2ext.analyze` | Sliver/meterpreter C2扩展 | — | Sliver HTTP/DNS/mTLS beacon 识别（URI 扩展名分类、改良 Base32/Base58 解码、证书画像）与 meterpreter staging/XOR 加密传输分析；有会话密钥时解密会话载荷 |
+
+Meterpreter 参数：无（自动按 TLV 结构识别，metsvc 默认端口 31337，
+反向连接端口不定）。输出 `meterpreter_timeline.csv`。
+
+C2 扩展参数：`sliver_session_key`（Sliver 会话 AES-256 密钥，hex）、
+`meterpreter_symkey`（meterpreter AES-256 对称密钥，hex）、
+`sliver_dns_domain`（已知 DNS beacon 域名，逗号分隔）。
 
 WinRM 参数：`winrm_auth=hash|password`、`winrm_ntlm`、`winrm_password`。
 CS 参数：`cobaltstrike_keys`（keys 文件路径）。
@@ -103,6 +112,12 @@ hashcat -m 5500 ntlm_hashes.txt wordlist.txt   # NetNTLMv1
 | `checkBox_35` | `flows.udp` | UDP流分析 | UDP 会话与载荷；输出可能较多 |
 | `checkBox_33` | `flows.tcp` | TCP流分析 | TCP 流重组、会话统计与内容提取 |
 | `checkBox_44` | `arp.analyze` | ARP协议分析 | IP/MAC 冲突、免费 ARP 与异常字段 |
+| `checkBox_48` | `ldap.analyze` | LDAP流量分析 | LDAP 绑定凭据/SASL 机制、查询 base/filter、条目属性（AD 账号等）与 StartTLS 告警 |
+| `checkBox_49` | `smb.analyze` | SMB流量分析 | SMB2/3 共享与会话、NTLM 身份、文件读写还原落盘、加密/压缩告警 |
+| `checkBox_50` | `mongodb.analyze` | MongoDB流量分析 | OP_MSG 命令与集合、SCRAM 认证交换、GridFS 文件还原落盘 |
+| `checkBox_51` | `postgres.analyze` | PostgreSQL流量分析 | 查询语句与参数、结果摘要、明文口令消息与 COPY 数据 |
+| `checkBox_52` | `redis.analyze` | Redis流量分析 | RESP 命令、AUTH/ACL 凭据、敏感键读取与写入值摘要（支持非标准端口） |
+| `checkBox_53` | `ssh.analyze` | SSH流量分析 | SSH 版本交换、KEXINIT 算法协商、userauth 用户名/方法/口令与爆破时间线 |
 
 ### 扩展协议处理器（无复选框）
 
@@ -188,7 +203,7 @@ Wi-Fi 处理器默认只做识别和取证，不会自动跑大字典：
 
 | 复选框 | Handler | 功能 | 说明 |
 | --- | --- | --- | --- |
-| `checkBox_24` | `tls.decrypt` | TLS流量解密 | 用 NSS keylog 或 RSA 私钥解密 TLS/QUIC，提取证书链、明文 HTTP、HTTP/2/gRPC、WebSocket 与 HTTP/3 |
+| `checkBox_24` | `tls.decrypt` | TLS流量解密 | 用 NSS keylog 或 RSA 私钥解密 TLS/QUIC，提取证书链、明文 HTTP、HTTP/2/gRPC、WebSocket 与 HTTP/3，并为每个 Client Hello 计算 JA3/JA4 指纹 |
 
 `tls.decrypt` 会顺带调用 `tls.quic` 识别 QUIC v1/v2 连接：输出版本、SNI、
 ALPN、包类型与帧号到 `quic_connections.csv`；配置 keylog 后继续解密 HTTP/3
@@ -204,7 +219,14 @@ KeyUpdate 提示。私钥仅适用于非前向保密套件：处理器会用证�
 `tshark` 已移除 `tls.keys_list` 时会明确提示改用 keylog。解密后的明文会继续做
 凭据/Cookie/JWT、表单、HTTP/2 与 WebSocket 分析与文件清单提取，分别写入
 `tls_decrypted_http.csv`、`tls_http2.csv`、`tls_websocket.txt` 与
-`tls_http_objects.csv`。
+`tls_http_objects.csv`。另外，处理器会为每个 Client Hello 按 Salesforce JA3 与
+FoxIO JA4+ 规范计算 JA3/JA4 指纹（纯 stdlib 实现，见 `fnet/utils/tlsdeep.py`），
+并在“TLS 握手”表中追加 JA3/JA4 列、记录 `tls_fingerprint` 发现、输出
+`tls_fingerprints.csv`（含匹配到的 Server Hello 的 JA4S/JA3S）。在没有 keylog
+（或 keylog 解不出该连接）时，处理器还会用 RFC 9001 的 QUIC Initial 已知保护密钥
+（纯 stdlib 实现于 `fnet/utils/tlsdeep.py`）直接解出 Initial 包中的 Client Hello，
+输出“无需 keylog 的 Initial 元数据提取”日志、`tls_fingerprint` 发现与
+`quic_initial_fingerprints.csv`（SNI/ALPN/JA3/JA4，JA4 使用 QUIC 的 `q` 前缀）。
 
 ## 杂项
 
@@ -212,6 +234,11 @@ KeyUpdate 提示。私钥仅适用于非前向保密套件：处理器会用证�
 | --- | --- | --- | --- |
 | `checkBox_36` | `misc.scsi` | SCSI传输数据提取 | 从 SCSI/存储流量提取读写数据 |
 | `checkBox_31` | `misc.ipid` | IPID数据分析 | IP ID 隐蔽信道/异常分析（通常关闭） |
+| `checkBox_54` | `forensics.log_import` | 日志证据关联 | 导入 Suricata eve.json / Zeek TSV 日志（`log_path` 文件或 `log_text` 粘贴），归一化为统一事件模型并与流量发现按 IP/端口关联；告警签名计入结构化结果，输出 `log_import_events.csv` |
+
+日志证据关联不是 pcap 解析功能：它只读取导入的日志并与当前任务已有的
+findings 做交集，任务没有 findings 时照常归一化日志。识别不出格式时
+会提示需要 eve.json（JSON Lines）或带 `#fields` 头的 Zeek 日志。
 
 ## RDP 重放
 

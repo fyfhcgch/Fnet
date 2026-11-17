@@ -67,7 +67,7 @@ def iecd(ctx: FeatureContext) -> None:
     fields = ["frame.number", "ip.src", "ip.dst", "iec60870_asdu.typeid",
               "iec60870_asdu.co", "iec60870_asdu.addr",
               "iec60870_asdu.pn", "iec60870_asdu.ioa"]
-    rows = _summary(ctx, "IEC 60870-5-104", "iec60870_asdu or iec60870_apci", fields)
+    rows = _summary(ctx, "IEC 60870-5-104", "iec60870_asdu", fields)
     types = Counter(r[3] for r in rows if len(r) > 3 and r[3])
     if types:
         ctx.report("类型标识统计: " + ", ".join(f"{k}={v}" for k, v in types.most_common()),
@@ -91,7 +91,7 @@ def mms(ctx: FeatureContext) -> None:
 def omron(ctx: FeatureContext) -> None:
     fields = ["frame.number", "ip.src", "ip.dst", "_ws.col.protocol",
               "_ws.col.info"]
-    rows = tshark_rows(ctx, fields, "fins or omron", limit=50_000)
+    rows = tshark_rows(ctx, fields, "omron", limit=50_000)
     if not rows:
         rows = tshark_rows(ctx, fields,
                            'ip.addr && (_ws.col.protocol contains "FINS" || '

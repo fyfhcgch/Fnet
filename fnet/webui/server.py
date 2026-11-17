@@ -216,6 +216,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._batch_report()
             if path == "/api/compare":
                 return self._compare()
+            if path == "/api/topology":
+                return self._topology()
+            if path == "/api/annotations":
+                return self._annotations_info()
             if path == "/api/capture/interfaces":
                 return self._json({"ok": True,
                                    "interfaces": self.app.live.interfaces()})
@@ -319,6 +323,10 @@ class Handler(BaseHTTPRequestHandler):
                                    "job": job.as_dict() if job else None})
             if path == "/api/rules":
                 return self._set_rules()
+            if path == "/api/replay":
+                return self._replay()
+            if path == "/api/annotations":
+                return self._annotations_set()
             match = re.fullmatch(r"/api/history/([0-9a-f]+)/delete", path)
             if match:
                 ok = self.app.jobs.delete_history(match.group(1))
@@ -845,6 +853,7 @@ class Handler(BaseHTTPRequestHandler):
         )
         if found is None:
             return self._error("任务不存在", 404)
+        self.app.jobs.merge_annotations(job_id, found["findings"])
         return self._json({"ok": True, "job": job_id, **found})
 
     def _packet(self) -> None:
@@ -912,6 +921,70 @@ class Handler(BaseHTTPRequestHandler):
         limit = int((self._query().get("limit") or ["300"])[0] or 300)
         self._json({"ok": True,
                     "logs": [r.as_dict() for r in global_logger.tail(limit)]})
+
+    def _annotations_set(self) -> None:
+        """Set/clear one finding's human annotation (note + status)."""
+        data = self._json_body()
+        job_id = str(data.get("job") or "")
+        result = self.app.jobs.set_annotation(
+            job_id,
+            data.get("seq") if data.get("seq") is not None
+            else data.get("id") or "",
+            str(data.get("status") or ""),
+            str(data.get("note") or data.get("annotation") or ""))
+        if result is None:
+            return self._error("任务不存在", 404)
+        return self._json(result)
+
+    def _annotations_info(self) -> None:
+        """Persisted annotations for one job, keyed by finding ``seq``."""
+        job_id = (self._query().get("job") or [""])[0]
+        notes = self.app.jobs.load_annotations(job_id)
+        if notes is None:
+            return self._error("任务不存在", 404)
+        return self._json({"ok": True, "job": job_id, "annotations": notes})
+
+    def _topology(self) -> None:
+        """Compact endpoint graph for one job's capture."""
+        from fnet.services import network_topology
+
+        job_id = (self._query().get("job") or [""])[0]
+        pcap = self.app.jobs.pcap_for(job_id)
+        if not pcap:
+            return self._error("任务不存在或流量包已被删除", 404)
+        result = network_topology(pcap, self.app.toolbox)
+        if not result.get("ok"):
+            return self._error(result.get("text") or "拓扑统计失败")
+        return self._json({"ok": True, "job": job_id,
+                           "nodes": result.get("nodes") or [],
+                           "links": result.get("links") or [],
+                           "text": result.get("text") or ""})
+
+    def _replay(self) -> None:
+        """Runnable Python replay script for one TCP/HTTP session."""
+        from fnet.services import replay_script
+
+        data = self._json_body()
+        job_id = str(data.get("job") or "")
+        if not job_id:
+            return self._error("需要任务 ID")
+        if data.get("stream") in ("", None) and data.get("frame") in ("", None):
+            return self._error("需要 stream 或 frame 参数")
+        pcap = self.app.jobs.pcap_for(job_id)
+        if not pcap:
+            return self._error("任务不存在或流量包已被删除", 404)
+        result = replay_script(pcap, self.app.toolbox,
+                               stream=data.get("stream"),
+                               frame=data.get("frame"))
+        if not result.get("ok"):
+            return self._error(result.get("text") or "生成重放脚本失败")
+        return self._json({"ok": True, "job": job_id,
+                           "kind": result.get("kind"),
+                           "script": result.get("script"),
+                           "text": result.get("text") or "",
+                           "stream": result.get("stream"),
+                           "client": result.get("client"),
+                           "server": result.get("server")})
 
 
 def safe_limit(value, default: int = 5000, maximum: int = 50_000) -> int:

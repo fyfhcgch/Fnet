@@ -39,7 +39,7 @@ python3 -m fnet --port 9000             # 换端口
 python3 -m fnet capture.pcapng          # 启动并预选流量包
 python3 -m fnet capture.pcapng --features checkBox_10,http.extract
 python3 -m fnet --doctor                # 检查 tshark / java / hashcat 等
-python3 -m fnet --list-features         # 列出 37 个功能与复选框编号
+python3 -m fnet --list-features         # 列出 46 个功能与复选框编号
 ```
 
 WebUI 顶栏可切换中文 / English；大文件上传显示进度并可按 `Esc` 取消，
@@ -61,7 +61,7 @@ fnet
 # 运行默认勾选的功能，日志直接打印到终端
 python3 -m fnet -C capture.pcapng
 
-# 运行全部 37 个功能
+# 运行全部 46 个功能
 python3 -m fnet -C capture.pcapng --all
 
 # 只运行指定功能（复选框编号或 handler 均可）
@@ -85,7 +85,18 @@ python3 -m fnet -C capture.pcapng --features checkBox_30 --rules rules.yar
 # 继续已暂停/中断的任务，或对比两个任务的发现
 python3 -m fnet --resume <job-id>
 python3 -m fnet --compare <base-job-id> <target-job-id> --json
+
+# MCP stdio 服务器：把功能列表/分析/findings/帧上下文暴露为 MCP 工具（JSON-RPC 2.0）
+python3 -m fnet --mcp
+# 预载默认流量包，analyze 工具可省略 pcap_path
+python3 -m fnet --mcp capture.pcapng
+
+# PCAP-over-IP：监听 127.0.0.1:18000 接收 pcap 字节流，连接关闭后自动分析
+python3 -m fnet --pcap-over-ip 18000 --features checkBox_10
 ```
+
+无界面分析、PCAP-over-IP 与 MCP server 三种命令行模式的详细说明见
+[`docs/CLI.md`](docs/CLI.md)。
 
 报告与导出文件写入 `~/.cache/fnet/jobs/<job-id>/`，终端会列出
 `report.txt`、`report.md`、`report.html` 与结构化结果
@@ -97,11 +108,11 @@ tshark 字段提取默认启用磁盘缓存与超时重试，可通过 `config.i
 
 ## WebUI 界面
 
-![Fnet WebUI：左侧 37 个功能的勾选面板，右侧分析结果表格与统计图表](docs/images/webui.webp)
+![Fnet WebUI：左侧 46 个功能的勾选面板，右侧分析结果表格与统计图表](docs/images/webui.webp)
 
 | 区域       | 说明                                                                                                             |
 | ---------- | ---------------------------------------------------------------------------------------------------------------- |
-| 左侧功能栏 | 37 个功能按 13 个分类折叠展示，可全选/全不选                                                                     |
+| 左侧功能栏 | 46 个功能按 13 个分类折叠展示，可全选/全不选                                                                 |
 | 顶部       | 全局功能搜索、文件/统计/设置/工具菜单、tshark 状态、语言切换、主题切换                                           |
 | 主区域     | 关键字、HTTP、Webshell、SQL、认证、C2、工控、杂项、文本、设置、关于                                              |
 | 分析结果   | 凭据、哈希、flag、导出文件等汇总为可排序表格，支持筛选、搜索、分页、列显示/隐藏、批量复制、按帧号跳转与 CSV 导出 |
@@ -205,7 +216,7 @@ Fnet/
 │   ├── findings.py        结构化结果（类别、级别、筛选、CSV）
 │   ├── report.py          纯文本/Markdown/HTML 报告渲染与章节选择
 │   ├── config.py          config.ini 读写与默认值
-│   ├── features/          37 个分析功能（按主题拆分）
+│   ├── features/          46 个分析功能（按主题拆分）
 │   ├── tools/runner.py    外部工具发现与 tshark 封装
 │   ├── utils/             编解码、AES/RC4/MD4/RSA、pcap、TCP 流重组、
 │   │                      MySQL/Kerberos/邮件/隧道/WPA/规则解析
@@ -214,7 +225,7 @@ Fnet/
 ├── docs/                  架构、功能、WebUI、安全说明
 ├── scripts/               样例抓包生成、性能基准
 ├── tests/                 单元测试、API 冒烟测试与样例 pcap
-└── packaging/             Linux 桌面入口与安装脚本
+└── packaging/             Linux 桌面入口与安装脚本；install.ps1 为 Windows 一键安装
 ```
 
 ## 开发与测试

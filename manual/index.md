@@ -42,7 +42,7 @@ Fnet 有两条使用路径：**WebUI** 适合交互式分析、看图表和整�
   <li>
     <a href="{{ '/manual/features/' | relative_url }}">
       <strong>功能清单</strong>
-      <span>37 项功能按 13 个分类的作用、编号与依赖</span>
+      <span>46 项功能按 13 个分类的作用、编号与依赖</span>
     </a>
   </li>
   <li>

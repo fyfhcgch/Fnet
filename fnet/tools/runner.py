@@ -322,6 +322,13 @@ class TShark:
         if code != 0 and not out.strip():
             logger.error(out.strip() or f"tshark 退出码 {code}")
             return []
+        if code != 0:
+            # tshark failed (bad filter/field, unreadable file).  Its error
+            # text must never leak into the tab-separated data rows, so log
+            # it and treat the whole run as empty instead of parsing it.
+            logger.error(out.strip().splitlines()[0]
+                         or f"tshark 退出码 {code}")
+            return []
         rows = []
         truncated = 0
         for line in out.splitlines():
@@ -388,12 +395,24 @@ class ToolBox:
         "openssl": "openssl",
     }
 
+    #: Tools whose user override is stored in ``[config]``: the WebUI
+    #: (``SETTING_META`` in ``app.js``) saves the path there.  ``[paths]`` is
+    #: still accepted as a fallback for older config files.
+    CONFIG_OVERRIDE_KEYS = ("tshark",)
+
     def __init__(self, config: Config) -> None:
         self.config = config
 
+    def configured(self, key: str) -> str:
+        """Return the user-configured override for ``key`` (may be empty)."""
+        if key in self.CONFIG_OVERRIDE_KEYS:
+            return (self.config.get(key, "config").strip()
+                    or self.config.get(key, "paths").strip())
+        return self.config.get(key, "paths")
+
     def path(self, key: str) -> str | None:
         name = self.TOOL_NAMES.get(key, key)
-        return find_tool(name, self.config.get(key, "paths"))
+        return find_tool(name, self.configured(key))
 
     def tshark(self) -> TShark | None:
         path = self.path("tshark")

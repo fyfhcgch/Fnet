@@ -52,6 +52,16 @@ DEFAULTS = {
         "language": "zh",
     },
     "plugins": {"execute_cmd": "{}"},
+    # 在线 IOC 情报（默认完全离线；填写 api key 才会发请求）
+    "intel": {
+        "provider": "",
+        "vt_api_key": "",
+        "otx_api_key": "",
+        "vt_min_malicious": "3",
+        "otx_min_pulses": "1",
+        "timeout": "10",
+        "vt_interval": "15",
+    },
     "paths": {
         "tls_keylog": "",
         "tls_private_key": "",

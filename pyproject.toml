@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fnet-ctf"
-version = "2.19.0"
+version = "2.20.0"
 description = "Fnet - 开源 CTF 网络流量分析工具箱（WebUI，Linux/macOS/Windows）"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,6 +38,10 @@ samples = ["scapy>=2.5"]
 crypto = ["cryptography>=41"]
 # RDP 会话解密播放（需要 pyrdp-player 可执行文件）。
 rdp = ["pyrdp-mitm>=1.0"]
+# 可选加速层（fnet/utils/accel.py）：CUDA（cupy / numba.cuda）与 Numba CPU
+# JIT。探测不到时静默回退纯 Python，分析器运行时仍然零第三方依赖；
+# 跑分见 docs/PERFORMANCE.md 加速章节与 scripts/bench_accel.py。
+accel = ["numba>=0.61", "cupy-cuda12x>=13"]
 
 [project.urls]
 Homepage = "https://github.com/fyfhcgch/Fnet"

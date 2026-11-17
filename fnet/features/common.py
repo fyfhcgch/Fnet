@@ -94,3 +94,39 @@ def csv_rows(ctx: FeatureContext, fields: list[str],
 
 def normalize_hex(value: str) -> str:
     return re.sub(r"(?i)[^0-9a-f]", "", value or "")
+
+
+def protocol_streams(ctx: FeatureContext, protocol: str = "",
+                     *, matcher=None, limit: int = 60_000):
+    """Reassemble TCP payloads and keep the directions of one protocol.
+
+    Streams are kept when either port is a known default port for
+    ``protocol`` or when their payload matches a detection function.  Pass a
+    custom ``matcher(data) -> bool`` for protocols that
+    :mod:`fnet.utils.protocol_detect` does not know about.
+    """
+    from fnet.utils import protocol_detect
+    from fnet.utils.stream import STREAM_FIELDS, reassemble_rows
+
+    ports = protocol_detect.default_ports(protocol) if protocol else ()
+    rows = tshark_rows(ctx, list(STREAM_FIELDS), "tcp.len > 0", limit=limit)
+    matched = []
+    for stream in reassemble_rows(rows):
+        ctx.check_cancel()
+        try:
+            sport, dport = int(stream.sport), int(stream.dport)
+        except (TypeError, ValueError):
+            sport = dport = 0
+        if sport in ports or dport in ports:
+            matched.append(stream)
+            continue
+        if matcher is not None and matcher(stream.data):
+            matched.append(stream)
+            continue
+        if protocol and not matcher:
+            detected, score = protocol_detect.detect_protocol_scored(
+                stream.data)
+            if detected == protocol and \
+                    score >= protocol_detect.MIN_CONFIDENCE:
+                matched.append(stream)
+    return matched

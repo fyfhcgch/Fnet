@@ -49,6 +49,31 @@ QUIC_FIELDS = [
     "tls.handshake.extensions_alpn_str", "quic.connection.number",
     "frame.len",
 ]
+#: Fields needed to fetch raw QUIC payloads for the keylog-free Initial path.
+QUIC_INITIAL_FIELDS = [
+    "frame.number", "udp.srcport", "udp.dstport", "udp.payload",
+]
+#: Client Hello fields needed for JA3/JA4 (order matters, see
+#: ``_client_hello_from_row``).
+FP_CLIENT_FIELDS = [
+    "frame.number", "ip.src", "tcp.srcport", "ip.dst", "tcp.dstport",
+    "tcp.stream", "tls.handshake.version", "tls.handshake.legacy_version",
+    "tls.record.version",
+    "tls.handshake.ciphersuite", "tls.handshake.extension.type",
+    "tls.handshake.extensions_supported_group",
+    "tls.handshake.extensions_ec_point_format",
+    "tls.handshake.extensions.supported_version",
+    "tls.handshake.sig_hash_alg",
+    "tls.handshake.extensions_server_name",
+    "tls.handshake.extensions_alpn_str",
+]
+#: Server Hello fields needed for JA4S/JA3S.
+FP_SERVER_FIELDS = [
+    "frame.number", "tcp.stream", "tls.handshake.version",
+    "tls.handshake.legacy_version", "tls.record.version",
+    "tls.handshake.ciphersuite", "tls.handshake.extension.type",
+    "tls.handshake.extensions_alpn_str",
+]
 
 
 def key_kind(path: Path) -> str:
@@ -203,14 +228,153 @@ def _prepare_private_keys(ctx: FeatureContext,
 # ---------------------------------------------------------------------------
 # Handshake, certificates and TLS 1.3 KeyUpdate
 # ---------------------------------------------------------------------------
+def _split_cells(value: str) -> list[str]:
+    return [part.strip() for part in str(value or "").split(",") if part.strip()]
+
+
+def _field_ints(value: str) -> list[int]:
+    """tshark multi-value cell (``0x1301,0xc02f`` / ``0,16,43``) to integers."""
+    ints: list[int] = []
+    for part in _split_cells(value):
+        try:
+            ints.append(int(part, 16) if part.lower().startswith("0x")
+                        else int(part))
+        except ValueError:
+            continue
+    return ints
+
+
+def _field_version(*values: str) -> int:
+    for text in values:
+        for part in _split_cells(text):
+            try:
+                return int(part, 16) if part.lower().startswith("0x") \
+                    else int(part)
+            except ValueError:
+                continue
+    return 0
+
+
+def _client_hello_from_row(row: list[str]) -> dict | None:
+    """Client Hello dict (for ``tlsdeep.fingerprints``) from a field row."""
+    row = list(row) + [""] * (len(FP_CLIENT_FIELDS) - len(row))
+    (_frame, _src, _sport, _dst, _dport, _stream, version, legacy,
+     record_version, ciphers, exts, groups, formats, supported, sig_algs,
+     sni, alpn) = row[:17]
+    if not ciphers:
+        return None
+    return {
+        "version": _field_version(version, legacy, record_version),
+        "ciphers": _field_ints(ciphers),
+        "extensions": _field_ints(exts),
+        "curves": _field_ints(groups),
+        "formats": _field_ints(formats),
+        "supported_versions": _field_ints(supported),
+        "sig_algs": _field_ints(sig_algs),
+        "sni": sni.strip(),
+        "alpn": _split_cells(alpn),
+    }
+
+
+def _server_hello_from_row(row: list[str]) -> dict | None:
+    """Server Hello dict from a field row; ``None`` when not usable for JA4S.
+
+    Frames that also carry TLS 1.3 ``EncryptedExtensions`` are rejected:
+    tshark field mode merges the extension types of every handshake message
+    in a frame, which would poison the server extension list.
+    """
+    row = list(row) + [""] * (len(FP_SERVER_FIELDS) - len(row))
+    frame, stream, version, legacy, record_version, ciphers, exts, alpn = \
+        row[:8]
+    if not ciphers:
+        return None
+    cipher_list = _field_ints(ciphers)
+    return {
+        "frame": frame,
+        "stream": stream,
+        "version": _field_version(version, legacy, record_version),
+        "ciphers": cipher_list[:1],
+        "extensions": _field_ints(exts),
+        "alpn": _split_cells(alpn)[:1],
+    }
+
+
+def _report_fingerprints(ctx: FeatureContext) -> dict[str, list[str]]:
+    """Compute JA3/JA4(/JA4S/JA3S) for every Client Hello in the capture.
+
+    Each Client Hello is logged with its fingerprints, recorded as a
+    ``tls_fingerprint`` finding and written to ``tls_fingerprints.csv``.
+    Returns ``{frame: [ja3, ja4]}`` so the handshake table can gain two
+    fingerprint columns.
+    """
+    if ctx.tshark is None:
+        return {}
+    rows = tshark_rows(ctx, FP_CLIENT_FIELDS, "tls.handshake.type == 1",
+                       limit=20_000)
+    if not rows:
+        return {}
+    servers: dict[str, dict] = {}
+    for raw in tshark_rows(ctx, FP_SERVER_FIELDS,
+                           "tls.handshake.type == 2 && !(tls.handshake.type == 8)",
+                           limit=20_000):
+        hello = _server_hello_from_row(raw)
+        if hello and hello["stream"] and hello["stream"] not in servers:
+            servers[hello["stream"]] = hello
+    by_frame: dict[str, list[str]] = {}
+    csv_rows: list[list[str]] = []
+    with_server = 0
+    for raw in rows:
+        row = list(raw) + [""] * (len(FP_CLIENT_FIELDS) - len(raw))
+        frame, src, sport, dst, dport, stream = row[:6]
+        hello = _client_hello_from_row(raw)
+        if not hello or not hello["ciphers"]:
+            continue
+        server = servers.get(stream)
+        fp = tlsdeep.fingerprints(hello, server)
+        endpoint = f"{src}:{sport} -> {dst}:{dport}"
+        with_server += 1 if server else 0
+        by_frame[frame] = [fp["ja3"], fp["ja4"]]
+        ctx.report(f"帧 {frame} TLS 指纹 {endpoint} SNI {fp['sni'] or '-'}: "
+                   f"JA3={fp['ja3']} JA4={fp['ja4']}"
+                   + (f" JA4S={fp['ja4s']}" if server else ""), "info")
+        ctx.add_finding(
+            "tls_fingerprint",
+            f"TLS 指纹 {fp['sni'] or dst} · JA4 {fp['ja4']}",
+            frame=frame, level="info",
+            detail=(f"{endpoint}\nSNI: {fp['sni'] or '-'}\n"
+                    f"JA3: {fp['ja3']}\nJA4: {fp['ja4']}\n"
+                    f"JA4S: {fp.get('ja4s') or '-'}\n"
+                    f"JA3S: {fp.get('ja3s') or '-'}"),
+            extra={"protocol": "tls", "sni": fp["sni"], "ja3": fp["ja3"],
+                   "ja4": fp["ja4"], "ja4s": fp.get("ja4s") or "",
+                   "ja3s": fp.get("ja3s") or ""})
+        csv_rows.append([frame, f"{src}:{sport}", f"{dst}:{dport}",
+                         fp["sni"], fp["ja3"], fp["ja4"],
+                         fp.get("ja4s") or "", fp.get("ja3s") or ""])
+        ctx.check_cancel()
+    if csv_rows:
+        note = (f"（{with_server} 个匹配到 Server Hello，含 JA4S/JA3S）"
+                if with_server else "")
+        ctx.report(f"已为 {len(csv_rows)} 个 Client Hello 计算 JA3/JA4 指纹"
+                   f"{note}", "good")
+        _write_csv(ctx, "tls_fingerprints.csv",
+                   ["帧", "客户端", "服务端", "SNI", "JA3", "JA4", "JA4S", "JA3S"],
+                   csv_rows)
+    return by_frame
+
+
 def _report_handshake(ctx: FeatureContext) -> None:
+    fingerprints = _report_fingerprints(ctx)
     handshake = ["frame.number", "tls.handshake.type",
                  "tls.handshake.extensions_server_name", "tls.record.version",
                  "tls.handshake.ciphersuite"]
     rows = tshark_rows(ctx, handshake, "tls.handshake", limit=20_000)
     if not rows:
         return
-    table(ctx, "TLS 握手", handshake, rows, limit=150)
+    header = handshake + (["JA3", "JA4"] if fingerprints else [])
+    table(ctx, "TLS 握手", header,
+          [row + fingerprints.get(row[0], []) if fingerprints else row
+           for row in rows], limit=150)
     sni = sorted({r[2] for r in rows if len(r) > 2 and r[2]})
     if sni:
         ctx.report("SNI: " + ", ".join(sni[:100]), "info")
@@ -272,6 +436,61 @@ def _report_certificates(ctx: FeatureContext,
                       and item["leaf"].get("subject") == item["leaf"].get("issuer"))
     if self_signed:
         ctx.report(f"其中 {self_signed} 个端点使用自签名证书", "warn")
+
+
+def _quic_initial_forensics(ctx: FeatureContext) -> int:
+    """无需 keylog 的 QUIC Initial 元数据提取（RFC 8446/9001 已知保护密钥）。
+
+    QUIC Initial 包使用版本内置 salt 从 DCID 派生保护密钥，任何抓包都能
+    直接解出 CRYPTO 帧 → Client Hello，得到 SNI/ALPN 与 JA3/JA4 指纹。
+    tshark 自己也会这么做，但旧版本对 QUIC v2/draft 的支持不完整时会漏掉；
+    这里用纯 stdlib 实现兜底。返回解出的 Client Hello 个数。
+    """
+    if ctx.tshark is None:
+        return 0
+    rows = tshark_rows(ctx, QUIC_INITIAL_FIELDS, "quic && udp", limit=20_000)
+    packets: list[tuple[str, bytes]] = []
+    for raw in rows:
+        row = list(raw) + [""] * (len(QUIC_INITIAL_FIELDS) - len(raw))
+        data = hex_to_bytes(row[3])
+        if data and data[0] & 0x80:              # long header candidate
+            packets.append((row[0], data))
+    if not packets:
+        return 0
+    results = tlsdeep.quic_initial_fingerprints(packets)
+    if not results:
+        return 0
+    ctx.report(f"无需 keylog 的 Initial 元数据提取: 从 {len(packets)} 个 "
+               f"QUIC Initial 包解出 {len(results)} 个 ClientHello"
+               "（RFC 9001 已知保护密钥，无需 keylog）", "good")
+    csv_rows: list[list[str]] = []
+    for item in results:
+        frame = item["frames"][0] if item["frames"] else ""
+        version = item["version_name"]
+        alpn = ", ".join(item["alpn"])
+        ctx.report(f"帧 {frame} QUIC Initial（{version}）SNI {item['sni'] or '-'}: "
+                   f"JA3={item['ja3']} JA4={item['ja4']}"
+                   + (f" ALPN={alpn}" if alpn else ""), "info")
+        ctx.add_finding(
+            "tls_fingerprint",
+            f"QUIC Initial 指纹 {item['sni'] or item['dcid']} · JA4 {item['ja4']}",
+            frame=frame, level="info",
+            detail=(f"无需 keylog 的 Initial 元数据提取（RFC 9001 已知保护密钥）\n"
+                    f"版本: {version}\nDCID: {item['dcid']}\n"
+                    f"SNI: {item['sni'] or '-'}\n"
+                    f"ALPN: {alpn or '-'}\n"
+                    f"JA3: {item['ja3']}\nJA4: {item['ja4']}"),
+            extra={"protocol": "quic", "sni": item["sni"], "ja3": item["ja3"],
+                   "ja4": item["ja4"], "version": version,
+                   "dcid": item["dcid"]})
+        csv_rows.append([frame, version, item["dcid"], item["sni"], alpn,
+                         item["ja3"], item["ja4"]])
+        ctx.check_cancel()
+    ctx.report("QUIC Initial 解密只覆盖握手元数据（SNI/ALPN/指纹）；"
+               "HTTP/3 头与正文仍需 keylog 才能解密。", "info")
+    _write_csv(ctx, "quic_initial_fingerprints.csv",
+               ["帧", "版本", "DCID", "SNI", "ALPN", "JA3", "JA4"], csv_rows)
+    return len(results)
 
 
 def _report_key_updates(ctx: FeatureContext) -> int:
@@ -773,6 +992,10 @@ def quic(ctx: FeatureContext, quiet: bool = False) -> None:
         ctx.report("已识别 QUIC；配置 TLS keylog 后可进一步解密 HTTP/3 头与正文。"
                    "Wireshark 会先用版本内置 salt 解密 Initial，因此 SNI/ALPN 通常"
                    "无需密钥即可看到。", "info")
+        # 无 keylog 时也能从 Initial 包直接恢复 Client Hello（SNI/ALPN/指纹）。
+        if not _quic_initial_forensics(ctx):
+            ctx.report("未能从 QUIC Initial 包中直接提取 ClientHello"
+                       "（捕获可能缺少 Initial 包或使用了不支持的版本）", "info")
         ctx.set_progress(100)
         return
 
@@ -789,6 +1012,8 @@ def quic(ctx: FeatureContext, quiet: bool = False) -> None:
     if not h3_rows:
         ctx.report("keylog 未能解密 HTTP/3 头；请确认 keylog 包含该连接的 TLS 1.3 "
                    "traffic secret，并保持抓包包含完整握手。", "warn")
+        # keylog 解不出该连接时，Initial 包仍能给出握手元数据。
+        _quic_initial_forensics(ctx)
         ctx.set_progress(100)
         return
     h3_csv: list[list[str]] = []

@@ -25,7 +25,7 @@ python3 -m fnet capture.pcapng --features checkBox_10,http.extract
 ├──────────┬──────────────────────────────────────────────────┤
 │ 功能侧栏 │  日志 / 结果 / 产出 / 批量 / 图表 / 历史 / 文本 / 关于 │
 │ 13 组    │  （胶囊 Tab 切换）                                │
-│ 37 功能  │                                                  │
+│ 43 功能  │                                                  │
 │ 全选/清空│  进度条 + 开始/取消按钮                            │
 └──────────┴──────────────────────────────────────────────────┘
 ```
@@ -125,6 +125,10 @@ python3 -m fnet capture.pcapng --features checkBox_10,http.extract
 | POST | `/api/jobs/<id>/pause` | 请求在当前功能结束后暂停 |
 | POST | `/api/jobs/<id>/resume` | 继续已暂停/中断的任务 |
 | GET | `/api/compare?base=<id>&target=<id>` | 对比两个任务的 findings（新增/消失/共有） |
+| GET | `/api/topology?job=<id>` | 端点拓扑图数据（`nodes`/`links`，复用会话统计） |
+| GET | `/api/annotations?job=<id>` | 该任务 findings 的人工标注（按 `seq` 索引） |
+| POST | `/api/annotations` | 设置/清除一条结果的标注（`job`、`seq`、`status`、`note`），持久化到 `<job>/annotations.json` |
+| POST | `/api/replay` | 生成会话重放脚本（`job` + `stream` 或 `frame`；HTTP 返回 requests 版，裸 TCP 返回 socket 版） |
 | GET | `/api/rules` | 当前自定义规则文件、规则数量与名称 |
 | POST | `/api/rules` | 设置自定义规则文件路径（空字符串关闭） |
 | GET | `/api/capture/interfaces` | 列出 tshark 可见网卡 |
@@ -288,6 +292,16 @@ curl -H "X-Fnet-Token: $TOKEN" \
 `kind` 取值：`flag`、`credential`、`hash`、`http`、`webshell`、`sql`、
 `dns`、`file`、`protocol`、`log`、`other`；`level` 与日志级别相同。
 导出 CSV 的列固定为 `类别,级别,帧,功能,摘要,详情`。
+
+#### 结果标注与时间线
+
+“分析结果”与“结果时间线”页点击任意条目，可以为其设置人工标注：
+`status` 取 `confirmed`（已确认）/ `false_positive`（误报）/ `starred`（星标），
+并附带一段自由备注。标注持久化到任务目录的 `annotations.json`，
+`GET /api/findings` 会把 `annotation` 字段合并回对应条目；
+`/api/compare` 的 diff 逻辑保持不变。结果时间线按 `capture`（抓包侧时间，
+可选字段）或记录时间、帧号纵向排列，支持按类别过滤，
+点击帧号可直接打开数据包详情。
 
 ### 菜单动作
 

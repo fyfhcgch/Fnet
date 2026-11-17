@@ -12,7 +12,7 @@ from fnet.utils.pcap import hex_to_bytes, payload_text, printable_ratio
 def ev3(ctx: FeatureContext) -> None:
     fields = ["frame.number", "bthci_acl.data", "btatt.value",
               "btl2cap.payload", "data.data"]
-    rows = tshark_rows(ctx, fields, "bthci_acl or btatt or btl2cap or btbrl2cap",
+    rows = tshark_rows(ctx, fields, "bthci_acl or btatt or btl2cap",
                        limit=50_000)
     if not rows:
         ctx.report("没有发现蓝牙/EV3 数据", "warn")

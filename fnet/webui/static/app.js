@@ -37,7 +37,7 @@
     localSeq: 0,
     featureCount: 0,
     batch: { ids: [], jobs: [], timer: null, active: false, summary: null, drag: null },
-    viz: { timeline: null, hierarchy: null, talkers: null, topology: null, zoom: null, svg: "" },
+    viz: { timeline: null, hierarchy: null, talkers: null, topology: null, topologyApi: null, zoom: null, svg: "" },
     tlsKeyKind: "keylog",
     language: "zh",
     featureSearch: "",
@@ -54,7 +54,7 @@
     zh: {
       tab_log: "分析日志", tab_findings: "分析结果", tab_artifacts: "产出文件",
       tab_batch: "批量队列", tab_viz: "统计图表", tab_history: "任务历史",
-      tab_text: "文本工具", tab_about: "关于",
+      tab_text: "文本工具", tab_about: "关于", tab_timeline: "结果时间线",
       menu_file: "文件", menu_stats: "统计", menu_settings: "设置",
       menu_tools: "工具", menu_special: "专项功能", menu_help: "帮助",
       search: "搜索功能 / 分类 / handler", select_all: "全选",
@@ -68,6 +68,17 @@
       settings_general: "通用分析设置",
       status_idle: "空闲", status_running: "运行中", status_paused: "已暂停",
       status_done: "完成", status_cancelled: "已取消", status_error: "错误",
+      timeline_title: "发现时间线", timeline_refresh: "刷新",
+      timeline_hint: "按发现的时间 / 帧号纵向排列，点击条目可查看详情与标注。",
+      timeline_empty: "任务结束后，凭据、哈希、flag 等会按时间与帧号展示在这里。",
+      timeline_no_match: "没有匹配的结果，试试调整类别筛选。",
+      ann_status: "标注状态", ann_none: "无标注",
+      ann_confirmed: "已确认", ann_false_positive: "误报", ann_starred: "星标",
+      ann_note: "备注", ann_save: "保存标注", ann_saved: "标注已保存",
+      replay_button: "生成重放脚本", replay_title: "攻击重放脚本",
+      replay_running: "正在生成重放脚本…", replay_copied: "重放脚本已复制到剪贴板",
+      replay_close: "关闭",
+      topo_hint: "点击节点可按该端点过滤分析结果；连线按协议着色。",
     },
     en: {
       tab_log: "Log", tab_findings: "Findings", tab_artifacts: "Artifacts",
@@ -86,6 +97,19 @@
       settings_general: "General analysis",
       status_idle: "Idle", status_running: "Running", status_paused: "Paused",
       status_done: "Done", status_cancelled: "Cancelled", status_error: "Error",
+      timeline_title: "Findings timeline", timeline_refresh: "Refresh",
+      timeline_hint: "Listed vertically by capture time / frame; click an entry for details and annotations.",
+      timeline_empty: "Credentials, hashes and flags appear here by time and frame once a job finishes.",
+      timeline_no_match: "No matching findings; try another kind filter.",
+      ann_status: "Annotation", ann_none: "None",
+      ann_confirmed: "Confirmed", ann_false_positive: "False positive",
+      ann_starred: "Starred",
+      ann_note: "Note", ann_save: "Save annotation", ann_saved: "Annotation saved",
+      replay_button: "Replay script", replay_title: "Replay script",
+      replay_running: "Generating replay script…",
+      replay_copied: "Replay script copied to clipboard",
+      replay_close: "Close",
+      topo_hint: "Click a node to filter findings by that endpoint; links are colored by protocol.",
     },
   };
 
@@ -227,6 +251,10 @@
     kindSelect.innerHTML = '<option value="all">全部类别</option>' +
       kinds.map((kind) =>
         `<option value="${esc(kind.key)}">${esc(kind.name)}</option>`).join("");
+    const timelineKind = $("#timeline-kind");
+    if (timelineKind) {
+      timelineKind.innerHTML = kindSelect.innerHTML;
+    }
 
     // Feature list grouped by category.
     state.features = meta.features || [];
@@ -1325,9 +1353,9 @@
   function renderTopology() {
     const box = $("#viz-topology");
     if (!box) return;
-    const data = state.viz.topology;
+    const data = state.viz.topologyApi || state.viz.topology;
     const nodes = (data && data.nodes) || [];
-    const edges = (data && data.edges) || [];
+    const edges = (data && (data.links || data.edges)) || [];
     if (!nodes.length) {
       box.classList.add("muted");
       box.textContent = (data && data.text) || "没有可用的会话拓扑";
@@ -1347,38 +1375,65 @@
         radius: 5 + Math.sqrt((Number(node.bytes) || 0) / maxBytes) * 17,
       };
     });
-    const palette = ["#4ea1ff", "#7ad97a", "#ffd166", "#ff7b72", "#c792ea",
-      "#67d8ef", "#f78c6c", "#a3e635"];
-    const nodeColor = (node) => {
-      const name = (node.protocols || [])[0] || node.id;
-      let hash = 0;
-      for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) | 0;
-      return palette[Math.abs(hash) % palette.length];
-    };
     const edgeSvg = edges.map((edge) => {
       const a = positions[edge.source], b = positions[edge.target];
       if (!a || !b) return "";
       const weight = 1 + Math.min(7, Math.sqrt((Number(edge.bytes) || 0) /
         Math.max(data.max_bytes || maxBytes, 1)) * 9);
+      const color = protoColor(edge.protocol);
       return `<line class="topo-edge" x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}"
         x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}"
-        stroke-width="${weight.toFixed(2)}"><title>${esc(edge.protocol)} · ${edge.frames} 帧 · ${fmtSize(edge.bytes)} · 帧 ${esc(edge.first_frame)}-${esc(edge.last_frame)}</title></line>`;
+        stroke="${color}" stroke-width="${weight.toFixed(2)}"><title>${esc(edge.protocol)} · ${edge.frames} 帧 · ${fmtSize(edge.bytes)} · 帧 ${esc(edge.first_frame ?? "")}-${esc(edge.last_frame ?? "")}</title></line>`;
     }).join("");
     const nodeSvg = nodes.map((node) => {
       const pos = positions[node.id];
-      const label = node.port ? `${node.ip}:${node.port}` : node.ip;
-      return `<g class="topo-node" data-node="${esc(node.id)}">
+      const label = node.label || (node.port ? `${node.ip}:${node.port}` : node.ip);
+      return `<g class="topo-node" data-node="${esc(node.id)}" tabindex="0" role="button"
+        aria-label="按 ${esc(label)} 过滤结果">
         <circle cx="${pos.x.toFixed(1)}" cy="${pos.y.toFixed(1)}" r="${pos.radius.toFixed(1)}"
-          fill="${nodeColor(node)}"><title>${esc(label)} · ${node.frames} 帧 · ${fmtSize(node.bytes)} · ${esc((node.protocols || []).join(", "))}</title></circle>
+          fill="${protoColor((node.protocols || [])[0])}"><title>${esc(label)} · ${node.count ?? node.frames ?? 0} 帧 · ${fmtSize(node.bytes)} · ${esc((node.protocols || []).join(", "))}</title></circle>
         <text x="${pos.x.toFixed(1)}" y="${(pos.y + pos.radius + 13).toFixed(1)}"
           text-anchor="middle">${esc(label.length > 24 ? label.slice(0, 23) + "…" : label)}</text>
       </g>`;
     }).join("");
+    const protocols = [...new Set(edges.map((edge) => edge.protocol))].slice(0, 8);
+    const legend = protocols.map((name) =>
+      `<span class="topo-legend-item"><span class="dot" style="background:${protoColor(name)}"></span>${esc(name)}</span>`).join("");
     box.innerHTML = `<svg id="viz-topology-svg" viewBox="0 0 ${width} ${height}"
       role="img" aria-label="会话拓扑" xmlns="http://www.w3.org/2000/svg">
       <rect class="tl-bg" x="0" y="0" width="${width}" height="${height}"></rect>
       ${edgeSvg}${nodeSvg}</svg>
-      <div class="muted small">${esc(data.text || "")}</div>`;
+      ${legend ? `<div class="topo-legend">${legend}</div>` : ""}
+      <div class="muted small">${esc(data.text || "")} · ${esc(t("topo_hint"))}</div>`;
+  }
+
+  const PROTO_COLORS = {
+    HTTP: "#4ea1ff", HTTPS: "#4ea1ff", TLS: "#7ad97a", SSL: "#7ad97a",
+    DNS: "#ffd166", TCP: "#c792ea", UDP: "#67d8ef", SSH: "#ff7b72",
+    HTTP2: "#a3e635", QUIC: "#f78c6c", SMB: "#e0a3ff", ARP: "#9aa4b0",
+  };
+
+  function protoColor(name) {
+    const key = String(name || "").toUpperCase();
+    if (PROTO_COLORS[key]) return PROTO_COLORS[key];
+    let hash = 0;
+    for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) | 0;
+    const palette = ["#4ea1ff", "#7ad97a", "#ffd166", "#ff7b72", "#c792ea",
+      "#67d8ef", "#f78c6c", "#a3e635"];
+    return palette[Math.abs(hash) % palette.length];
+  }
+
+  function filterFindingsByEndpoint(endpoint) {
+    // Nodes are "ip:port"; findings search matches summary/detail/frame/
+    // feature text, so filter on the endpoint string itself.
+    const target = String(endpoint || "").trim();
+    if (!target) return;
+    switchTab("findings");
+    setVal("findings-search", target);
+    state.findingsPage = 1;
+    const job = packetJob();
+    if (job) loadFindings(job, { quiet: true });
+    else renderFindings();
   }
 
   async function loadViz() {
@@ -1399,6 +1454,16 @@
     state.viz.talkers = talkers.ok ? parseConversations(talkers.text) : null;
     state.viz.topology = topology.ok ? topology : null;
     state.viz.zoom = null;
+    // Prefer the job-scoped topology API when a task is attached; it keeps
+    // historical jobs replottable even after the pcap picker moves on.
+    state.viz.topologyApi = null;
+    const jobId = packetJob();
+    if (jobId) {
+      try {
+        const data = await api(`/api/topology?job=${encodeURIComponent(jobId)}`);
+        if (data.ok && (data.nodes || []).length) state.viz.topologyApi = data;
+      } catch (error) { /* fall back to the pcap-based stats above */ }
+    }
     setText("#viz-summary", timeline.ok
       ? (timeline.text || "") : (timeline.text || "统计失败"));
     renderViz();
@@ -1797,22 +1862,109 @@
       (match) => `<mark>${match}</mark>`);
   }
 
-  function showFinding(seq) {
+  async function showFinding(seq) {
     const item = state.findings.find((entry) => String(entry.seq) === String(seq));
     if (!item) return;
     const lines = [
       `类别: ${findingValue(item, "kind")}`,
       `级别: ${findingValue(item, "level")}`,
       `功能: ${item.feature || "—"}`,
-      `帧: ${item.frame || "—"}    时间: ${item.time || "—"}`,
+      `帧: ${item.frame || "—"}    时间: ${item.capture || item.time || "—"}`,
       "",
       item.summary || "",
     ];
     if (item.detail) lines.push("", item.detail);
-    openModal({
+    if (item.annotation && item.annotation.note) {
+      lines.push("", `备注: ${item.annotation.note}`);
+    }
+    const ann = item.annotation || { status: "", note: "" };
+    const values = await openModal({
       title: `结果详情 · ${findingValue(item, "kind")}`,
-      text: lines.join("\n"), hideCancel: true, okText: "关闭",
-    }).catch(() => {});
+      text: lines.join("\n"),
+      fields: [
+        {
+          name: "status", label: t("ann_status"), type: "select",
+          value: ann.status || "",
+          options: [
+            { value: "", label: t("ann_none") },
+            { value: "confirmed", label: t("ann_confirmed") },
+            { value: "false_positive", label: t("ann_false_positive") },
+            { value: "starred", label: t("ann_starred") },
+          ],
+        },
+        { name: "note", label: t("ann_note"), type: "textarea", value: ann.note || "" },
+      ],
+      okText: t("ann_save"),
+    });
+    if (!values) return;
+    const job = packetJob();
+    if (!job) { toast(state.language === "en"
+      ? "No analysis job available" : "还没有可标注的分析任务", "warn"); return; }
+    try {
+      await api("/api/annotations", {
+        method: "POST",
+        body: { job, seq: item.seq, status: values.status || "",
+                note: values.note || "" },
+      });
+      toast(t("ann_saved"), "good", 1800);
+      await loadFindings(job, { quiet: true });
+      renderTimelinePanel();
+    } catch (error) {
+      toast(error.message, "error", 7000);
+    }
+  }
+
+  function annotationLabel(status) {
+    return { confirmed: t("ann_confirmed"),
+             false_positive: t("ann_false_positive"),
+             starred: t("ann_starred") }[status] || "";
+  }
+
+  /* ------------------------------------------------- findings timeline */
+  function renderTimelinePanel() {
+    const box = $("#timeline");
+    if (!box) return;
+    if (!state.findings.length) {
+      box.innerHTML = `<div class="muted">${esc(t("timeline_empty"))}</div>`;
+      return;
+    }
+    const kind = val("timeline-kind") || "all";
+    const items = [...state.findings]
+      .filter((item) => kind === "all" || item.kind === kind)
+      .sort((left, right) => {
+        // Capture order first (frame number); entries without a frame keep
+        // their seq order at the end.
+        const lf = Number(left.frame) || 0, rf = Number(right.frame) || 0;
+        if (lf && rf) return lf - rf || left.seq - right.seq;
+        if (lf !== rf) return lf ? 1 : -1;
+        return left.seq - right.seq;
+      });
+    if (!items.length) {
+      box.innerHTML = `<div class="muted">${esc(t("timeline_no_match"))}</div>`;
+      return;
+    }
+    box.innerHTML = items.map((item) => {
+      const frame = Number(item.frame) || 0;
+      const when = item.capture || item.time || "";
+      const level = LEVEL_NAMES[item.level] ? item.level : "info";
+      const badge = item.annotation
+        ? annotationLabel(item.annotation.status) : "";
+      return `<div class="timeline-item lvl-${level}" data-seq="${esc(item.seq)}">
+        <div class="timeline-rail"><span class="timeline-dot"></span></div>
+        <div class="timeline-body">
+          <div class="timeline-meta">
+            <span class="log-time">${esc(when || "—")}</span>
+            ${frame ? `<button type="button" class="frame-link" data-frame="${frame}"
+              title="查看数据包 ${frame}">帧 ${frame}</button>` : ""}
+            <span class="finding-kind">${esc(findingValue(item, "kind"))}</span>
+            <span class="finding-level ${level}">${esc(findingValue(item, "level"))}</span>
+            ${item.feature ? `<span class="muted small">${esc(item.feature)}</span>` : ""}
+            ${badge ? `<span class="ann-badge">${esc(badge)}</span>` : ""}
+          </div>
+          <div class="timeline-summary">${highlightFlags(esc(clip(item.summary, 220)))}</div>
+        </div>
+      </div>`;
+    }).join("");
   }
 
   /* ------------------------------------------------------------ packets */
@@ -1911,11 +2063,38 @@
     }
   }
 
+  async function replayPacketSession() {
+    if (!packetState.job || !packetState.frame) return;
+    toast(t("replay_running"), "info", 2400);
+    try {
+      const data = await api("/api/replay", {
+        method: "POST",
+        body: { job: packetState.job, frame: packetState.frame },
+      });
+      const script = data.script || "";
+      try {
+        await navigator.clipboard.writeText(script);
+        toast(t("replay_copied"), "good", 2600);
+      } catch (error) { /* clipboard denied; the script is still shown */ }
+      closePacket();
+      await openModal({
+        title: `${t("replay_title")} · ${data.kind === "http" ? "requests" : "socket"}`,
+        text: script || data.text || "", hideCancel: true,
+        okText: t("replay_close"),
+      });
+    } catch (error) {
+      toast(error.message, "error", 8000);
+    }
+  }
+
   function bindPacket() {
     $("#packet-close").addEventListener("click", closePacket);
     $("#packet-ok").addEventListener("click", closePacket);
     $("#packet-clip").addEventListener("click", downloadPacketClip);
     $("#packet-wireshark").addEventListener("click", openInWireshark);
+    $("#packet-replay").addEventListener("click", () => {
+      replayPacketSession().catch((error) => toast(error.message, "error", 8000));
+    });
     $("#packet-modal").addEventListener("click", (event) => {
       if (event.target === $("#packet-modal")) closePacket();
     });
@@ -1939,6 +2118,7 @@
         encodeURIComponent(TOKEN)}`;
       csv.classList.remove("disabled");
       renderFindings();
+      renderTimelinePanel();
     } catch (error) {
       if (!options.quiet) toast(`获取分析结果失败：${error.message}`, "error", 7000);
     }
@@ -2494,6 +2674,44 @@
       event.preventDefault();
       openProtocolDetail(row.dataset.protocol);
     });
+    $("#viz-topology").addEventListener("click", (event) => {
+      const node = event.target.closest(".topo-node");
+      if (node) filterFindingsByEndpoint(node.dataset.node);
+    });
+    $("#viz-topology").addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      const node = event.target.closest(".topo-node");
+      if (!node) return;
+      event.preventDefault();
+      filterFindingsByEndpoint(node.dataset.node);
+    });
+
+    $("#timeline-kind").addEventListener("change", () => renderTimelinePanel());
+    $("#timeline-refresh").addEventListener("click", () => {
+      const job = packetJob();
+      if (!job) { toast("还没有分析任务", "warn"); return; }
+      loadFindings(job, { quiet: true })
+        .then(() => toast("分析结果已刷新", "good", 1400))
+        .catch((error) => toast(error.message, "error", 7000));
+    });
+    $("#timeline").addEventListener("click", (event) => {
+      const frame = event.target.closest(".frame-link");
+      if (frame) {
+        event.stopPropagation();
+        openPacket(frame.dataset.frame);
+        return;
+      }
+      const item = event.target.closest(".timeline-item");
+      if (item) showFinding(item.dataset.seq);
+    });
+    $("#timeline").addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      if (event.target.closest(".frame-link")) return;
+      const item = event.target.closest(".timeline-item");
+      if (!item) return;
+      event.preventDefault();
+      showFinding(item.dataset.seq);
+    });
 
     $("#log-search").addEventListener("input", debounce(reRenderLog, 180));
     $("#log-filter").addEventListener("change", reRenderLog);
@@ -2526,6 +2744,9 @@
         }
         if (tab.dataset.tab === "viz") {
           loadViz().catch((error) => toast(error.message, "error", 7000));
+        }
+        if (tab.dataset.tab === "timeline") {
+          renderTimelinePanel();
         }
       });
     });

@@ -336,6 +336,65 @@ FEATURES: list[Feature] = [
             "IP ID 字段的隐蔽信道分析",
             title_en="IP ID analysis (usually off)",
             description_en="Covert channel analysis of the IP ID field"),
+    Feature("checkBox_48", "LDAP流量分析", "ldap.analyze", "flow",
+            "LDAP 绑定凭据/SASL 机制、查询 base/filter、条目属性（AD 账号等）与 StartTLS 告警",
+            title_en="LDAP analysis",
+            description_en="LDAP bind credentials, SASL mechanisms, search "
+                           "base/filters, entry attributes (AD accounts) and "
+                           "StartTLS alerts"),
+    Feature("checkBox_49", "SMB流量分析", "smb.analyze", "flow",
+            "SMB2/3 共享与会话、NTLM 身份、文件读写还原落盘、加密/压缩告警",
+            title_en="SMB analysis",
+            description_en="SMB2/3 shares, sessions, NTLM identities, file "
+                           "read/write recovery and encryption/compression "
+                           "alerts"),
+    Feature("checkBox_50", "MongoDB流量分析", "mongodb.analyze", "flow",
+            "OP_MSG 命令与集合、SCRAM 认证交换、GridFS 文件还原落盘",
+            title_en="MongoDB analysis",
+            description_en="OP_MSG commands and collections, SCRAM "
+                           "authentication exchanges and GridFS file "
+                           "recovery"),
+    Feature("checkBox_51", "PostgreSQL流量分析", "postgres.analyze", "flow",
+            "查询语句与参数、结果摘要、明文口令消息与 COPY 数据",
+            title_en="PostgreSQL analysis",
+            description_en="Queries and parameters, result summaries, "
+                           "cleartext password messages and COPY data"),
+    Feature("checkBox_52", "Redis流量分析", "redis.analyze", "flow",
+            "RESP 命令、AUTH/ACL 凭据、敏感键读取与写入值摘要（支持非标准端口）",
+            title_en="Redis analysis",
+            description_en="RESP commands, AUTH/ACL credentials, sensitive "
+                           "key reads and written values (non-standard "
+                           "ports supported)"),
+    Feature("checkBox_53", "SSH流量分析", "ssh.analyze", "flow",
+            "SSH 版本交换、KEXINIT 算法协商、userauth 用户名/方法/口令与爆破时间线",
+            title_en="SSH analysis",
+            description_en="SSH version exchange, KEXINIT negotiation, "
+                           "userauth usernames/methods/passwords and brute "
+                           "force timeline"),
+    Feature("checkBox_54", "日志证据关联", "forensics.log_import", "misc",
+            "导入 Suricata eve.json / Zeek 日志，归一化为统一事件模型并"
+            "与流量发现按 IP/端口关联（log_path 或 log_text 参数）",
+            title_en="Log evidence correlation",
+            description_en="Import Suricata eve.json / Zeek logs, normalise "
+                           "them into a common event model and correlate "
+                           "with capture findings by IP/port"),
+    Feature("checkBox_55", "Meterpreter会话分析", "meterpreter.analyze", "c2",
+            "Meterpreter/metsvc TCP TLV 会话识别，提取命令 ID、字符串参数与时间线",
+            title_en="Meterpreter session analysis",
+            description_en="Identify Meterpreter/metsvc TCP TLV sessions and "
+                           "extract command IDs, string parameters and a "
+                           "timeline"),
+    Feature("checkBox_56", "Sliver/meterpreter C2扩展", "c2ext.analyze", "c2",
+            "Sliver HTTP/DNS/mTLS beacon 识别与 meterpreter staging/加密"
+            "传输分析；可用 sliver_session_key / meterpreter_symkey 解密"
+            "会话载荷（sliver_dns_domain 指定已知 DNS beacon 域名）",
+            title_en="Sliver/meterpreter C2 extended analysis",
+            description_en="Identify Sliver HTTP/DNS/mTLS beacons and "
+                           "meterpreter staging/encrypted transport; decrypt "
+                           "session payloads with the sliver_session_key / "
+                           "meterpreter_symkey parameters "
+                           "(sliver_dns_domain lists known DNS beacon "
+                           "domains)"),
 ]
 
 BY_CHECKBOX = {feature.checkbox: feature for feature in FEATURES}

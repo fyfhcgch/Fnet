@@ -306,6 +306,13 @@
             <path d="M4 19V9M10 19V4.5M16 19v-6.5M22 19H2"/>
           </svg><span data-i18n="tab_viz">统计图表</span>
         </button>
+        <button class="tab" data-tab="timeline" role="tab">
+          <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <circle cx="6" cy="6" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="6" cy="18" r="2"/>
+            <path d="M8 6h8M8 18h8M14 12h4"/>
+          </svg><span data-i18n="tab_timeline">结果时间线</span>
+        </button>
         <button class="tab" data-tab="history" role="tab">
           <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
@@ -456,6 +463,20 @@
         </div>
       </section>
 
+      <section id="tab-timeline" class="tab-panel">
+        <div class="panel-head">
+          <h3 data-i18n="timeline_title">发现时间线</h3>
+          <div class="findings-actions">
+            <select id="timeline-kind"><option value="all">全部类别</option></select>
+            <button id="timeline-refresh" class="ghost small" data-i18n="timeline_refresh">刷新</button>
+          </div>
+        </div>
+        <div class="muted small" data-i18n="timeline_hint">按发现的时间 / 帧号纵向排列，点击条目可查看详情与标注。</div>
+        <div id="timeline" class="timeline-list">
+          <div class="muted" data-i18n="timeline_empty">任务结束后，凭据、哈希、flag 等会按时间与帧号展示在这里。</div>
+        </div>
+      </section>
+
       <section id="tab-history" class="tab-panel">
         <div class="panel-head">
           <h3>任务历史</h3>
@@ -528,6 +549,7 @@
     <div class="modal-foot">
       <button id="packet-clip" class="ghost">导出 pcap 片段</button>
       <button id="packet-wireshark" class="ghost">在 Wireshark 中打开</button>
+      <button id="packet-replay" class="ghost" data-i18n="replay_button">生成重放脚本</button>
       <button id="packet-ok" class="primary">关闭</button>
     </div>
   </div>

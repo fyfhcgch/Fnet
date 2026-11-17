@@ -579,3 +579,242 @@ def decode_text(text: str) -> dict:
                    {f for c in candidates for f in codec.find_flags(c["value"])})
     return _result(True, "\n".join(f"[{c['label']}]\n{c['value']}" for c in candidates),
                    candidates=candidates, flags=flags)
+
+
+# ---------------------------------------------------------------------------
+# Job topology + attack replay snippets (tulip / pkappa2 style)
+# ---------------------------------------------------------------------------
+def network_topology(pcap: str, toolbox: ToolBox,
+                     cancel: threading.Event | None = None) -> dict:
+    """Compact endpoint graph for one capture, reshaped for ``/api/topology``.
+
+    Reuses :func:`session_topology` so both the chart view and this API stay
+    consistent; nodes carry ``{id,label,protocols,count}`` and links
+    ``{source,target,protocol,frames}``.
+    """
+    base = session_topology(pcap, toolbox, cancel)
+    if not base.get("ok"):
+        return base
+    nodes = [{
+        "id": item["id"],
+        "label": (f"{item['ip']}:{item['port']}"
+                  if item.get("port") else str(item.get("ip") or item["id"])),
+        "protocols": item.get("protocols") or [],
+        "count": item.get("frames", 0),
+        "bytes": item.get("bytes", 0),
+    } for item in base.get("nodes") or []]
+    links = [{
+        "source": item["source"], "target": item["target"],
+        "protocol": item.get("protocol") or "IP",
+        "protocols": item.get("protocols") or [],
+        "frames": item.get("frames", 0),
+        "bytes": item.get("bytes", 0),
+    } for item in base.get("edges") or []]
+    return _result(True, base.get("text") or "", nodes=nodes, links=links,
+                   total_bytes=base.get("total_bytes"),
+                   total_frames=base.get("total_frames"))
+
+
+REPLAY_METHODS = ("GET", "POST", "PUT", "HEAD", "DELETE", "OPTIONS",
+                  "PATCH", "CONNECT", "TRACE")
+REPLAY_MAX_SPANS = 64
+_SENSITIVE_HINT = ("Authorization", "Cookie", "Set-Cookie", "Proxy-Authorization")
+
+
+def _looks_sensitive(headers, body: bytes) -> bool:
+    """True when a replayed request carries credentials worth a reminder."""
+    for name, value in headers or []:
+        if name.lower() in ("authorization", "cookie", "proxy-authorization"):
+            return True
+        if any(marker in value for marker in ("password", "passwd", "pwd=")):
+            return True
+    low = body[:8192].lower()
+    return (b"password" in low or b"passwd" in low or b"pwd=" in low
+            or b"pass=" in low)
+
+
+def _parse_http_requests(data: bytes) -> list[dict]:
+    """Split one client direction into HTTP requests (best effort).
+
+    Returns an empty list when the direction is not plain HTTP, so callers
+    can fall back to a raw TCP replay.
+    """
+    parsed: list[dict] = []
+    offset = 0
+    while offset < len(data):
+        head_end = data.find(b"\r\n\r\n", offset)
+        if head_end < 0:
+            break
+        lines = data[offset:head_end].decode("iso-8859-1", "replace").split("\r\n")
+        first = lines[0].split(" ")
+        if len(first) < 2 or first[0].upper() not in REPLAY_METHODS:
+            break
+        headers = []
+        for line in lines[1:]:
+            name, _, value = line.partition(":")
+            if name.strip():
+                headers.append((name.strip(), value.strip()))
+        length = 0
+        for name, value in headers:
+            if name.lower() == "content-length":
+                try:
+                    length = max(0, int(value))
+                except ValueError:
+                    length = 0
+        body_start = head_end + 4
+        body = bytes(data[body_start:body_start + length])
+        offset = min(body_start + length, len(data))
+        parsed.append({"method": first[0].upper(), "path": first[1],
+                       "headers": headers, "body": body})
+        if len(parsed) >= 64:
+            break
+    return parsed
+
+
+def _replay_int(value, minimum: int = 0) -> int | None:
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return number if number >= minimum else None
+
+
+def _http_replay_script(stream_id: str, client, server_reqs: list[dict]) -> list[str]:
+    """requests-based replay for an HTTP session (sensitive data kept)."""
+    host, port = client.dst or "0.0.0.0", client.dport or "80"
+    lines = [
+        "#!/usr/bin/env python3",
+        f"# Fnet 攻击重放脚本（requests 版）· tcp.stream {stream_id}",
+        f"# 来源会话: {client.src}:{client.sport} -> {host}:{port}",
+        "# 警告: 以下请求头与请求体原样保留了会话中的凭据 / Cookie / 密码等敏感数据，",
+        "#       仅用于在获得授权的环境中完整重放，请勿外传。",
+        "import requests",
+        "",
+        f"HOST = {host!r}",
+        f"PORT = {int(port) if str(port).isdigit() else port!r}",
+        "session = requests.Session()",
+        'base = f"http://{HOST}:{PORT}"',
+        "",
+    ]
+    for index, req in enumerate(server_reqs, 1):
+        path = req["path"]
+        if path.startswith(("http://", "https://")):
+            url = repr(path)
+        else:
+            url = f"base + {path!r}"
+        lines.append(f"# ---- 请求 {index} · {req['method']} {path}")
+        if _looks_sensitive(req["headers"], req["body"]):
+            lines.append("# 注意: 该请求包含敏感凭据（Authorization/Cookie/密码），已原样保留。")
+        headers = ", ".join(f"{name!r}: {value!r}"
+                            for name, value in req["headers"])
+        lines.append(f"resp = session.request(")
+        lines.append(f"    {req['method']!r},")
+        lines.append(f"    {url},")
+        lines.append(f"    headers={{{headers}}},")
+        if req["body"]:
+            lines.append(f"    data={req['body']!r},")
+        lines.append(")")
+        lines.append("print(resp.status_code, resp.url, len(resp.content))")
+        lines.append("")
+    return lines
+
+
+def _tcp_replay_script(stream_id: str, client, spans) -> list[str]:
+    """socket-based replay that re-sends the client bytes verbatim."""
+    host, port = client.dst or "0.0.0.0", client.dport or "0"
+    lines = [
+        "#!/usr/bin/env python3",
+        f"# Fnet 攻击重放脚本（socket 版）· tcp.stream {stream_id}",
+        f"# 来源会话: {client.src}:{client.sport} -> {host}:{port}",
+        "# 警告: 以下二进制载荷原样保留了会话中的凭据等敏感数据，",
+        "#       仅用于在获得授权的环境中完整重放，请勿外传。",
+        "import socket",
+        "",
+        f"HOST = {host!r}",
+        f"PORT = {int(port) if str(port).isdigit() else port!r}",
+        "",
+        "# 按捕获顺序原样重放客户端发送的数据段（帧号注释便于回溯抓包）。",
+        "payloads = [",
+    ]
+    for start, end, frame in spans:
+        chunk = client.data[start:end]
+        lines.append(f"    ({chunk!r},  # 帧 {frame}")
+        lines.append("    ),")
+    lines += [
+        "]",
+        "",
+        "conn = socket.create_connection((HOST, PORT), timeout=10)",
+        "try:",
+        "    for data, frame in payloads:",
+        "        conn.sendall(data)",
+        "        conn.settimeout(1.0)",
+        "        try:",
+        "            reply = conn.recv(65536)",
+        "            print(frame, '->', len(reply), 'bytes', reply[:200])",
+        "        except socket.timeout:",
+        "            print(frame, '-> no reply within 1s')",
+        "finally:",
+        "    conn.close()",
+    ]
+    return lines
+
+
+def replay_script(pcap: str, toolbox: ToolBox, stream=None, frame=None,
+                  cancel: threading.Event | None = None) -> dict:
+    """Generate a runnable Python replay script for one TCP session.
+
+    ``stream`` is a ``tcp.stream`` index; ``frame`` locates the session that
+    carried that frame.  HTTP sessions yield a ``requests`` script, anything
+    else a raw ``socket`` script that re-sends the client bytes verbatim
+    (credentials included, flagged with reminders).
+    """
+    from fnet.utils.stream import STREAM_FIELDS, reassemble_rows
+
+    tshark, error = _tshark(toolbox, cancel)
+    if error:
+        return error
+    stream_id = _replay_int(stream, minimum=0)
+    if stream_id is None and frame not in ("", None):
+        number = clamp_frame(frame)
+        if number is None:
+            return _result(False, "帧号无效")
+        rows = tshark.fields(pcap, ["frame.number", "tcp.stream"],
+                             f"frame.number == {number}", cancel=cancel)
+        stream_id = next((_replay_int(row[1]) for row in rows
+                          if len(row) > 1 and _replay_int(row[1]) is not None),
+                         None)
+        if stream_id is None:
+            return _result(False, f"帧 {number} 不属于任何 TCP 会话")
+    if stream_id is None:
+        return _result(False, "需要 stream 或 frame 参数")
+    rows = tshark.fields(pcap, STREAM_FIELDS, f"tcp.stream == {stream_id}",
+                         cancel=cancel)
+    directions = reassemble_rows(rows)
+    if not directions:
+        return _result(False, f"没有找到 tcp.stream {stream_id} 的会话数据")
+
+    def first_frame(item):
+        value = item.frame_at(0)
+        return int(value) if str(value).isdigit() else 1 << 30
+
+    client = min(directions, key=first_frame)
+    if not client.data:
+        return _result(False, f"tcp.stream {stream_id} 没有客户端发送的数据")
+    requests_out = _parse_http_requests(client.data)
+    if requests_out:
+        lines = _http_replay_script(str(stream_id), client, requests_out)
+        kind, steps, text_kind = "http", len(requests_out), "HTTP"
+    else:
+        spans = list(client.spans())
+        if len(spans) > REPLAY_MAX_SPANS:
+            head = spans[:REPLAY_MAX_SPANS]
+            last = head[-1]
+            head[-1] = (last[0], len(client.data), last[2])
+            spans = head
+        lines = _tcp_replay_script(str(stream_id), client, spans)
+        kind, steps, text_kind = "tcp", len(spans), "裸 TCP"
+    return _result(
+        True, f"tcp.stream {stream_id} · {text_kind} 重放脚本（{steps} 步）",
+        kind=kind, script="\n".join(lines) + "\n", stream=str(stream_id),
+        client=f"{client.src}:{client.sport}",
+        server=f"{client.dst}:{client.dport}")

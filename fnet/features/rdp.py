@@ -147,7 +147,11 @@ def handler(ctx: FeatureContext) -> None:
         key_path=key,
         server_ip=params.get("server_ip") or None,
         port=int(params.get("port") or 3389),
-        tshark_path=params.get("tshark_path") or ctx.config.get("tshark"),
+        # tshark 解析顺序：任务参数 → [config] tshark（WebUI「tshark 路径」
+        # 设置，全仓 tshark 覆盖的规范位置）→ JobManager 已解析的 ctx.tshark，
+        # 保证 RDP 解密用的二进制与其余分析功能一致。
+        tshark_path=(params.get("tshark_path") or ctx.config.get("tshark")
+                     or getattr(ctx.tshark, "path", "") or None),
         player_path=params.get("player_path") or "pyrdp-player",
         output_root=ctx.output_dir / "rdp",
         log=ctx.report,

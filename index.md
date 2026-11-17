@@ -14,13 +14,29 @@ description: 把 pcap 拖进浏览器，勾选需要的检查项，得到 flag�
   <p class="cta-row">
     <a class="btn" href="{{ '/manual/tutorial/' | relative_url }}">开始实战</a>
     <a class="btn ghost" href="{{ '/manual/install/' | relative_url }}">安装与启动</a>
-    <a class="btn ghost" href="{{ '/manual/features/' | relative_url }}">浏览 37 项功能</a>
+    <a class="btn ghost" href="{{ '/manual/features/' | relative_url }}">浏览 46 项功能</a>
     <a class="btn ghost" href="https://github.com/fyfhcgch/Fnet">GitHub 仓库</a>
     {%- if site.version %}
     <span class="badge version-badge">v{{ site.version }}</span>
     {%- endif %}
   </p>
 </div>
+
+## 2.20.0 更新
+
+- **协议补齐**：LDAP、SMB2/3、MongoDB、PostgreSQL、Redis、SSH 六个会话级功能
+  注册为独立复选框（共 46 项），统一输出命令、查询、凭据、文件与爆破时间线。
+- **C2 与取证**：Sliver（HTTP/DNS/mTLS beacon）与 meterpreter（staging、XOR 线
+  格式、AES 加密包）识别解密；导入 Suricata `eve.json` 与 Zeek 日志，按 IP/
+  端口/时间与流量发现做旁证关联。
+- **QUIC 无 keylog 取证**：纯标准库实现 RFC 9001 Initial 密钥派生与 AES-GCM
+  解密，无 keylog 也能取出 ClientHello、SNI、版本协商与连接 ID。
+- **可选加速层**：自动探测 CUDA → CPU JIT → 纯 Python 并静默回退；关键字扫描
+  与 GCM 校验吞吐分别提升至 96× 与 131×，核心零依赖不变。
+- **结果可交付**：findings 支持人工标注与误报标记，报告三格式同步渲染，任务
+  对比的 diff 纳入标注差异。
+- **工程**：`jobs.py` 按分片/断点/findings 拆分，Windows CI 转门禁，示例夹具
+  补齐 USB、蓝牙与 RDP，发布走 PyPI Trusted Publishing。
 
 ## 2.19.0 更新
 
@@ -38,7 +54,7 @@ description: 把 pcap 拖进浏览器，勾选需要的检查项，得到 flag�
 
 <p class="shot">
   <img src="{{ '/assets/images/webui.webp' | relative_url }}"
-       alt="Fnet WebUI：左侧 37 个功能的勾选面板，右侧分析结果表格">
+       alt="Fnet WebUI：左侧 46 个功能的勾选面板，右侧分析结果表格">
 </p>
 <p class="shot-caption">真实界面截图：暖夜主题下的分析结果页</p>
 
@@ -51,7 +67,7 @@ description: 把 pcap 拖进浏览器，勾选需要的检查项，得到 flag�
   </div>
   <div class="card">
     <h3>按赛题组织功能</h3>
-    <p>37 个分析功能分成 13 类：从 flag 扫描、HTTP 与 Webshell，到工控、无线、TLS 解密。</p>
+    <p>46 个分析功能分成 13 类：从 flag 扫描、HTTP 与 Webshell，到工控、无线、TLS 解密。</p>
   </div>
   <div class="card">
     <h3>结果能带走</h3>
@@ -162,9 +178,9 @@ python3 -m fnet</code></pre>
     <p>NTLM 哈希与 Kerberos 票据；keytab/口令/原始密钥解密、PAC 与用户时间线，输出 hashcat 格式。</p>
   </div>
   <div class="card">
-    <span class="badge">10 项</span>
+    <span class="badge">16 项</span>
     <h3>协议流量</h3>
-    <p>TCP / UDP / DNS / ICMP / FTP / SMTP / Telnet / MySQL / ARP / GTP；DNS/ICMP 隧道重组、邮件附件、MySQL 结果集与 LOAD。</p>
+    <p>TCP / UDP / DNS / ICMP / FTP / SMTP / Telnet / MySQL / ARP / GTP / LDAP / SMB / MongoDB / PostgreSQL / Redis / SSH；DNS/ICMP 隧道重组、邮件附件、MySQL 结果集与 LOAD，数据库与 SSH 会话凭据还原。</p>
   </div>
   <div class="card">
     <span class="badge">7 项</span>
@@ -224,7 +240,7 @@ python3 -m fnet</code></pre>
   <li>
     <a href="{{ '/manual/features/' | relative_url }}">
       <strong>功能清单</strong>
-      <span>37 项功能的作用、复选框编号与所需工具</span>
+      <span>46 项功能的作用、复选框编号与所需工具</span>
     </a>
   </li>
   <li>

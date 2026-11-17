@@ -1,11 +1,22 @@
-"""Background analysis jobs used by the WebUI and the CLI."""
+"""Background analysis jobs used by the WebUI and the CLI.
+
+This module is the public facade: it keeps :class:`JobManager`, :class:`Job`,
+``CACHE_DIR`` and :data:`ANNOTATION_STATUSES` importable from here, while the
+implementation lives in focused modules:
+
+* :mod:`fnet.jobs_shards` — frame-range splitting and shard clipping;
+* :mod:`fnet.jobs_checkpoint` — ``job.json`` checkpoint/resume persistence;
+* :mod:`fnet.jobs_findings` — findings JSON/CSV and human annotations.
+
+``CACHE_DIR`` is read lazily through :func:`fnet.jobs_checkpoint.cache_dir` so
+tests that monkeypatch ``fnet.jobs.CACHE_DIR`` keep working.
+"""
 from __future__ import annotations
 
 import datetime as _dt
 import json
 import secrets
 import shutil
-import subprocess
 import threading
 import traceback
 import zipfile
@@ -14,36 +25,25 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from fnet import findings as findings_mod
+from fnet import jobs_checkpoint as _ckpt
+from fnet import jobs_findings as _jfnd
+from fnet import jobs_shards as _shards
+# Re-exported for backwards compatibility with ``from fnet.jobs import …``.
+from fnet.jobs_findings import ANNOTATION_STATUSES
 from fnet.config import Config
 from fnet.features.registry import (
     BY_CHECKBOX, BY_HANDLER, CancelledError, Feature, FeatureContext, call_feature,
 )
 from fnet.logger import JobLog, logger
+# ``CACHE_DIR`` stays importable/patchable on this module (``fnet.jobs.CACHE_DIR``)
+# — internal code must read it lazily via ``_ckpt.cache_dir()`` so monkeypatching
+# keeps working; do not use this binding inside the manager.
 from fnet.paths import CACHE_DIR
 from fnet.report import (
-    MAX_LOG_RECORDS, MAX_REPORT_FINDINGS, normalise_sections, parse_report_text,
-    render_html, render_markdown, select_findings, write_reports,
+    MAX_LOG_RECORDS, MAX_REPORT_FINDINGS, annotation_lines, normalise_sections,
+    parse_report_text, render_html, render_markdown, write_reports,
 )
 from fnet.tools.runner import ToolBox
-
-
-def _split_ranges(total: int, shards: int) -> list[tuple[int, int]]:
-    """Split ``1..total`` into ``shards`` contiguous 1-based frame ranges."""
-    total = max(0, int(total))
-    shards = max(1, int(shards))
-    if total <= 0:
-        return []
-    shards = min(shards, total)
-    size, extra = divmod(total, shards)
-    ranges: list[tuple[int, int]] = []
-    start = 1
-    for index in range(shards):
-        length = size + (1 if index < extra else 0)
-        if length <= 0:
-            continue
-        ranges.append((start, start + length - 1))
-        start += length
-    return ranges
 
 
 @dataclass
@@ -136,69 +136,21 @@ class JobManager:
         self._concurrency = 1
         self._batch_paused = False
 
-    # -- history -------------------------------------------------------
+    # -- checkpoint / history ------------------------------------------
     @staticmethod
     def _history_path(job: Job) -> Path:
         return job.output_dir / "job.json"
 
     def _snapshot(self, job: Job) -> dict:
-        """Serializable metadata persisted next to each job's artifacts."""
-        return {
-            "id": job.id,
-            "pcap": job.pcap,
-            "pcap_name": Path(job.pcap).name,
-            "features": [f.checkbox for f in job.features],
-            "feature_titles": [f.title for f in job.features],
-            "params": job.params,
-            "status": job.status,
-            "progress": job.progress,
-            "created": job.created,
-            "started": job.started,
-            "finished": job.finished,
-            "succeeded": job.succeeded,
-            "failed": job.failed,
-            "completed": list(job.completed),
-            "feature_status": dict(job.feature_status),
-            "shards": job.shards,
-            "report": job.report_path,
-            "report_markdown": job.report_markdown_path,
-            "report_html": job.report_html_path,
-            "findings": job.findings_path,
-            "findings_csv": job.findings_csv_path,
-            "findings_count": len(job.findings),
-        }
+        return _ckpt.snapshot(job)
 
     def _write_history(self, job: Job) -> None:
-        """Best-effort ``job.json`` snapshot; history must never fail a job."""
-        try:
-            job.output_dir.mkdir(parents=True, exist_ok=True)
-            self._history_path(job).write_text(
-                json.dumps(self._snapshot(job), ensure_ascii=False, indent=2,
-                           default=str),
-                encoding="utf-8")
-        except OSError as exc:
-            job.log.warn(f"任务历史写入失败: {exc}")
+        _ckpt.write_history(job)
 
     def history(self, limit: int = 100) -> list[dict]:
         """Return on-disk job history merged with the live in-memory jobs."""
-        entries: dict[str, dict] = {}
         active = {job.id for job in self._jobs.values()}
-        root = CACHE_DIR / "jobs"
-        if root.is_dir():
-            for path in root.glob("*/job.json"):
-                try:
-                    data = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    continue
-                if not isinstance(data, dict) or not data.get("id"):
-                    continue
-                job_id = str(data["id"])
-                if not path.parent.name == job_id:
-                    continue
-                if job_id not in active and data.get("status") in ("queued", "running"):
-                    # The process exited before the job could finish.
-                    data["status"] = "interrupted"
-                entries[job_id] = data
+        entries = _ckpt.load_disk_entries(active)
         for job in self._jobs.values():
             entries[job.id] = self._snapshot(job)
         ordered = sorted(entries.values(),
@@ -251,96 +203,157 @@ class JobManager:
                 "logs": [record.as_dict() for record in
                          live.log.records_since(0, limit=MAX_LOG_RECORDS)],
                 "artifacts": self.artifacts(live),
-                "findings": findings_mod.normalise_all(live.findings),
+                "findings": self._annotated_findings(job_id, live.findings),
             }
         detail = self.history_detail(job_id)
         if detail is None:
             return None
         found = self.findings_for(job_id, limit=MAX_REPORT_FINDINGS)
+        items = found["findings"] if found else []
+        if items:
+            # ``findings_for`` already assigns seq; annotations are keyed by it.
+            self.merge_annotations(job_id, items)
         return {
             "job": detail["job"],
             "logs": parse_report_text(detail["report"]),
             "artifacts": detail["artifacts"],
-            "findings": found["findings"] if found else [],
+            "findings": items,
         }
+
+    # -- annotations ----------------------------------------------------
+    def _annotations_file(self, job_id: str) -> Path | None:
+        return _jfnd.annotations_file(self, job_id)
+
+    def load_annotations(self, job_id: str) -> dict | None:
+        """Persisted human annotations keyed by finding ``seq``."""
+        return _jfnd.load_annotations(self, job_id)
+
+    def set_annotation(self, job_id: str, seq, status: str = "",
+                       note: str = "") -> dict | None:
+        """Set or clear one finding's annotation, persisted per job.
+
+        Annotations are usually written after a job finished, so the three
+        report files are re-rendered afterwards to keep them consistent.
+        """
+        result = _jfnd.set_annotation(self, job_id, seq, status, note)
+        if result is not None:
+            self._refresh_reports(job_id)
+        return result
+
+    def merge_annotations(self, job_id: str, items: list) -> None:
+        """Attach persisted annotations onto findings (in place, by seq)."""
+        _jfnd.merge_annotations(self, job_id, items)
+
+    def _annotated_findings(self, job_id: str, items: list) -> list[dict]:
+        """Normalised findings of a live job plus their persisted annotations."""
+        annotated = findings_mod.normalise_all(items)
+        for index, item in enumerate(annotated, 1):
+            item.setdefault("seq", index)
+        self.merge_annotations(job_id, annotated)
+        return annotated
+
+    @staticmethod
+    def _split_report_body(text: str) -> tuple[list[str], list[str]]:
+        """Split ``report.txt`` into its fixed header and the log body."""
+        lines = str(text or "").splitlines()
+        separators = [index for index, line in enumerate(lines)
+                      if line.startswith("=" * 60)]
+        if len(separators) >= 2:
+            cut = separators[1] + 1
+            return lines[:cut], lines[cut:]
+        return [], lines
+
+    @staticmethod
+    def _strip_annotation_block(body: list[str]) -> list[str]:
+        """Drop a previously rendered ``人工标注:`` block (idempotent rewrite)."""
+        start = 0
+        while start < len(body) and not body[start].strip():
+            start += 1
+        if start >= len(body) or body[start].strip() != "人工标注:":
+            return body
+        index = start + 1
+        while index < len(body) and body[index].startswith("  "):
+            index += 1
+        while index < len(body) and not body[index].strip():
+            index += 1
+        return body[:start] + body[index:]
+
+    def _refresh_reports(self, job_id: str) -> None:
+        """Re-render the report files after an annotation change.
+
+        Annotations are normally written *after* a job finished, so the three
+        artifacts written by the worker would otherwise go stale.  Best effort
+        by design: a report problem must never fail the annotation request.
+        """
+        live = self.get(job_id)
+        if live is not None:
+            if live.status in ("queued", "running"):
+                # The worker renders the reports itself once it finishes.
+                return
+            try:
+                self._write_report(live, live.status)
+            except Exception as exc:  # noqa: BLE001 - reports are optional
+                live.log.debug(f"标注后重生成报告失败: {exc}")
+            return
+        output = self.output_dir_for(job_id)
+        source = self.report_source(job_id)
+        if output is None or source is None:
+            return
+        have_txt = (output / "report.txt").is_file()
+        have_rich = any((output / f"report.{suffix}").is_file()
+                        for suffix in ("md", "html"))
+        if not have_txt and not have_rich:
+            return
+        findings = source.get("findings") or []
+        try:
+            if have_rich:
+                from types import SimpleNamespace
+
+                entry = source["job"]
+                features = [
+                    SimpleNamespace(checkbox=str(checkbox), title=str(title))
+                    for title, checkbox in zip(
+                        entry.get("feature_titles") or [],
+                        entry.get("features") or [])]
+                stub = SimpleNamespace(
+                    id=job_id, pcap=str(entry.get("pcap") or ""),
+                    features=features, params=entry.get("params") or {},
+                    output_dir=output, status=str(entry.get("status") or ""),
+                    created=entry.get("created"), started=entry.get("started"),
+                    finished=entry.get("finished"))
+                write_reports(stub, source["logs"], source["artifacts"],
+                              findings=findings)
+            if have_txt:
+                path = output / "report.txt"
+                header, body = self._split_report_body(
+                    path.read_text(encoding="utf-8", errors="replace"))
+                body = self._strip_annotation_block(body)
+                while body and not body[0].strip():
+                    body = body[1:]
+                notes = annotation_lines(findings)
+                lines = list(header)
+                if notes:
+                    lines.extend(["", "人工标注:", *notes])
+                if body:
+                    lines.extend([""] + body)
+                path.write_text("\n".join(lines), encoding="utf-8")
+        except Exception:  # noqa: BLE001 - never fail the annotation request
+            return
 
     # -- structured findings -------------------------------------------
     @staticmethod
     def _derived_findings(report_text: str) -> list[dict]:
         """Fallback for jobs analysed before ``findings.json`` existed."""
-        items: list[dict] = []
-        for record in select_findings(parse_report_text(report_text)):
-            item = findings_mod.normalise({
-                "kind": "log",
-                "level": record.get("level"),
-                "time": record.get("time"),
-                "summary": record.get("text"),
-            })
-            if item is not None:
-                items.append(item)
-        return items
+        return _jfnd.derived_findings(report_text)
 
     def findings_for(self, job_id: str, query: str = "", kind: str = "",
                      level: str = "", limit: int = 5000) -> dict | None:
         """Return structured findings for a live or historical job."""
-        output = self._job_dir(job_id) if self.get(job_id) is None else None
-        live = self.get(job_id)
-        if live is None and output is None:
-            return None
-        derived = False
-        items: list[dict] = []
-        if live is not None:
-            items = findings_mod.normalise_all(live.findings)
-        else:
-            path = output / "findings.json"
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                data = None
-            if isinstance(data, dict):
-                items = findings_mod.normalise_all(data.get("findings") or [])
-            elif isinstance(data, list):
-                items = findings_mod.normalise_all(data)
-            if not items:
-                detail = self.history_detail(job_id)
-                if detail is not None:
-                    items = self._derived_findings(detail["report"])
-                    derived = bool(items)
-        for index, item in enumerate(items, 1):
-            item["seq"] = index
-            item["id"] = f"f{index:05d}"
-        kinds = findings_mod.kind_counts(items)
-        selected = findings_mod.filter_items(items, query, kind, level)
-        try:
-            limit = max(1, int(limit))
-        except (TypeError, ValueError):
-            limit = 5000
-        return {
-            "findings": selected[:limit],
-            "total": len(items),
-            "count": len(selected),
-            "kinds": kinds,
-            "derived": derived,
-            "truncated": len(selected) > limit,
-        }
+        return _jfnd.findings_for(self, job_id, query, kind, level, limit)
 
     def export_findings(self, job_id: str, fmt: str = "csv") -> dict | None:
         """Render findings as CSV (download) without truncating the table."""
-        live = self.get(job_id)
-        if live is not None:
-            items = findings_mod.normalise_all(live.findings)
-        else:
-            found = self.findings_for(job_id, limit=findings_mod.MAX_FINDINGS)
-            if found is None:
-                return None
-            items = found["findings"]
-        if str(fmt or "csv").lower() != "csv":
-            return None
-        return {
-            "filename": f"fnet-findings-{job_id[:8]}.csv",
-            "content": findings_mod.to_csv(items),
-            "count": len(items),
-        }
+        return _jfnd.export_findings(self, job_id, fmt)
 
     def export_report(self, job_id: str, fmt: str = "html",
                       sections=None) -> dict | None:
@@ -446,13 +459,7 @@ class JobManager:
 
     def _job_dir(self, job_id: str) -> Path | None:
         """Resolve ``<cache>/jobs/<hex id>`` without allowing traversal."""
-        if not job_id or any(ch not in "0123456789abcdef" for ch in job_id):
-            return None
-        root = (CACHE_DIR / "jobs").resolve()
-        target = (root / job_id).resolve()
-        if target.parent != root or not target.is_dir():
-            return None
-        return target
+        return _ckpt.job_dir(job_id)
 
     def output_dir_for(self, job_id: str) -> Path | None:
         """Output directory for live or historical jobs (``None`` if absent)."""
@@ -466,17 +473,7 @@ class JobManager:
         live = self.get(job_id)
         if live is not None:
             return live.pcap
-        output = self._job_dir(job_id)
-        if output is None:
-            return None
-        try:
-            data = json.loads((output / "job.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
-        if not isinstance(data, dict):
-            return None
-        pcap = str(data.get("pcap") or "")
-        return pcap or None
+        return _ckpt.pcap_from_history(job_id)
 
     def delete_history(self, job_id: str) -> bool:
         """Delete a finished job's output directory. Active jobs are kept."""
@@ -512,7 +509,7 @@ class JobManager:
         if not features:
             raise ValueError("请至少选择一个分析功能")
         job_id = secrets.token_hex(8)
-        output = CACHE_DIR / "jobs" / job_id
+        output = _ckpt.cache_dir() / "jobs" / job_id
         output.mkdir(parents=True, exist_ok=True)
         try:
             shards = max(1, min(int(shards or 1), 64))
@@ -702,65 +699,36 @@ class JobManager:
 
     def _load_from_history(self, job_id: str) -> Job | None:
         """Recreate an in-memory job from ``<cache>/jobs/<id>/job.json``."""
-        output = self._job_dir(job_id)
-        if output is None:
-            return None
-        try:
-            data = json.loads((output / "job.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
-        if not isinstance(data, dict) or data.get("id") != job_id:
-            return None
-        pcap = str(data.get("pcap") or "")
-        if not pcap or not Path(pcap).is_file():
-            return None
-        features: list[Feature] = []
-        for item in data.get("features") or []:
-            feature = BY_CHECKBOX.get(item) or BY_HANDLER.get(item)
-            if feature is not None:
-                features.append(feature)
-        if not features:
-            return None
-        try:
-            shards = max(1, min(int(data.get("shards") or 1), 64))
-        except (TypeError, ValueError):
-            shards = 1
-        job = Job(job_id, pcap, features, dict(data.get("params") or {}),
-                  output, created=str(data.get("created") or ""), shards=shards)
-        job.status = str(data.get("status") or "interrupted")
-        job.progress = int(data.get("progress") or 0)
-        job.started = data.get("started")
-        job.finished = data.get("finished")
-        job.succeeded = int(data.get("succeeded") or 0)
-        job.failed = int(data.get("failed") or 0)
-        job.completed = [str(item) for item in data.get("completed") or []]
-        statuses = data.get("feature_status")
-        if isinstance(statuses, dict):
-            job.feature_status.update({str(k): str(v) for k, v in statuses.items()})
-        for feature in features:
-            job.feature_status.setdefault(feature.checkbox, "pending")
-        # Restore the old transcript so the resumed report keeps its history.
-        try:
-            report = (output / "report.txt").read_text(
-                encoding="utf-8", errors="replace")
-            if report:
-                job.log.seed(parse_report_text(report))
-        except OSError:
-            pass
-        return job
+        return _ckpt.load_from_history(job_id)
 
     def compare(self, base_id: str, target_id: str,
                 limit: int = 5000) -> dict | None:
-        """Diff the structured findings of two jobs (target minus base)."""
+        """Diff the structured findings of two jobs (target minus base).
+
+        The diff key covers the finding identity *and* its human annotation
+        (status + note), so re-triaging the same finding shows up as a
+        removed/added pair instead of silently staying "common".  Findings
+        without annotations key on two empty strings, which keeps comparisons
+        of historical jobs byte-for-byte equivalent to the old behaviour.
+        """
         base = self.findings_for(base_id, limit=findings_mod.MAX_FINDINGS)
         target = self.findings_for(target_id, limit=findings_mod.MAX_FINDINGS)
         if base is None or target is None:
             return None
+        base_items = base["findings"]
+        target_items = target["findings"]
+        self.merge_annotations(base_id, base_items)
+        self.merge_annotations(target_id, target_items)
 
         def key(item: dict) -> tuple:
+            annotation = item.get("annotation")
+            if not isinstance(annotation, dict):
+                annotation = {}
             return (str(item.get("kind") or ""),
                     str(item.get("summary") or ""),
-                    str(item.get("detail") or ""))
+                    str(item.get("detail") or ""),
+                    str(annotation.get("status") or ""),
+                    str(annotation.get("note") or ""))
 
         def unique(items: list[dict]) -> dict[tuple, dict]:
             seen: dict[tuple, dict] = {}
@@ -768,8 +736,8 @@ class JobManager:
                 seen.setdefault(key(item), item)
             return seen
 
-        base_map = unique(base["findings"])
-        target_map = unique(target["findings"])
+        base_map = unique(base_items)
+        target_map = unique(target_items)
         added = [item for key_, item in target_map.items() if key_ not in base_map]
         removed = [item for key_, item in base_map.items()
                    if key_ not in target_map]
@@ -803,8 +771,8 @@ class JobManager:
                 "removed": len(removed),
                 "common": len(common),
             },
-            "kinds": {"base": kinds(base["findings"]),
-                      "target": kinds(target["findings"]),
+            "kinds": {"base": kinds(base_items),
+                      "target": kinds(target_items),
                       "added": kinds(added)},
             "truncated": any(len(items) > limit for items in
                              (added, removed, common)),
@@ -924,6 +892,11 @@ class JobManager:
         job.current = ""
         job.finished = _dt.datetime.now().isoformat(timespec="seconds")
         job.log.info(f"分析结束: {terminal}（成功 {succeeded}，失败 {failed}）")
+        # Optional online IOC enrichment (offline unless the user configured a
+        # key) runs before the findings flush so the extra records land in the
+        # same findings.json / report. Skipped for cancelled/paused jobs.
+        if terminal == "done":
+            self._enrich_intel(job)
         # Write all artifacts BEFORE flipping job.status: API clients and the
         # CLI break out of their poll loops as soon as they see the terminal
         # status, and must see the complete artifact list at that moment.
@@ -948,7 +921,7 @@ class JobManager:
         if feature.shardable and job.shards > 1:
             count = self._frame_count(job.pcap, tshark)
             if count and count >= job.shards * 2:
-                ranges = _split_ranges(count, job.shards)
+                ranges = _shards.split_ranges(count, job.shards)
                 job.log.info(f"{feature.title}: {count} 帧，按 {len(ranges)} 片执行")
 
         first_finding = len(job.findings)
@@ -1065,52 +1038,40 @@ class JobManager:
     # -- sharding helpers ---------------------------------------------
     def _frame_count(self, pcap: str, tshark) -> int:
         """Total frame count using capinfos when available, tshark otherwise."""
-        from fnet.tools.runner import count_frames
-
-        return count_frames(pcap, tshark.path if tshark is not None else "")
+        return _shards.frame_count(pcap, tshark)
 
     def _clip_shard(self, job: Job, tshark, start: int, end: int,
                     shard_index: int) -> Path | None:
         """Write frames ``start..end`` to a temporary pcapng for one shard."""
-        if tshark is None:
-            return None
-        target = job.output_dir / "shards" / f"shard-{shard_index}-{start}-{end}.pcapng"
-        target.parent.mkdir(parents=True, exist_ok=True)
+        return _shards.clip_shard(job, tshark, start, end, shard_index)
+
+    def _enrich_intel(self, job: Job) -> int:
+        """Optional online IOC enrichment of ``job.findings`` (in place).
+
+        Building the client is free and side-effect free: only an explicitly
+        configured ``[intel]`` API key enables lookups, so the default offline
+        install performs zero network requests and adds no log line.  Any
+        failure is swallowed (debug only) because intel is a nice-to-have and
+        must never turn a finished analysis into a failed job.
+        """
         try:
-            code, out = subprocess.run(
-                [tshark.path, "-r", job.pcap, "-Y",
-                 f"frame >= {start} && frame <= {end}", "-w", str(target)],
-                capture_output=True, text=True, timeout=3600).returncode, ""
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if code != 0 or not target.is_file():
-            return None
-        return target
+            from fnet.utils.intel import IntelClient, enrich_job
+
+            if any(str(item.get("feature") or "").startswith("intel.")
+                   for item in job.findings if isinstance(item, dict)):
+                # Already enriched (e.g. after a resume): never duplicate rows.
+                return 0
+            client = IntelClient.from_config(self.config)
+            if not client.enabled:
+                return 0
+            return enrich_job(job, client)
+        except Exception as exc:  # noqa: BLE001 - optional enrichment
+            job.log.debug(f"在线情报富化失败: {exc}")
+            return 0
 
     def _write_findings(self, job: Job) -> None:
         """Persist structured findings as JSON + CSV next to the reports."""
-        for index, item in enumerate(job.findings, 1):
-            item.setdefault("seq", index)
-            item.setdefault("id", f"f{index:05d}")
-        json_path = job.output_dir / "findings.json"
-        csv_path = job.output_dir / "findings.csv"
-        try:
-            json_path.write_text(
-                json.dumps({"job": job.id, "count": len(job.findings),
-                            "findings": job.findings},
-                           ensure_ascii=False, indent=2),
-                encoding="utf-8")
-            job.findings_path = str(json_path)
-        except OSError as exc:
-            job.log.warn(f"结构化结果写入失败: {exc}")
-        try:
-            csv_path.write_text(findings_mod.to_csv(job.findings),
-                                encoding="utf-8")
-            job.findings_csv_path = str(csv_path)
-        except OSError as exc:
-            job.log.warn(f"结果 CSV 写入失败: {exc}")
-        if job.findings:
-            job.log.good(f"结构化结果 {len(job.findings)} 条，可在“分析结果”页查看")
+        _jfnd.write_findings(job)
 
     def _write_report(self, job: Job, status: str | None = None) -> None:
         """Render the txt/md/html reports; ``status`` overrides job.status.
@@ -1133,6 +1094,17 @@ class JobManager:
             "",
         ]
         records = job.log.records_since(0, limit=MAX_LOG_RECORDS)
+        # Same normalisation + seq mapping as ``findings_for`` so annotations
+        # (keyed by seq) line up; copies keep report-only keys out of the live
+        # job object that is still being checkpointed.
+        findings = self._annotated_findings(job.id, job.findings)
+        notes = annotation_lines(findings)
+        if notes:
+            # Kept before the timestamped log lines so ``parse_report_text``
+            # still recovers the log records unchanged after a restart.
+            lines.append("人工标注:")
+            lines.extend(notes)
+            lines.append("")
         lines.extend(record.line for record in records)
         try:
             report.write_text("\n".join(lines), encoding="utf-8")
@@ -1143,7 +1115,7 @@ class JobManager:
         try:
             written = write_reports(
                 job, [record.as_dict() for record in records], self.artifacts(job),
-                findings=job.findings, status=status)
+                findings=findings, status=status)
         except Exception as exc:  # noqa: BLE001 - reports must not fail a job
             job.log.warn(f"Markdown/HTML 报告生成失败: {exc}")
         job.report_markdown_path = str(written.get("md") or "")

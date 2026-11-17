@@ -59,22 +59,24 @@ python3 -m venv /tmp/fnet-install
 2. `publish`：使用 **PyPI Trusted Publishing（OIDC）**，仓库中不保存
    API token。
 
-首次发布前需要维护者在 PyPI 完成一次性配置：
+首次发布前需要维护者在 PyPI 完成一次性配置（**2026-11-17 已完成**）：
 
-1. 在 PyPI 创建/认领项目 `fnet-ctf`。
-2. 添加 Trusted Publisher：
+1. 在 PyPI 创建/认领项目 `fnet-ctf`——通过 pending publisher 首次发布时
+   自动创建（已发布 `2.19.0`，项目名已归属本仓库）。
+2. 添加 Trusted Publisher（pending → 已转正）：
    - Owner：`fyfhcgch`
    - Repository：`Fnet`
    - Workflow：`publish.yml`
    - Environment：`pypi`
 3. 在 GitHub 仓库的 `Settings → Environments` 创建 `pypi` 环境（可加保护
-   规则，只允许标签发布）。
+   规则，只允许标签发布）——已通过 `gh api -X PUT
+   repos/fyfhcgch/Fnet/environments/pypi` 创建。
 
 完成后打标签即可发布：
 
 ```bash
-git tag v2.19.0
-git push origin v2.19.0
+git tag v2.20.0
+git push origin v2.20.0
 ```
 
 ## 发布前检查清单
@@ -83,25 +85,19 @@ git push origin v2.19.0
 - [ ] `node --check fnet/webui/static/app.js` 通过
 - [ ] `python3 scripts/bench.py --sizes 10,100,1000 --features default` 更新
       `docs/PERFORMANCE.md`
-- [ ] README / TODO / docs/FEATURES.md 与 `FEATURES` 的 37 个功能一致
-- [ ] `pyproject.toml` 与 `fnet/__init__.py` 版本一致
-- [ ] `twine check dist/*` 通过
+- [ ] README / docs/FEATURES.md 与 `FEATURES` 的 46 个功能一致
+- [x] `pyproject.toml` 与 `fnet/__init__.py` 版本一致
+- [x] `twine check dist/*` 通过（2.19.0 已验证）
 - [ ] 干净环境中 `fnet --version` 与 WebUI `/api/health` 正常
 
-## 当前阻塞
+## 当前状态
 
-截至 2.19.0，代码侧全部就绪并已实测：`v2.19.0` 标签触发的发布运行中
-`build` 成功（sdist/wheel 通过 `twine check`），`publish` 在 PyPI OIDC 交换
-处失败：
+2.20.0 已成功发布到 PyPI（2026-11-17）：`v2.20.0` 标签触发的运行中 `build`
+通过 `twine check`，`publish` 经 Trusted Publishing（OIDC）上传成功，
+`fnet-ctf 2.20.0` 的 wheel 与 sdist 均可在 https://pypi.org/project/fnet-ctf/
+下载。
 
-```
-invalid-publisher: valid token, but no corresponding publisher
-```
-
-OIDC claims 与工作流完全一致（repository `fyfhcgch/Fnet`、workflow
-`publish.yml`、environment `pypi`、ref `refs/tags/v2.19.0`），错误只可能
-来自 PyPI 侧未配置 Trusted Publisher。完成上文第 62–71 行的一次性配置后，
-在 GitHub 的 Actions 页面对 `publish.yml` 选择 `v2.19.0` 重跑
-（Re-run failed jobs）即可完成上传；或重新打任意 `v*` 标签。
-
-没有 PyPI 账号操作时，任何自动化都无法代替维护者完成上传。
+历史问题（已解决）：首次尝试返回 `invalid-publisher: valid token, but no
+corresponding publisher`，原因是 PyPI 侧尚未配置 Trusted Publisher。补齐
+pending publisher（仓库 `fyfhcgch/Fnet`、workflow `publish.yml`、环境
+`pypi`）与 GitHub `pypi` 环境后重跑即成功。

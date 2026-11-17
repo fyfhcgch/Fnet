@@ -14,6 +14,12 @@ Two special handlers are exposed (they have no check box):
 ``forensics.timeline``
     Only build the authentication/file activity timeline.
 
+``forensics.log_import`` (checkBox_54)
+    Import a Suricata ``eve.json`` / Zeek log (``log_path``/``log_text``
+    parameters), normalise it into the common event model of
+    :mod:`fnet.utils.evidence` and correlate the events with this capture's
+    findings by IP/port/time; writes ``log_import_events.csv``.
+
 Run them after the extractors that produce the findings, for example::
 
     python3 -m fnet -C capture.pcap --features \\
@@ -23,13 +29,15 @@ Run them after the extractors that produce the findings, for example::
 from __future__ import annotations
 
 import csv
+import datetime as _dt
 import fnmatch
 import io
 import re
+from pathlib import Path
 
 from fnet.features.common import clean_cell, table
 from fnet.features.registry import FeatureContext
-from fnet.utils import codec
+from fnet.utils import codec, evidence
 
 #: Protocol names used for grouping (keep them short and stable).
 PROTOCOL_ALIASES = {
@@ -481,4 +489,205 @@ def timeline(ctx: FeatureContext) -> None:
                         f"[{item['frame']}] {item['event']} "
                         f"{item['summary']}" for item in events[:50]),
                     level="info")
+    ctx.set_progress(100)
+
+
+# ---------------------------------------------------------------------------
+# 日志证据关联（checkBox_54, forensics.log_import）
+#
+# 导入 Suricata eve.json（JSON Lines）或 Zeek 日志（TSV 带 #fields 头 / JSON
+# 流），归一化与关联全部交给 ``fnet/utils/evidence.py`` 的纯函数
+# （``detect_format`` / ``parse_events`` / ``correlate``）——那里是唯一实现。
+# 本模块只负责：
+#
+# * 读取 ``log_path`` / ``log_text``；
+# * 把 CEM 事件（src_ip/type/source …）映射回本功能历史的列名
+#   （src/event_type/format …），保证 ``log_import_events.csv`` 列名与中文
+#   日志输出向后兼容；
+# * 记录相关事件与告警签名的 finding。
+# ---------------------------------------------------------------------------
+
+#: 默认最低关联分（``evidence.correlate`` 的 min_score）。保持 1 表示
+#: “共享任一 IP 即可关联”，与历史行为一致；可通过 ``log_min_score`` 收紧。
+DEFAULT_LOG_MIN_SCORE = 1
+
+
+def _event_time(event: dict) -> str:
+    """旧版时间列：Zeek 的 ts 是 epoch 秒，格式化为 UTC 可读时间。
+
+    其他时间（Suricata 的 ISO-8601 字符串等）原样保留，和历史输出一致。
+    """
+    text = str(event.get("time") or "")
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        try:
+            return _dt.datetime.fromtimestamp(
+                float(text), _dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, OSError, OverflowError):
+            return text
+    return text
+
+
+def _severity_label(event: dict) -> str:
+    """CEM 的整数 severity → 旧版 high/medium/low/info 文案。"""
+    if str(event.get("type") or "") != "alert":
+        return "info"
+    try:
+        level = int(event.get("severity"))
+    except (TypeError, ValueError):
+        return "low"
+    return {1: "high", 2: "medium"}.get(level, "low")
+
+
+def _port_text(value) -> str:
+    return "" if value is None else str(value)
+
+
+def _float_param(value, default: float) -> float:
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def map_event(event: dict) -> dict:
+    """把 ``evidence`` 的 CEM 事件映射为旧版统一事件模型的列名。
+
+    ``source`` → ``format``（``suricata:eve`` → ``suricata``），``type`` →
+    ``event_type``，``src_ip``/``src_port`` → ``src``/``sport`` 等；仅做字段
+    别名与 severity 文案转换，解析/关联逻辑仍只有 ``evidence`` 一份。
+    """
+    source = str(event.get("source") or "")
+    return {
+        "time": _event_time(event),
+        "format": source.split(":", 1)[0],
+        "event_type": str(event.get("type") or "event"),
+        "src": str(event.get("src_ip") or ""),
+        "sport": _port_text(event.get("src_port")),
+        "dst": str(event.get("dst_ip") or ""),
+        "dport": _port_text(event.get("dst_port")),
+        "proto": str(event.get("proto") or ""),
+        "severity": _severity_label(event),
+        "summary": str(event.get("summary") or ""),
+        "signature": str(event.get("signature") or ""),
+    }
+
+
+def read_log_source(ctx: FeatureContext) -> str | None:
+    """Fetch the log text from ``log_path`` or pasted ``log_text``."""
+    path = str(ctx.params.get("log_path") or "").strip()
+    if path:
+        target = Path(path).expanduser()
+        if not target.is_file():
+            ctx.report(f"日志文件不存在: {target}", "error")
+            return None
+        try:
+            return target.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            ctx.report(f"读取日志文件失败: {exc}", "error")
+            return None
+    text = str(ctx.params.get("log_text") or "")
+    if not text.strip():
+        ctx.report("未提供日志：请在参数中填写 log_path（eve.json / Zeek 日志"
+                   "文件路径）或直接粘贴 log_text", "error")
+        return None
+    return text
+
+
+def _event_csv(events: list[dict], related: set[int]) -> str:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["序号", "时间", "格式", "事件类型", "源IP", "源端口",
+                     "目的IP", "目的端口", "协议", "严重级别", "摘要",
+                     "与流量发现相关"])
+    for index, event in enumerate(events):
+        writer.writerow([index + 1, event.get("time"), event.get("format"),
+                         event.get("event_type"), event.get("src"),
+                         event.get("sport"), event.get("dst"),
+                         event.get("dport"), event.get("proto"),
+                         event.get("severity"),
+                         clean_cell(event.get("summary"), 240),
+                         "是" if index in related else ""])
+    return buffer.getvalue()
+
+
+def log_import(ctx: FeatureContext) -> None:
+    """Import Suricata/Zeek logs and correlate them with capture findings."""
+    text = read_log_source(ctx)
+    if text is None:
+        return
+    fmt = evidence.detect_format(text)
+    if fmt is None:
+        ctx.report("无法识别日志格式：请提供 Suricata eve.json（JSON Lines，"
+                   "含 timestamp/event_type 字段）或 Zeek TSV 日志"
+                   "（conn.log/dns.log/http.log 等，带 #fields 头）", "error")
+        return
+    cem_events = evidence.parse_events(text)
+    events: list[dict] = []
+    for event in cem_events:
+        ctx.check_cancel()
+        events.append(map_event(event))
+    ctx.report(f"日志格式识别为 {fmt}，共归一化 {len(events)} 条事件", "good")
+    if not events:
+        ctx.report("日志中没有可归一化的事件", "warn")
+        ctx.set_progress(100)
+        return
+
+    # 关联只有一份实现：evidence.correlate（IP 对 + 端口重叠 + 时间窗打分）。
+    window = _float_param(ctx.params.get("log_window"),
+                          evidence.DEFAULT_WINDOW)
+    min_score = _int_param(ctx.params.get("log_min_score"),
+                           DEFAULT_LOG_MIN_SCORE)
+    pairs = evidence.correlate(cem_events, ctx.findings, window=window,
+                               min_score=min_score)
+    related = {pair["event_index"] for pair in pairs}
+
+    table(ctx, "日志事件（统一事件模型）",
+          ["时间", "源", "目的", "协议", "类型", "级别", "摘要", "相关"],
+          [[event.get("time"), f"{event.get('src')}:{event.get('sport') or '-'}",
+            f"{event.get('dst')}:{event.get('dport') or '-'}",
+            event.get("proto") or "-", event.get("event_type"),
+            event.get("severity"), clean_cell(event.get("summary"), 180),
+            "是" if index in related else ""]
+           for index, event in enumerate(events)], limit=100)
+
+    if not ctx.findings:
+        ctx.report("当前任务没有流量发现（findings），仅输出日志归一化结果",
+                   "info")
+    elif related:
+        ctx.report(f"===== 与流量发现相关的事件（{len(related)} 条）=====",
+                   "good")
+        for index in sorted(related)[:100]:
+            event = events[index]
+            ctx.report(f"[{event.get('time') or '-'}] "
+                       f"{event.get('src')} -> {event.get('dst')} "
+                       f"{clean_cell(event.get('summary'), 180)}", "warn")
+            ctx.add_finding(
+                "rule", f"日志证据: {clean_cell(event.get('summary'), 160)}",
+                detail=f"来源 {fmt} 日志 时间 {event.get('time')} "
+                       f"{event.get('src')}:{event.get('sport')} -> "
+                       f"{event.get('dst')}:{event.get('dport')} "
+                       f"级别 {event.get('severity')}",
+                level="warn",
+                extra={"log_format": fmt, "event_type": event.get("event_type"),
+                       "src": event.get("src"), "dst": event.get("dst")})
+    else:
+        ctx.report("日志事件与当前任务的流量发现没有 IP/端口交集", "warn")
+
+    signatures: dict[str, int] = {}
+    for event in events:
+        signature = event.get("signature")
+        if signature:
+            signatures[signature] = signatures.get(signature, 0) + 1
+    if signatures:
+        ctx.report(f"===== 日志告警签名（{len(signatures)} 种）=====", "good")
+        for signature, count in sorted(signatures.items(),
+                                       key=lambda kv: -kv[1])[:50]:
+            ctx.report(f"{signature} x{count}", "warn")
+            ctx.add_finding("rule", f"日志告警签名 {signature}（{count} 次）",
+                            detail=f"来源 {fmt} 日志", level="warn",
+                            extra={"log_format": fmt, "signature": signature,
+                                   "count": count})
+
+    ctx.write_output("log_import_events.csv", _event_csv(events, related))
+    ctx.report("事件明细已写入 log_import_events.csv", "info")
     ctx.set_progress(100)

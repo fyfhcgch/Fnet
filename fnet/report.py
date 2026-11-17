@@ -23,18 +23,23 @@ SECTIONS: tuple[dict[str, str], ...] = (
     {"key": "summary", "title": "概要"},
     {"key": "features", "title": "功能清单"},
     {"key": "findings", "title": "关键发现"},
+    {"key": "timeline", "title": "时间线"},
+    {"key": "iocs", "title": "IOC 指标"},
+    {"key": "attack", "title": "ATT&CK 映射"},
     {"key": "log", "title": "完整日志"},
     {"key": "artifacts", "title": "产出文件"},
     {"key": "params", "title": "分析参数"},
 )
 SECTION_KEYS = tuple(item["key"] for item in SECTIONS)
 SECTION_TITLES = {item["key"]: item["title"] for item in SECTIONS}
-DEFAULT_SECTIONS = ("summary", "features", "findings", "log", "artifacts")
+DEFAULT_SECTIONS = ("summary", "features", "findings", "timeline", "iocs",
+                    "attack", "log", "artifacts")
 
 #: Guard rails so an accidentally huge log cannot exhaust browser memory.
 MAX_LOG_RECORDS = 40_000
 MAX_REPORT_CHARS = 8 * 1024 * 1024
 MAX_REPORT_FINDINGS = 2_000
+MAX_IOCS = 500
 
 STATUS_NAMES = {
     "queued": "排队中",
@@ -44,6 +49,14 @@ STATUS_NAMES = {
     "cancelled": "已取消",
     "paused": "已暂停",
     "interrupted": "已中断",
+}
+
+#: Human annotation states (``fnet.jobs_findings.ANNOTATION_STATUSES``) in
+#: report language.  Kept here so the txt/md/html renderers agree.
+ANNOTATION_NAMES = {
+    "confirmed": "已确认",
+    "false_positive": "误报",
+    "starred": "星标",
 }
 
 _TAG_LEVELS = {"[DEBUG]": "debug", "[*]": "info", "[+]": "good",
@@ -206,11 +219,16 @@ def select_findings(logs) -> list[dict]:
     return findings
 
 
-def finding_rows(findings) -> list[tuple[str, str, str, str, str, str]]:
-    """Tabular projection of the structured findings for both report formats."""
+def finding_rows(findings) -> list[tuple[str, str, str, str, str, str, str]]:
+    """Tabular projection of the structured findings for both report formats.
+
+    The seventh column carries the human annotation (status + note, see
+    :func:`annotation_label`); it is empty for unannotated findings so old
+    reports keep rendering exactly as before.
+    """
     from fnet.findings import KIND_NAMES
 
-    rows: list[tuple[str, str, str, str, str, str]] = []
+    rows: list[tuple[str, str, str, str, str, str, str]] = []
     for item in findings or []:
         if not isinstance(item, dict):
             continue
@@ -225,9 +243,168 @@ def finding_rows(findings) -> list[tuple[str, str, str, str, str, str]]:
             str(item.get("feature") or ""),
             summary,
             str(item.get("detail") or ""),
+            annotation_label(item),
         ))
         if len(rows) >= MAX_REPORT_FINDINGS:
             break
+    return rows
+
+
+def annotation_label(item) -> str:
+    """Human readable annotation for one finding (``""`` when unannotated).
+
+    The record shape is owned by :mod:`fnet.jobs_findings`: ``status`` is one
+    of ``confirmed`` / ``false_positive`` / ``starred`` (or empty when only a
+    note was written) and ``note`` is free text.  A false positive is prefixed
+    with ``误报`` so the marker survives even without colour in plain text.
+    """
+    record = item.get("annotation") if isinstance(item, dict) else None
+    if not isinstance(record, dict):
+        return ""
+    status = str(record.get("status") or "").strip()
+    note = " ".join(str(record.get("note") or "").split())
+    label = ANNOTATION_NAMES.get(status, status)
+    return " · ".join(part for part in (label, note) if part)
+
+
+def annotation_lines(findings) -> list[str]:
+    """Plain-text block for ``report.txt``: one line per annotated finding."""
+    from fnet.findings import KIND_NAMES
+
+    lines: list[str] = []
+    for index, item in enumerate(findings or [], 1):
+        if not isinstance(item, dict):
+            continue
+        label = annotation_label(item)
+        if not label:
+            continue
+        kind = KIND_NAMES.get(str(item.get("kind") or ""),
+                              str(item.get("kind") or ""))
+        seq = item.get("seq") or index
+        summary = str(item.get("summary") or "").strip()
+        lines.append(f"  #{seq} [{kind}] {summary} → {label}")
+        if len(lines) >= MAX_REPORT_FINDINGS:
+            break
+    return lines
+
+
+def timeline_rows(findings) -> list[tuple[str, str, str, str, str]]:
+    """Chronological projection of the structured findings."""
+    from fnet.findings import KIND_NAMES
+
+    rows: list[tuple] = []
+    for order, item in enumerate(findings or []):
+        if not isinstance(item, dict):
+            continue
+        summary = str(item.get("summary") or "").strip()
+        if not summary:
+            continue
+        kind = KIND_NAMES.get(str(item.get("kind") or ""),
+                              str(item.get("kind") or ""))
+        rows.append((order, str(item.get("time") or ""), kind,
+                     str(item.get("frame") or ""),
+                     str(item.get("feature") or ""), summary))
+        if len(rows) >= MAX_REPORT_FINDINGS:
+            break
+    rows.sort(key=lambda row: (row[1], row[0]))
+    return [(time, kind, frame, feature, summary)
+            for _, time, kind, frame, feature, summary in rows]
+
+
+_IOC_URL_RE = re.compile(r"https?://[^\s\"'<>\\)\]}（），；！？]+", re.IGNORECASE)
+_IOC_IP_RE = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
+_IOC_DOMAIN_RE = re.compile(
+    r"(?<![\w.@-])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,12}\b",
+    re.IGNORECASE)
+_IOC_HASH_RES = (
+    ("SHA256", re.compile(r"\b[a-fA-F0-9]{64}\b")),
+    ("SHA1", re.compile(r"\b[a-fA-F0-9]{40}\b")),
+    ("MD5", re.compile(r"\b[a-fA-F0-9]{32}\b")),
+)
+
+
+def ioc_rows(findings) -> list[tuple[str, str, int, str]]:
+    """Aggregate indicators of compromise (IP/domain/URL/hash) from findings.
+
+    Everything is extracted offline from the finding texts themselves: Fnet
+    never contacts a third-party service.  Each row keeps the feature that
+    first surfaced the indicator so an analyst can pivot back.
+    """
+    order: list[str] = []
+    seen: dict[str, dict] = {}
+
+    def _record(kind: str, value: str, feature: str) -> None:
+        key = f"{kind}:{value.lower()}"
+        entry = seen.get(key)
+        if entry is None:
+            if len(seen) >= MAX_IOCS:
+                return
+            entry = {"kind": kind, "value": value, "count": 0,
+                     "feature": feature, "order": len(order)}
+            seen[key] = entry
+            order.append(key)
+        entry["count"] += 1
+
+    for item in findings or []:
+        if not isinstance(item, dict):
+            continue
+        feature = str(item.get("feature") or "")
+        text = " ".join(str(item.get(key) or "") for key in ("summary", "detail"))
+        if not text:
+            continue
+        urls = list(_IOC_URL_RE.finditer(text))
+        covered = [(match.start(), match.end()) for match in urls]
+
+        def _masked(match: re.Match) -> bool:
+            return any(start <= match.start() < end for start, end in covered)
+
+        for match in urls:
+            _record("URL", match.group(0).rstrip(".,;"), feature)
+        for match in _IOC_IP_RE.finditer(text):
+            if _masked(match):
+                continue
+            _record("IP", match.group(0), feature)
+        for match in _IOC_DOMAIN_RE.finditer(text):
+            if _masked(match):
+                continue
+            _record("域名", match.group(0), feature)
+        for label, pattern in _IOC_HASH_RES:
+            for match in pattern.finditer(text):
+                if _masked(match):
+                    continue
+                _record(label, match.group(0), feature)
+    return [(entry["kind"], entry["value"], entry["count"], entry["feature"])
+            for entry in sorted(seen.values(),
+                                key=lambda item: item["order"])]
+
+
+#: Coarse, *indicative* MITRE ATT&CK mapping by finding kind.  The mapping is
+#: intentionally limited to unambiguous categories: a credential finding does
+#: not prove credential dumping, so reports label the section as a hint.
+ATTACK_HINTS: dict[str, tuple[str, str, str]] = {
+    "credential": ("凭据访问 (TA0006)", "T1555", "凭据存储中的凭据"),
+    "hash": ("凭据访问 (TA0006)", "T1003", "操作系统凭据转储"),
+    "webshell": ("持久化 (TA0003)", "T1505.003", "服务器软件组件：Web Shell"),
+    "sql": ("初始访问 (TA0001)", "T1190", "利用面向公众的应用"),
+    "dns": ("命令与控制 (TA0011)", "T1071.004", "应用层协议：DNS"),
+}
+
+
+def attack_rows(findings) -> list[tuple[str, str, str, int, str]]:
+    """Indicative ATT&CK technique rows derived from the finding kinds."""
+    buckets: dict[str, list[str]] = {}
+    for item in findings or []:
+        if not isinstance(item, dict):
+            continue
+        summary = str(item.get("summary") or "").strip()
+        kind = str(item.get("kind") or "")
+        if summary and kind in ATTACK_HINTS:
+            buckets.setdefault(kind, []).append(summary)
+    rows: list[tuple[str, str, str, int, str]] = []
+    for kind, (tactic, technique, name) in ATTACK_HINTS.items():
+        samples = buckets.get(kind)
+        if samples:
+            rows.append((tactic, technique, name, len(samples), samples[0]))
     return rows
 
 
@@ -298,13 +475,21 @@ def render_markdown(meta: dict, logs, artifacts=None, sections=None,
         elif key == "findings":
             rows = finding_rows(findings)
             if rows:
-                lines.append("| 类别 | 级别 | 帧 | 功能 | 摘要 | 详情 |")
-                lines.append("| --- | --- | --- | --- | --- | --- |")
-                for kind, level, frame, feature, summary, detail in rows:
-                    lines.append(
+                with_notes = any(row[6] for row in rows)
+                if with_notes:
+                    lines.append("| 类别 | 级别 | 帧 | 功能 | 摘要 | 详情 | 标注 |")
+                    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+                else:
+                    lines.append("| 类别 | 级别 | 帧 | 功能 | 摘要 | 详情 |")
+                    lines.append("| --- | --- | --- | --- | --- | --- |")
+                for kind, level, frame, feature, summary, detail, note in rows:
+                    line = (
                         f"| {_md_cell(kind)} | {_md_cell(level)} | "
                         f"{_md_cell(frame)} | {_md_cell(feature)} | "
                         f"{_md_cell(summary)} | {_md_cell(detail)} |")
+                    if with_notes:
+                        line += f" {_md_cell(note)} |"
+                    lines.append(line)
             else:
                 highlights = select_findings(records)
                 if not highlights:
@@ -315,6 +500,46 @@ def render_markdown(meta: dict, logs, artifacts=None, sections=None,
                         level = str(record.get("level") or "info")
                         lines.append(f"- **[{level}]** `{stamp}` "
                                      f"{_md_cell(record.get('text') or '')}")
+        elif key == "timeline":
+            rows = timeline_rows(findings)
+            if not rows:
+                lines.append("（没有可展示的时间线）")
+            else:
+                lines.append("| 时间 | 类别 | 帧 | 功能 | 摘要 |")
+                lines.append("| --- | --- | --- | --- | --- |")
+                for time, kind, frame, feature, summary in rows:
+                    lines.append(
+                        f"| {_md_cell(time)} | {_md_cell(kind)} | "
+                        f"{_md_cell(frame)} | {_md_cell(feature)} | "
+                        f"{_md_cell(summary)} |")
+        elif key == "iocs":
+            rows = ioc_rows(findings)
+            if not rows:
+                lines.append("（没有从发现中提取到 IOC，全部为离线汇总）")
+            else:
+                lines.append(f"共 {len(rows)} 条（离线汇总自发现记录，"
+                             "未访问任何在线服务）：")
+                lines.append("")
+                lines.append("| 类型 | 指标 | 次数 | 首现功能 |")
+                lines.append("| --- | --- | --- | --- |")
+                for kind, value, count, feature in rows:
+                    lines.append(
+                        f"| {_md_cell(kind)} | `{_md_cell(value)}` | {count} | "
+                        f"{_md_cell(feature)} |")
+        elif key == "attack":
+            rows = attack_rows(findings)
+            if not rows:
+                lines.append("（没有可映射到 ATT&CK 的发现）")
+            else:
+                lines.append("> 提示性映射：仅依据发现类别推断，"
+                             "需结合上下文人工确认。")
+                lines.append("")
+                lines.append("| 战术 | 技术 | 名称 | 关联发现 | 示例 |")
+                lines.append("| --- | --- | --- | --- | --- |")
+                for tactic, technique, name, count, sample in rows:
+                    lines.append(
+                        f"| {_md_cell(tactic)} | `{_md_cell(technique)}` | "
+                        f"{_md_cell(name)} | {count} | {_md_cell(sample)} |")
         elif key == "log":
             text = "\n".join(
                 f"{record.get('time') or ''} {record.get('tag') or ''} "
@@ -388,10 +613,15 @@ mark{background:var(--mark);color:inherit;border-radius:3px;padding:0 2px}
 .toc a{color:var(--accent);text-decoration:none;font-size:13px;border:1px solid
 var(--line);border-radius:999px;padding:3px 10px;background:var(--card)}
 .empty{color:var(--muted)}
+td.ann{color:var(--muted);font-size:13px}
+tr.ann-false td{opacity:.7}tr.ann-false td.ann{opacity:1;color:var(--bad);
+font-weight:600}
 footer{margin-top:40px;border-top:1px solid var(--line);padding-top:12px;
 color:var(--muted);font-size:12px}
 @media print{:root{--bg:#fff;--fg:#000;--card:#fff;--code:#f5f5f5}
-body{font-size:12px}main{max-width:none;padding:0}h2{break-after:avoid}
+@page{margin:14mm}body{font-size:12px}main{max-width:none;padding:0}
+h2{break-after:avoid}section{break-inside:auto}
+table,ul.findings{break-inside:auto}tr,ul.findings li{break-inside:avoid}
 pre.log{max-height:none;overflow:visible}.toc{display:none}}
 """.strip()
 
@@ -424,20 +654,30 @@ def _html_table(headers: list[str], rows: list[list[str]],
 
 
 def _html_findings_table(rows) -> str:
-    head = "".join(f"<th>{_esc(name)}</th>" for name in
-                   ("类别", "级别", "帧", "功能", "摘要", "详情"))
+    headers = ["类别", "级别", "帧", "功能", "摘要", "详情"]
+    with_notes = any(len(row) > 6 and row[6] for row in rows)
+    if with_notes:
+        headers.append("标注")
+    head = "".join(f"<th>{_esc(name)}</th>" for name in headers)
+    false_positive = ANNOTATION_NAMES["false_positive"]
     body = []
-    for kind, level, frame, feature, summary, detail in rows:
+    for row in rows:
+        kind, level, frame, feature, summary, detail = row[:6]
+        note = row[6] if len(row) > 6 else ""
         level = level if level in _LEVEL_NAMES else "info"
-        body.append(
-            f'<tr class="lvl-{level}">'
+        row_class = f'lvl-{level}'
+        if note.startswith(false_positive):
+            row_class += " ann-false"
+        cells = (
             f'<td>{_esc(kind)}</td>'
             f'<td><span class="lvl">{_esc(_LEVEL_NAMES[level])}</span></td>'
             f'<td class="mono">{_esc(frame)}</td>'
             f'<td>{_esc(feature)}</td>'
             f'<td>{_flagify(_esc(summary))}</td>'
-            f'<td class="mono">{_flagify(_esc(detail))}</td>'
-            "</tr>")
+            f'<td class="mono">{_flagify(_esc(detail))}</td>')
+        if with_notes:
+            cells += f'<td class="ann">{_esc(note)}</td>'
+        body.append(f'<tr class="{row_class}">{cells}</tr>')
     return (f"<table><thead><tr>{head}</tr></thead><tbody>"
             f"{''.join(body)}</tbody></table>")
 
@@ -520,6 +760,39 @@ def render_html(meta: dict, logs, artifacts=None, sections=None,
                         f'<span class="stamp">{_esc(record.get("time") or "")}</span>'
                         f"<span>{text}</span></li>")
                 parts.append("</ul>")
+        elif key == "timeline":
+            rows = timeline_rows(findings)
+            if not rows:
+                parts.append('<p class="empty">（没有可展示的时间线）</p>')
+            else:
+                parts.append(_html_table(
+                    ["时间", "类别", "帧", "功能", "摘要"],
+                    [list(row) for row in rows], mono={0, 2}))
+        elif key == "iocs":
+            rows = ioc_rows(findings)
+            if not rows:
+                parts.append('<p class="empty">（没有从发现中提取到 IOC，'
+                             "全部为离线汇总）</p>")
+            else:
+                parts.append(
+                    f'<p class="meta">共 {len(rows)} 条（离线汇总自发现记录，'
+                    "未访问任何在线服务）</p>")
+                parts.append(_html_table(
+                    ["类型", "指标", "次数", "首现功能"],
+                    [[kind, value, str(count), feature]
+                     for kind, value, count, feature in rows], mono={1}))
+        elif key == "attack":
+            rows = attack_rows(findings)
+            if not rows:
+                parts.append('<p class="empty">（没有可映射到 ATT&CK 的发现）</p>')
+            else:
+                parts.append('<p class="meta">提示性映射：仅依据发现类别推断，'
+                             "需结合上下文人工确认。</p>")
+                parts.append(_html_table(
+                    ["战术", "技术", "名称", "关联发现", "示例"],
+                    [[tactic, technique, name, str(count), sample]
+                     for tactic, technique, name, count, sample in rows],
+                    mono={1}))
         elif key == "log":
             parts.append(_html_log(records))
         elif key == "artifacts":

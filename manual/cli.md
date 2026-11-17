@@ -13,7 +13,7 @@ description: Fnet 无界面用法：参数、功能选择、参数传递、批�
 
 ```bash
 python3 -m fnet -C capture.pcapng                    # 只跑默认勾选项
-python3 -m fnet -C capture.pcapng --all              # 全部 37 个功能
+python3 -m fnet -C capture.pcapng --all              # 全部 46 个功能
 python3 -m fnet -C capture.pcapng --features checkBox_10,http.extract
 ```
 
@@ -41,7 +41,7 @@ HTML 报告: .../report.html
 | `capture` | 要分析的 pcap / pcapng / cap / dmp / etl 文件 |
 | `-C`, `--cli` | 不启动 WebUI，直接在终端运行 |
 | `--features a,b` | 逗号分隔的功能，可写复选框编号或功能名 |
-| `--all` | 运行全部 37 个功能 |
+| `--all` | 运行全部 46 个功能 |
 | `--param KEY=VALUE` | 传给功能的参数，可重复 |
 | `--json` | 结束后只向 stdout 输出 JSON（任务、findings、统计与产出） |
 | `--rules PATH` | 导入正则 / YARA 子集规则文件，命中写入 findings |

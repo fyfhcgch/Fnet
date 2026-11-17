@@ -65,6 +65,19 @@ class SampleCaptureTest(unittest.TestCase):
         self.assertIn("flag{webshell_plain}", log)
         self.assertIn("uid=33(www-data)", log)
 
+    def test_usb_keyboard_flag(self):
+        log = self.run_job("usb_kbd.pcap", ["checkBox_16"])
+        self.assertIn("flag{usb_kbd}", log)
+
+    def test_usb_mouse_trajectory(self):
+        log = self.run_job("usb_mouse.pcap", ["checkBox_17"])
+        self.assertIn("轨迹点", log)
+        self.assertIn("x=0..80 y=0..80", log)
+
+    def test_bluetooth_att_flag(self):
+        log = self.run_job("bluetooth.pcap", ["checkBox_21"])
+        self.assertIn("flag{ble_ctf}", log)
+
     def test_ntlm_hash(self):
         log = self.run_job("http_ntlm.pcap", ["checkBox_39"])
         self.assertIn("NetNTLMv1", log)

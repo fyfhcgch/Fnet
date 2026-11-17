@@ -5,11 +5,16 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
+from fnet.config import Config
+from fnet.jobs import JobManager
 from fnet.report import (
-    DEFAULT_SECTIONS, normalise_sections, parse_report_text, render_html,
-    render_markdown, select_findings, write_reports,
+    DEFAULT_SECTIONS, annotation_lines, normalise_sections, parse_report_text,
+    render_html, render_markdown, select_findings, write_reports,
 )
+
+DATA = Path(__file__).resolve().parent / "data"
 
 
 def sample_meta() -> dict:
@@ -135,6 +140,222 @@ class StructuredFindingsTest(unittest.TestCase):
         page = render_html(sample_meta(), LOGS, [], sections=["findings"])
         self.assertIn('<ul class="findings">', page)
         self.assertIn("疑似 ARP 欺骗", page)
+
+
+class IocsAttackTimelineTest(unittest.TestCase):
+    FINDINGS = [
+        {"kind": "dns", "level": "warn", "frame": "8",
+         "feature": "DNS流量分析", "time": "10:00:03",
+         "summary": "长标签查询 ev1l.example.com (10.0.0.5)",
+         "detail": "隧道时间线见 https://tracker.example.invalid/q?a=1"},
+        {"kind": "credential", "level": "good", "frame": "16",
+         "feature": "NTLM HASH提取", "time": "10:00:02",
+         "summary": "Administrator 凭据",
+         "detail": "MD5 5d41402abc4b2a76b9719d911017c592 出现于 POST"},
+        {"kind": "webshell", "level": "warn", "frame": "20",
+         "feature": "Webshell 解密", "time": "10:00:01",
+         "summary": "哥斯拉内存马 <script>alert(1)</script>",
+         "detail": "命令执行：whoami"},
+    ]
+
+    def test_iocs_extracted_and_deduplicated(self):
+        from fnet.report import ioc_rows
+        rows = ioc_rows(self.FINDINGS)
+        values = {value for _, value, _, _ in rows}
+        self.assertIn("ev1l.example.com", values)
+        self.assertIn("https://tracker.example.invalid/q?a=1", values)
+        self.assertIn("10.0.0.5", values)
+        self.assertIn("5d41402abc4b2a76b9719d911017c592", values)
+        # URL host must not be duplicated as a bare domain row.
+        domains = [value for kind, value, _, _ in rows if kind == "域名"]
+        self.assertNotIn("tracker.example.invalid", domains)
+
+    def test_iocs_carry_first_seen_feature_and_count(self):
+        from fnet.report import ioc_rows
+        rows = ioc_rows(self.FINDINGS)
+        first = {value: (kind, feature) for kind, value, _, feature in rows}
+        kind, feature = first["ev1l.example.com"]
+        self.assertEqual(kind, "域名")
+        self.assertEqual(feature, "DNS流量分析")
+        counts = {value: count for _, value, count, _ in rows}
+        self.assertGreaterEqual(counts.get("10.0.0.5", 0), 1)
+
+    def test_attack_mapping_and_note(self):
+        from fnet.report import attack_rows, render_markdown
+        rows = attack_rows(self.FINDINGS)
+        techniques = {technique for _, technique, _, _, _ in rows}
+        self.assertEqual(techniques, {"T1071.004", "T1505.003", "T1555"})
+        text = render_markdown({}, [], [], sections=["attack"],
+                               findings=self.FINDINGS)
+        self.assertIn("提示性映射", text)
+        self.assertIn("`T1505.003`", text)
+
+    def test_timeline_is_sorted_by_time(self):
+        from fnet.report import timeline_rows
+        rows = timeline_rows(self.FINDINGS)
+        times = [row[0] for row in rows]
+        self.assertEqual(times, sorted(times))
+        self.assertEqual(rows[0][4], "哥斯拉内存马 <script>alert(1)</script>")
+
+    def test_html_sections_render_and_escape(self):
+        page = render_html({}, [], [], findings=self.FINDINGS)
+        self.assertIn('id="section-iocs"', page)
+        self.assertIn('id="section-attack"', page)
+        self.assertIn('id="section-timeline"', page)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", page)
+        self.assertNotIn("<script>alert(1)</script>", page)
+        self.assertIn("@page{margin:14mm}", page)
+
+    def test_new_sections_in_defaults(self):
+        self.assertIn("timeline", DEFAULT_SECTIONS)
+        self.assertIn("iocs", DEFAULT_SECTIONS)
+        self.assertIn("attack", DEFAULT_SECTIONS)
+
+
+class AnnotationRenderTest(unittest.TestCase):
+    FINDINGS = [
+        {"kind": "credential", "level": "good", "frame": "4",
+         "feature": "NTLM HASH提取", "summary": "Administrator::WORKGROUP",
+         "detail": "NTLMv1",
+         "annotation": {"status": "false_positive", "note": "误报 <b>x</b>",
+                        "updated": "2026-01-01T00:00:00"}},
+        {"kind": "flag", "level": "good", "frame": "9",
+         "feature": "关键字检测", "summary": "flag{annotated}", "detail": "",
+         "annotation": {"status": "confirmed", "note": "已人工核对 | 保留"}},
+    ]
+
+    def test_markdown_annotation_column(self):
+        text = render_markdown(sample_meta(), LOGS, [], findings=self.FINDINGS)
+        self.assertIn("| 类别 | 级别 | 帧 | 功能 | 摘要 | 详情 | 标注 |", text)
+        self.assertIn("误报 · 误报 <b>x</b>", text)
+        self.assertIn(r"已人工核对 \| 保留", text)
+
+    def test_markdown_without_annotations_is_unchanged(self):
+        findings = [dict(item) for item in self.FINDINGS]
+        for item in findings:
+            item.pop("annotation")
+        text = render_markdown(sample_meta(), LOGS, [], findings=findings)
+        self.assertIn("| 类别 | 级别 | 帧 | 功能 | 摘要 | 详情 |", text)
+        self.assertNotIn("| 标注 |", text)
+
+    def test_html_annotation_is_escaped_and_marked(self):
+        page = render_html(sample_meta(), LOGS, [], findings=self.FINDINGS)
+        self.assertIn("<th>标注</th>", page)
+        self.assertIn("&lt;b&gt;x&lt;/b&gt;", page)
+        self.assertNotIn("<b>x</b>", page)
+        self.assertIn("ann-false", page)
+        self.assertIn("误报", page)
+
+    def test_plain_text_lines(self):
+        lines = annotation_lines(self.FINDINGS)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("误报", lines[0])
+        self.assertIn("已人工核对", lines[1])
+        self.assertTrue(lines[0].startswith("  #1 [凭据]"))
+
+
+class AnnotationReportTest(unittest.TestCase):
+    """report.txt / report.md / report.html tell the same annotation story."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        cache = Path(self.tmp.name) / "cache"
+        cache.mkdir()
+        patches = (mock.patch("fnet.jobs.CACHE_DIR", cache),
+                   mock.patch("fnet.paths.CACHE_DIR", cache))
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.manager = JobManager(Config(Path(self.tmp.name) / "config.ini"),
+                                  None)
+
+    def _job(self):
+        from fnet.findings import make
+
+        job = self.manager.create(str(DATA / "http_ntlm.pcap"),
+                                  ["checkBox_10"], {})
+        job.findings = [
+            make("credential", "Administrator::WORKGROUP", frame="4",
+                 detail="NTLMv1", feature="NTLM HASH提取"),
+            make("flag", "flag{annotation_report}", frame="9",
+                 feature="关键字检测"),
+        ]
+        return job
+
+    def test_three_formats_render_annotation(self):
+        job = self._job()
+        self.manager.set_annotation(job.id, 1, "false_positive",
+                                    "误报 <script>alert(1)</script>")
+        self.manager.set_annotation(job.id, 2, "confirmed", "已人工核对")
+        job.log.info("关键字检测 命中 flag{annotation_report}")
+        # Worker order: findings.json/csv first, then the three report files.
+        self.manager._write_findings(job)
+        self.manager._write_report(job, "done")
+
+        output = job.output_dir
+        text = (output / "report.txt").read_text(encoding="utf-8")
+        markdown = (output / "report.md").read_text(encoding="utf-8")
+        page = (output / "report.html").read_text(encoding="utf-8")
+
+        self.assertIn("人工标注:", text)
+        self.assertIn("误报 <script>alert(1)</script>", text)
+        self.assertIn("已人工核对", text)
+        self.assertIn("| 标注 |", markdown)
+        self.assertIn("误报 · 误报 <script>alert(1)</script>", markdown)
+        self.assertIn("<th>标注</th>", page)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", page)
+        self.assertNotIn("<script>alert(1)</script>", page)
+        self.assertIn("ann-false", page)
+
+        # The txt annotation block sits before the timestamped log lines so
+        # parse_report_text() still recovers the historical log unchanged.
+        records = parse_report_text(text)
+        self.assertTrue(records)
+        self.assertFalse(any("人工标注" in record["text"] or "误报" in record["text"]
+                             for record in records))
+        self.assertTrue(any("命中 flag{annotation_report}" in record["text"]
+                            for record in records))
+
+        # /api/report (report_source -> export_report) carries them too.
+        exported = self.manager.export_report(job.id, "html")["content"]
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", exported)
+        self.assertIn("ann-false", exported)
+
+        # Same for a job recovered from disk after a restart (no live job).
+        with self.manager._lock:
+            self.manager._jobs.pop(job.id, None)
+        restored = self.manager.export_report(job.id, "md")["content"]
+        self.assertIn("| 标注 |", restored)
+        self.assertIn("已人工核对", restored)
+
+    def test_report_without_annotations_unchanged(self):
+        job = self._job()
+        job.log.info("关键字检测 命中 flag{annotation_report}")
+        self.manager._write_report(job, "done")
+        text = (job.output_dir / "report.txt").read_text(encoding="utf-8")
+        markdown = (job.output_dir / "report.md").read_text(encoding="utf-8")
+        page = (job.output_dir / "report.html").read_text(encoding="utf-8")
+        self.assertNotIn("人工标注", text)
+        self.assertNotIn("| 标注 |", markdown)
+        self.assertNotIn("<th>标注</th>", page)
+
+    def test_set_annotation_refreshes_existing_reports(self):
+        """Annotations are usually written after the run: reports must follow."""
+        job = self._job()
+        job.status = "done"
+        job.log.info("关键字检测 命中 flag{annotation_report}")
+        self.manager.set_annotation(job.id, 1, "confirmed", "事后补的标注")
+        text = (job.output_dir / "report.txt").read_text(encoding="utf-8")
+        markdown = (job.output_dir / "report.md").read_text(encoding="utf-8")
+        self.assertEqual(text.count("人工标注:"), 1)
+        self.assertIn("事后补的标注", text)
+        self.assertIn("事后补的标注", markdown)
+        # Clearing it removes the block again without duplicating the log.
+        self.manager.set_annotation(job.id, 1, "", "")
+        text = (job.output_dir / "report.txt").read_text(encoding="utf-8")
+        self.assertNotIn("人工标注", text)
+        self.assertEqual(text.count("命中 flag{annotation_report}"), 1)
 
 
 class ParseTest(unittest.TestCase):

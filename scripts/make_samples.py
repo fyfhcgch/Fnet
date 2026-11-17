@@ -805,6 +805,293 @@ def quic_initial(dcid: bytes, scid: bytes, sni: str, *,
     return bytes(packet)
 
 
+def _usb_mmapped(rec_type: str, xfer: int, ep: int, dev: int, irp: int,
+                 data: bytes, bus: int = 256, ts: int = 1700000000) -> bytes:
+    """One Linux-mmapped USB record (pcap linktype 220, 64-byte header).
+
+    The header layout matches wiretap's ``USB_LINUX_MMAPPED``: id/type/
+    xfer/ep/dev/bus, setup+data flags, timestamps, then an 8-byte setup area
+    padded so the header totals 64 bytes.  ``bus`` is passed byte-swapped
+    because Wireshark reads it big-endian.
+    """
+    header = struct.pack(
+        "<QBBBBHbbqiiiI",
+        irp, ord(rec_type), xfer, ep, dev, bus,
+        -1, 0 if data else -1, ts, 0, 0, len(data), len(data))
+    return header.ljust(64, b"\x00") + data
+
+
+def usb_hid_capture(reports: list[bytes]) -> list:
+    """USBPcap-style interrupt-IN reports for the HID analysers.
+
+    Yields a submit/complete URB pair per report so tshark surfaces each
+    payload as ``usb.capdata`` (the filter used by checkBox_16/17).
+    """
+    packets = []
+    for index, report in enumerate(reports):
+        irp = index * 2 + 1
+        packets.append(Raw(_usb_mmapped("S", 1, 0x81, 1, irp, b"")))
+        packets.append(Raw(_usb_mmapped("C", 1, 0x81, 1, irp, report)))
+    return packets
+
+
+def usb_kbd_capture() -> list:
+    """Keyboard reports typing flag{usb_kbd} followed by Enter."""
+    text = "flag{usb_kbd}\n"
+    plain = {ch: code for code, ch in [
+        (0x04, "a"), (0x05, "b"), (0x07, "d"), (0x09, "f"), (0x0A, "g"),
+        (0x0E, "k"), (0x0F, "l"), (0x16, "s"), (0x18, "u"), (0x28, "\n"),
+    ]}
+    shifted = {"{": 0x2F, "}": 0x30, "_": 0x2D}
+    reports = [bytes(8)]
+    for ch in text:
+        if ch in shifted:
+            reports.append(bytes([0x02, 0, shifted[ch], 0, 0, 0, 0, 0]))
+        elif ch in plain:
+            reports.append(bytes([0, 0, plain[ch], 0, 0, 0, 0, 0]))
+        else:
+            continue
+        reports.append(bytes(8))
+    return usb_hid_capture(reports)
+
+
+def usb_mouse_capture() -> list:
+    """Mouse reports drawing a square with two left clicks."""
+    reports = [bytes([0, 0, 0, 0])]
+    steps = [(2, 0)] * 40 + [(0, 2)] * 40 + [(-2, 0)] * 40 + [(0, -2)] * 40
+    for dx, dy in steps:
+        reports.append(bytes([0, dx & 0xFF, dy & 0xFF, 0]))
+    reports.append(bytes([1, 0, 0, 0]))
+    reports.append(bytes([0, 0, 0, 0]))
+    reports.append(bytes([1, 0, 0, 0]))
+    reports.append(bytes([0, 0, 0, 0]))
+    return usb_hid_capture(reports)
+
+
+# Self-signed RDP test certificate (CN=rdp.ctf.local) embedded in the
+# Certificate message of the RDP fixture handshake.  The matching private
+# key is deliberately not shipped; the session is decryptable through the
+# deterministic NSS keylog written to ``rdp_keylog.txt`` (see ``_rdp_tls``).
+RDP_TEST_CERT = base64.b64decode(
+    "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUM4RENDQWRpZ0F3SUJBZ0lV"
+    "Q01LY05KYURQS2NLNGxiV1RRUGhDSjJON0xFd0RRWUpLb1pJaHZjTkFRRUwKQlFB"
+    "d0dERVdNQlFHQTFVRUF3d05jbVJ3TG1OMFppNXNiMk5oYkRBZUZ3MHlOakV4TVRj"
+    "d05UVXdOVFJhRncwMApOakV4TVRJd05UVXdOVFJhTUJneEZqQVVCZ05WQkFNTURY"
+    "SmtjQzVqZEdZdWJHOWpZV3d3Z2dFaU1BMEdDU3FHClNJYjNEUUVCQVFVQUE0SUJE"
+    "d0F3Z2dFS0FvSUJBUURFcUh3bWVVc1MzMFBWcGJVR1ZPRXEzQkdHQjBkU2pOS3IK"
+    "UjBjMkpWWVVvUW1PVXNXUmlVY01ybEpjUzdCTVBtdEdUNFZGYWsyaFhRVEVRSHZF"
+    "d1A5RUFMay9CaXJNWU4xRAppTHpVbTAwRkcyOXhyQ2pqdEI1eDkySFVxL0h4SnY4"
+    "czVoN1ZCU1dEejd1eGJyWXhZVWVQV3ArMlE3NGVNUyt6CjI3MWJ3aXdsUmVKRmJs"
+    "NWoza1JsOVh2QUVaYit2dVFjQXZpeFlaaTZHTHhtQmNtR01ESFkzbjN0SUFEZWRU"
+    "SFAKL2JLd0hkYUtrTmk0bDczQkFZZ3dodmpGYkIzUy9WTWpGc0p2Q3R1UERDRUN2"
+    "K251VEh5NHl4NzZLaGZMdlJiNwpmN0FRQ054bnMvZXNMWk9oUzBFWW5VR2ZSQnJE"
+    "ZGl3UmZwbGdCU211RVNWUGJpWVhORW41QWdNQkFBR2pNakF3Ck1CMEdBMVVkRGdR"
+    "V0JCU3BLZXhEQUlNTEFJalBLb1ByMXdDNm1kelZyREFQQmdOVkhSTUJBZjhFQlRB"
+    "REFRSC8KTUEwR0NTcUdTSWIzRFFFQkN3VUFBNElCQVFDam1xdmhHMkNJeWd2a0ZP"
+    "ZHlKU1BMZlUzQjFZdnVXcUwzZVdzVQpGVnBIV2Q1MDdNT29DajAyMWVKdXF1VXdL"
+    "eG9kTzQvZ0dlRUlRUTVycTcwckVRclVOU3dNQitrVzlLYzJDWnlpCkRYTXV0Q3Za"
+    "ak1XSnE3RTZPZjBtbm5zRi9iSDhSbGx1S3J4bTFHZ1RkYUpMTG0zU1U4U1ptVHFm"
+    "NzNvRzZjcFcKWFFJczVQdnROdWhSOGlyZmFYQkkrWnRHcUtVSDl0V0owVEI3aW1X"
+    "M3Q1dDhndEhlbTJmR0FtNWdEeFEyM1hYVgpHWmFMRVFSMDlub3E1Y0hJQlIwejJo"
+    "bjJpWFBVR2pnR1BMUndPVGxhYmEwSTZ2Y3ZBK1hQNXY2Y3pZNzhXWGk0CnJnZzRP"
+    "TGFWTG92UXhyWFdVSzYrWm9HMnZ2QUlaRXBidkkxanlQcWpzR1FGYUU3SAotLS0t"
+    "LUVORCBDRVJUSUZJQ0FURS0tLS0tCg==")
+def _pem_der(pem: bytes) -> bytes:
+    """Extract the DER body of the first PEM block."""
+    body = b"".join(line for line in pem.splitlines()
+                    if not line.startswith(b"-----"))
+    return base64.b64decode(body)
+
+
+def _der_walk(data: bytes) -> list:
+    """Flatten a DER structure into (tag, content) children."""
+    items = []
+    offset = 0
+    while offset < len(data):
+        tag = data[offset]
+        offset += 1
+        length = data[offset]
+        offset += 1
+        if length & 0x80:
+            size = length & 0x7F
+            length = int.from_bytes(data[offset:offset + size], "big")
+            offset += size
+        items.append((tag, data[offset:offset + length]))
+        offset += length
+    return items
+
+
+def _rsa_public_key(cert_pem: bytes) -> tuple:
+    """Pull ``(modulus, exponent)`` out of a self-signed certificate."""
+    top = _der_walk(_pem_der(cert_pem))[0][1]           # Certificate content
+    tbs = _der_walk(top)[0][1]                          # tbsCertificate
+    subject_key = _der_walk(tbs)[6][1]                  # subjectPublicKeyInfo
+    key_bits = _der_walk(subject_key)[1][1][1:]         # BIT STRING payload
+    # RSAPublicKey SEQUENCE content = concatenated modulus/exponent INTEGERs
+    modulus, exponent = (value for _tag, value
+                         in _der_walk(_der_walk(key_bits)[0][1]))
+    return int.from_bytes(modulus, "big"), int.from_bytes(exponent, "big")
+
+
+def _rsa_pkcs1_encrypt(message: bytes, modulus: int, exponent: int) -> bytes:
+    size = (modulus.bit_length() + 7) // 8
+    padding = bytes((index % 254) + 1
+                    for index in range(size - len(message) - 3))
+    block = b"\x00\x02" + padding + b"\x00" + message
+    return pow(int.from_bytes(block, "big"), exponent, modulus).to_bytes(
+        size, "big")
+
+
+def _tls_prf(secret: bytes, label: bytes, seed: bytes, length: int) -> bytes:
+    """TLS 1.2 pseudo-random function (HMAC-SHA256 based, RFC 5246 §5)."""
+    import hmac
+
+    out, block = b"", label + seed
+    while len(out) < length:
+        block = hmac.new(secret, block, hashlib.sha256).digest()
+        out += hmac.new(secret, block + label + seed,
+                        hashlib.sha256).digest()
+    return out[:length]
+
+
+def _rdp_tls(cert_pem: bytes) -> dict:
+    """Minimal TLS 1.2 RSA-key-exchange handshake for the RDP fixture.
+
+    Client random, server random and premaster secret are all fixed, so the
+    NSS keylog line for tshark's ``tls.keylog_file`` decryption is
+    deterministic.  TLS_RSA_WITH_NULL_SHA256 keeps the record layer to
+    MAC-only, which avoids a pure-Python AES while staying decryptable by
+    tshark.
+    """
+    import hmac
+
+    client_random = bytes(range(16, 48))
+    server_random = bytes(range(64, 96))
+    premaster = b"\x03\x03" + bytes(range(128, 174))
+    cipher = b"\x00\x3b"  # TLS_RSA_WITH_NULL_SHA256
+    hello_tail = (b"\x00" + struct.pack(">H", len(cipher)) + cipher
+                  + b"\x01\x00" + b"\x00\x00")
+
+    cert_der = _pem_der(cert_pem)
+    client_hello = tls_handshake(1, b"\x03\x03" + client_random + hello_tail)
+    # ServerHello carries a single cipher suite (no suites-length prefix) and
+    # a single compression method byte.
+    server_hello = tls_handshake(
+        2, b"\x03\x03" + server_random + b"\x00" + cipher
+        + b"\x00" + b"\x00\x00")
+    certificate = tls_handshake(
+        11, (len(cert_der) + 3).to_bytes(3, "big")
+        + len(cert_der).to_bytes(3, "big") + cert_der)
+    server_hello_done = tls_handshake(14, b"")
+    modulus, exponent = _rsa_public_key(cert_pem)
+    encrypted_premaster = _rsa_pkcs1_encrypt(premaster, modulus, exponent)
+    client_key_exchange = tls_handshake(
+        16, struct.pack(">H", len(encrypted_premaster)) + encrypted_premaster)
+
+    master_secret = _tls_prf(premaster, b"master secret",
+                             client_random + server_random, 48)
+    keylog = "CLIENT_RANDOM %s %s" % (client_random.hex(), master_secret.hex())
+    key_block = _tls_prf(master_secret, b"key expansion",
+                         server_random + client_random, 64)
+    client_mac, server_mac = key_block[:32], key_block[32:]
+    client_seen = hashlib.sha256(client_hello + server_hello + certificate
+                                 + server_hello_done).digest()
+    server_seen = hashlib.sha256(client_hello + server_hello + certificate
+                                 + server_hello_done
+                                 + client_key_exchange).digest()
+    client_finished = tls_handshake(
+        20, _tls_prf(master_secret, b"client finished", client_seen, 12))
+    server_finished = tls_handshake(
+        20, _tls_prf(master_secret, b"server finished", server_seen, 12))
+
+    def mac_record(side: bytes, seq: int, kind: int, content: bytes) -> bytes:
+        mac = hmac.new(side, struct.pack("!Q", seq) + bytes([kind])
+                       + b"\x03\x03" + struct.pack("!H", len(content))
+                       + content, hashlib.sha256).digest()
+        return tls_record(kind, content + mac)
+
+    def sender(side: bytes):
+        state = {"seq": 1}  # the Finished handshake consumed sequence 0
+
+        def send(content: bytes) -> bytes:
+            record = mac_record(side, state["seq"], 23, content)
+            state["seq"] += 1
+            return record
+        return send
+
+    return {
+        "client_hello": [tls_record(22, client_hello)],
+        "server_flight1": [tls_record(22, server_hello),
+                           tls_record(22, certificate),
+                           tls_record(22, server_hello_done)],
+        "client_flight2": [tls_record(22, client_key_exchange),
+                           tls_record(20, b"\x01"),
+                           mac_record(client_mac, 0, 22, client_finished)],
+        "server_flight2": [tls_record(20, b"\x01"),
+                           mac_record(server_mac, 0, 22, server_finished)],
+        "client_app": sender(client_mac),
+        "server_app": sender(server_mac),
+        "keylog": keylog,
+    }
+
+
+def rdp_keylog() -> str:
+    """NSS keylog line matching the fixed RDP fixture handshake."""
+    return _rdp_tls(RDP_TEST_CERT)["keylog"]
+
+
+def rdp_replay_capture() -> list:
+    """RDP for the checkBox_47 session-replay handler.
+
+    The X.224 Connection Request/Confirm with RDP negotiation PDUs runs on
+    TCP/13389 (the handler's ``port`` parameter) while the TLS 1.2
+    RSA-key-exchange session runs on TCP/3389.  Recent Wireshark builds let
+    the ``tpkt.tcp.port`` preference claim every payload on the parameter
+    port before the TLS heuristic dissector gets a chance, so the encrypted
+    records must live on the default RDP port, where the RDP dissector
+    rejects them and hands them to the TLS heuristic.  The session decrypts
+    through the deterministic NSS keylog written to ``rdp_keylog.txt``
+    (tshark's ``tls.keylog_file``); PyRDP's replay conversion additionally
+    needs full MCS/GCC PDUs, which this fixture keeps minimal.
+    """
+    def tpkt(payload: bytes) -> bytes:
+        return b"\x03\x00" + struct.pack(">H", len(payload) + 4) + payload
+
+    def dt(payload: bytes) -> bytes:
+        return tpkt(b"\x02\xf0\x80" + payload)
+
+    def neg(kind: int, protocol: int) -> bytes:
+        return bytes([kind, 0x00, 0x08, 0x00]) + struct.pack("<I", protocol)
+
+    cookie = b"Cookie: mstshash=fnet\r\n"
+    # TYPE_RDP_NEG_REQ(0x01) requesting PROTOCOL_SSL(0x00000001).
+    request_var = cookie + neg(0x01, 1)
+    connection_request = tpkt(bytes([6 + len(request_var), 0xE0])
+                              + b"\x00\x00\x00\x00\x00" + request_var)
+    # TYPE_RDP_NEG_RSP(0x02) selecting PROTOCOL_SSL.
+    confirm_var = neg(0x02, 1)
+    connection_confirm = tpkt(bytes([6 + len(confirm_var), 0xD0])
+                              + b"\x00\x00\x00\x00\x00" + confirm_var)
+
+    tls = _rdp_tls(RDP_TEST_CERT)
+    client_app = tls["client_app"](dt(b"\x7f\x65\x04"
+                                      + b"flag{rdp_client_info}"))
+    fastpath = (b"\x00\x0e\x0f\x00"
+                + struct.pack(">H", len(b"flag{rdp_graphics}"))
+                + b"flag{rdp_graphics}")
+    server_app = tls["server_app"](dt(b"\x7f\x66\x04" + b"flag{rdp_server}"))
+    server_fastpath = tls["server_app"](tpkt(fastpath))
+    negotiation = tcp_stream("10.0.0.5", 40140, "10.0.0.88", 13389,
+                             [connection_request], [connection_confirm])
+    session = tcp_stream("10.0.0.5", 40142, "10.0.0.88", 3389,
+                         [b"".join(tls["client_hello"]),
+                          b"".join(tls["client_flight2"]), client_app],
+                         [b"".join(tls["server_flight1"]),
+                          b"".join(tls["server_flight2"]),
+                          server_app + server_fastpath])
+    return negotiation + session
+
+
 def quic_capture() -> list:
     """QUIC v1 and v2 Initial packets carrying SNI/ALPN metadata."""
     flows = [
@@ -819,6 +1106,41 @@ def quic_capture() -> list:
         packets.append(Ether() / IP(src=src, dst=dst) / UDP(sport=sport,
                                                             dport=443) / payload)
     return packets
+
+
+def bluetooth_capture() -> list:
+    """Bluetooth HCI H4 (linktype 201, direction pseudo-header) sample.
+
+    One LE scan command pair plus two ACL/ATT read responses carrying a
+    flag, so checkBox_21 dumps HCI tables and checkBox_40 surfaces btatt
+    values.
+    """
+    def h4_dir(direction, h4frame):
+        return struct.pack(">I", direction) + h4frame
+
+    def h4_cmd(opcode, body=b""):
+        return bytes([0x01]) + struct.pack("<HH", opcode, len(body)) + body
+
+    def h4_evt(code, body):
+        return bytes([0x04]) + struct.pack("<BB", code, len(body)) + body
+
+    def acl(handle, payload):
+        return bytes([0x02]) + struct.pack("<HH", handle | 0x2000,
+                                           len(payload)) + payload
+
+    def l2cap(cid, payload):
+        return struct.pack("<HH", len(payload), cid) + payload
+
+    def att_read_rsp(value):
+        return bytes([0x0b]) + value
+
+    packets = [
+        h4_dir(1, h4_cmd(0x2007, b"\x01")),                    # LE Set Scan Enable
+        h4_dir(0, h4_evt(0x0e, b"\x01\x20\x07\x00")),          # Command Complete
+        h4_dir(0, acl(0x0040, l2cap(0x0004, att_read_rsp(b"flag{ble_ctf}")))),
+        h4_dir(0, acl(0x0040, l2cap(0x0004, att_read_rsp(b"Device Name")))),
+    ]
+    return [Raw(p) for p in packets]
 
 
 def build(only: list[str] | None = None) -> dict[str, Path]:
@@ -837,15 +1159,28 @@ def build(only: list[str] | None = None) -> dict[str, Path]:
         "wifi_eapol.pcap": wifi_eapol(),
         "tls_deep.pcap": tls_deep(),
         "quic.pcap": quic_capture(),
+        "usb_kbd.pcap": usb_kbd_capture(),
+        "usb_mouse.pcap": usb_mouse_capture(),
+        "bluetooth.pcap": bluetooth_capture(),
+        "rdp.pcap": rdp_replay_capture(),
     }
+    # Non-Ethernet encapsulations: scapy would default Raw payloads to
+    # Ethernet, so override the pcap linktype per group.
+    linktypes = {"usb_kbd.pcap": 220, "usb_mouse.pcap": 220,
+                 "bluetooth.pcap": 201}
     if only:
         wanted = set(only)
         groups = {name: packets for name, packets in groups.items()
                   if name in wanted}
+    if not only or "rdp.pcap" in wanted:
+        # NSS keylog matching the fixed handshake inside rdp.pcap; feed it to
+        # checkBox_47 (rdp.handler) via --param rdp_private_key=rdp_keylog.txt.
+        (OUT / "rdp_keylog.txt").write_text(rdp_keylog() + "\n",
+                                            encoding="ascii")
     written = {}
     for name, packets in groups.items():
         path = OUT / name
-        wrpcap(str(path), packets)
+        wrpcap(str(path), packets, linktype=linktypes.get(name, 1))
         written[name] = path
         print(f"{path}  ({len(packets)} packets)")
     return written

@@ -125,8 +125,11 @@ def _try_decrypt_output(data: bytes, key: bytes) -> tuple[str, bytes] | None:
                            aes_cbc_decrypt(trimmed[16:], key, trimmed[:16])))
     best = max(candidates, key=lambda item: printable_ratio(item[1])
                + (20 if b"<" in item[1] or b"cmd" in item[1] else 0))
-    if printable_ratio(best[1]) >= 0.6 or any(
-            marker in best[1] for marker in (b"cmd", b"powershell", b"<", b"{")):
+    # 任务输出必然是可读文本：可读率与结构标记两者取严，避免错误密钥解出的
+    # 乱码（例如只含一个 '<' 的伪随机字节）被误判为“解密成功”并落盘。
+    markers = (b"cmd", b"powershell", b"<", b"{", b"\n")
+    if (printable_ratio(best[1]) >= 0.6
+            and any(marker in best[1] for marker in markers)):
         return best
     return None
 

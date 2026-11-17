@@ -74,7 +74,7 @@ JobManager ─────────────►  worker thread
 | 实时抓包 | `fnet/live.py` | tshark 网卡枚举与单实例抓包控制 |
 | 结果 | `fnet/findings.py` | 结构化结果的格式、筛选、CSV 导出 |
 | 报告 | `fnet/report.py` | Markdown/HTML 报告渲染、章节选择、旧报告反解 |
-| 功能 | `fnet/features/` | 37 个分析功能，按主题拆文件 |
+| 功能 | `fnet/features/` | 46 个分析功能，按主题拆文件 |
 | 外部工具 | `fnet/tools/runner.py` | 工具发现、子进程、tshark 字段校验 |
 | 工具库 | `fnet/utils/` | 编解码、AES/RC4/MD4/RSA/GCM、pcap 辅助、TCP 流重组、RESP/PostgreSQL/BSON-MongoDB/WebSocket/MySQL 解析、Kerberos 原语、DNS/ICMP 隧道、邮件 MIME、WPA CCMP 解密、规则解析 |
 | 配置 | `fnet/config.py` | `config.ini` 默认值、读写、最近文件 |
@@ -144,7 +144,7 @@ findings、统计与产出序列化为 JSON；`--resume`/`--compare` 直接调�
 ## 测试策略
 
 - **纯函数**：AES/GCM/MD4/RC4/RSA 使用标准测试向量；编解码使用已知输入。
-- **注册表**：37 个 handler 都可导入、checkbox 唯一、分类都存在。
+- **注册表**：46 个 handler 都可导入、checkbox 唯一、分类都存在。
 - **API 冒烟**：启动临时服务，验证 health/meta/upload/analyze/log/download。
 - **抓包**：`tests/data/*.pcap` 由 `scripts/make_samples.py` 生成，断言
   关键字、HTTP 凭据、Webshell、NTLM、DNS、Modbus/MQTT 等结果。

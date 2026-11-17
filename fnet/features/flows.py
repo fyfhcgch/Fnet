@@ -498,9 +498,14 @@ def _mail_sessions(ctx: FeatureContext) -> None:
 def bluetooth(ctx: FeatureContext) -> None:
     _dump(ctx, "Bluetooth HCI", ["frame.number", "bthci_cmd.opcode",
                                  "bthci_cmd.ogf", "bthci_evt.code",
-                                 "bthci_acl.protocol", "bthci_acl.data"],
+                                 "bthci_acl.chandle", "btatt.opcode",
+                                 "btatt.value"],
           "bthci_cmd or bthci_acl or bthci_evt")
-    _payload_rows(ctx, "Bluetooth 数据", "bthci_acl", ["bthci_acl.data"],
+    # bthci_acl.data is unreliable across tshark builds; btatt.value carries
+    # the ATT payload on LE links.  Unknown fields are dropped silently by
+    # the runner, so this stays compatible with older versions.
+    _payload_rows(ctx, "Bluetooth 数据", "bthci_acl or btatt",
+                  ["bthci_acl.data", "btatt.value"],
                   max_lines=300)
 
 
