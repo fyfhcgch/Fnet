@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
-import re
 import secrets
 import shutil
 import subprocess
@@ -989,7 +988,8 @@ class JobManager:
         """Run imported regex/YARA-subset rules and record matches as findings."""
         from fnet.utils import rules as rules_mod
 
-        path = str(params.get("rules") or "").strip()
+        path = str(params.get("rules")
+                   or self.config.get("rules_file", "paths") or "").strip()
         if not path:
             return
         if job.feature_status.get("__rules__") == "done":
@@ -1047,31 +1047,9 @@ class JobManager:
     # -- sharding helpers ---------------------------------------------
     def _frame_count(self, pcap: str, tshark) -> int:
         """Total frame count using capinfos when available, tshark otherwise."""
-        capinfos = shutil.which("capinfos")
-        if capinfos:
-            try:
-                out = subprocess.run([capinfos, "-c", "-M", pcap],
-                                     capture_output=True, text=True,
-                                     timeout=120).stdout
-                match = re.search(r"Number of packets:\s*(\d+)", out)
-                if match:
-                    return int(match.group(1))
-            except (OSError, subprocess.SubprocessError):
-                pass
-        if tshark is not None:
-            try:
-                result = subprocess.run(
-                    [tshark.path, "-r", pcap, "-q", "-z", "io,stat,0"],
-                    capture_output=True, text=True, timeout=300)
-            except (OSError, subprocess.SubprocessError):
-                return 0
-            if result.returncode == 0:
-                # ``| 0.000 <> 1.000 |   123 |  4567 |``
-                matches = re.findall(r"\|\s*[\d.]+ <>\s*[\d.]+\s*\|\s*(\d+)\s*\|",
-                                     result.stdout or "")
-                if matches:
-                    return int(matches[-1])
-        return 0
+        from fnet.tools.runner import count_frames
+
+        return count_frames(pcap, tshark.path if tshark is not None else "")
 
     def _clip_shard(self, job: Job, tshark, start: int, end: int,
                     shard_index: int) -> Path | None:

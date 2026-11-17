@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -85,6 +86,42 @@ def tool_version(path: str, timeout: int = 10) -> str:
         if code == 0 and out.strip():
             return out.strip().splitlines()[0]
     return ""
+
+
+def count_frames(pcap: str | Path, tshark_path: str = "",
+                 timeout: int = 300) -> int:
+    """Return the number of packets in ``pcap`` (0 when unknown).
+
+    ``capinfos`` is preferred because it only reads the file headers; the
+    ``tshark -z io,stat`` fallback works everywhere tshark does.  The result
+    lets callers scan a capture in bounded frame ranges instead of materialising
+    every packet payload at once.
+    """
+    capinfos = shutil.which("capinfos")
+    if capinfos:
+        try:
+            out = subprocess.run([capinfos, "-c", "-M", str(pcap)],
+                                 capture_output=True, text=True,
+                                 timeout=timeout).stdout
+            match = re.search(r"Number of packets:\s*(\d+)", out or "")
+            if match:
+                return int(match.group(1))
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if tshark_path:
+        try:
+            result = subprocess.run(
+                [tshark_path, "-r", str(pcap), "-q", "-z", "io,stat,0"],
+                capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.SubprocessError):
+            return 0
+        if result.returncode == 0:
+            matches = re.findall(
+                r"\|\s*[\d.]+ <>\s*[\d.]+\s*\|\s*(\d+)\s*\|",
+                result.stdout or "")
+            if matches:
+                return int(matches[-1])
+    return 0
 
 
 def run(cmd: list[str], timeout: int = 600, stdin: bytes | None = None,

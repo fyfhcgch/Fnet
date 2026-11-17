@@ -103,64 +103,101 @@ def keyword_scan(ctx: FeatureContext) -> None:
         display_filter = "http.request.method == POST"
         ctx.report("仅扫描 POST 请求", "info")
 
-    rows = tshark_rows(ctx, FIELDS, display_filter, limit=200_000)
-    if not rows:
-        ctx.report("没有可分析的报文", "warn")
-        return
+    from fnet.tools.runner import count_frames
+
+    total_frames = count_frames(
+        ctx.pcap, ctx.tshark.path if ctx.tshark is not None else "")
+    chunk = max(2_000, min(int(params.get("chunk_frames") or 20_000), 100_000))
+    if total_frames > chunk:
+        # Scan bounded frame ranges so a 1 GB capture never materialises all
+        # payloads at once (the old single tshark call needed gigabytes of RSS).
+        ranges = [(start, min(start + chunk - 1, total_frames))
+                  for start in range(1, total_frames + 1, chunk)]
+        ctx.report(f"分块扫描：{len(ranges)} 个区间，每区间 {chunk} 帧", "debug")
+    else:
+        ranges = [None]
 
     max_hits = int(params.get("max_hits") or 500)
     hits = 0
     flags: list[str] = []
     seen_flags: set[str] = set()
     seen_hits: set[tuple[str, str]] = set()
+    processed = 0
+    stopped = False
 
-    for index, row in enumerate(rows):
-        if index % 200 == 0:
-            ctx.set_progress(int(index / max(len(rows), 1) * 90))
-            ctx.check_cancel()
-        row += [""] * (len(FIELDS) - len(row))
-        frame, proto, info = row[0], row[1], row[2]
-        payloads = [row[3], row[4], row[5], row[6]]
-        meta = "\n".join(row[7:12])
+    def scan_rows(rows) -> bool:
+        """Process one batch; returns False once the hit limit is reached."""
+        nonlocal processed, hits, stopped
+        for index, row in enumerate(rows):
+            if index % 200 == 0:
+                done = processed + index
+                if total_frames:
+                    ctx.set_progress(min(90, int(done / total_frames * 90)))
+                ctx.check_cancel()
+            row += [""] * (len(FIELDS) - len(row))
+            frame, proto, info = row[0], row[1], row[2]
+            payloads = [row[3], row[4], row[5], row[6]]
+            meta = "\n".join(row[7:12])
 
-        haystacks: list[tuple[str, str]] = []
-        if meta:
-            haystacks.append(("redis", meta))
-        for raw in payloads:
-            data = hex_to_bytes(raw)
-            if not data:
-                continue
-            for label, view in _decoded_views(data):
-                haystacks.append((label, view))
+            haystacks: list[tuple[str, str]] = []
+            if meta:
+                haystacks.append(("redis", meta))
+            for raw in payloads:
+                data = hex_to_bytes(raw)
+                if not data:
+                    continue
+                for label, view in _decoded_views(data):
+                    haystacks.append((label, view))
 
-        for label, haystack in haystacks:
-            if not haystack:
-                continue
-            for pattern, rx in compiled:
-                for match in rx.finditer(haystack):
-                    hits += 1
-                    start = max(0, match.start() - 50)
-                    end = min(len(haystack), match.end() + 70)
-                    snippet = haystack[start:end].replace("\r", " ").replace("\n", " ")
-                    ctx.report(
-                        f"[{proto}] 帧 {frame} ({label}) 命中 {pattern!r}: …{snippet}…",
-                        "good")
-                    if (frame, pattern) not in seen_hits:
-                        seen_hits.add((frame, pattern))
-                        ctx.add_finding(
-                            "other", f"命中 {pattern}", frame=frame, level="good",
-                            detail=f"[{proto}] ({label}) …{snippet}…")
-                    if hits >= max_hits:
-                        ctx.report("命中数量达到上限，停止扫描", "warn")
-                        ctx.set_progress(100)
-                        return
-            for flag in codec.find_flags(haystack):
-                if flag not in seen_flags:
-                    seen_flags.add(flag)
-                    flags.append(flag)
-                    ctx.report(f"[{proto}] 帧 {frame} 发现 flag: {flag}", "good")
-                    ctx.add_finding("flag", flag, frame=frame, level="good",
-                                    detail=f"[{proto}] {label}")
+            for label, haystack in haystacks:
+                if not haystack:
+                    continue
+                for pattern, rx in compiled:
+                    for match in rx.finditer(haystack):
+                        hits += 1
+                        start = max(0, match.start() - 50)
+                        end = min(len(haystack), match.end() + 70)
+                        snippet = haystack[start:end].replace("\r", " ").replace("\n", " ")
+                        ctx.report(
+                            f"[{proto}] 帧 {frame} ({label}) 命中 {pattern!r}: …{snippet}…",
+                            "good")
+                        if (frame, pattern) not in seen_hits:
+                            seen_hits.add((frame, pattern))
+                            ctx.add_finding(
+                                "other", f"命中 {pattern}", frame=frame, level="good",
+                                detail=f"[{proto}] ({label}) …{snippet}…")
+                        if hits >= max_hits:
+                            ctx.report("命中数量达到上限，停止扫描", "warn")
+                            stopped = True
+                            return False
+                for flag in codec.find_flags(haystack):
+                    if flag not in seen_flags:
+                        seen_flags.add(flag)
+                        flags.append(flag)
+                        ctx.report(f"[{proto}] 帧 {frame} 发现 flag: {flag}", "good")
+                        ctx.add_finding("flag", flag, frame=frame, level="good",
+                                        detail=f"[{proto}] {label}")
+        processed += len(rows)
+        return True
+
+    for bounds in ranges:
+        if stopped:
+            break
+        if bounds is None:
+            rows = tshark_rows(ctx, FIELDS, display_filter, limit=200_000)
+        else:
+            start, end = bounds
+            bound = f"frame >= {start} && frame <= {end}"
+            combined = f"({display_filter}) && {bound}" if display_filter else bound
+            rows = tshark_rows(ctx, FIELDS, combined, limit=200_000)
+        if not rows:
+            continue
+        if not scan_rows(rows):
+            break
+
+    if not processed and not hits and not flags:
+        ctx.report("没有可分析的报文", "warn")
+        return
 
     ctx.set_progress(100)
     if flags:

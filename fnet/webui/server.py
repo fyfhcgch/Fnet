@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from fnet import APP_DISPLAY_NAME, __version__
+from fnet.live import LiveCapture
 from fnet.logger import logger
 
 STATIC_DIR = Path(__file__).with_name("static")
@@ -32,6 +33,7 @@ class FnetApp:
         self.toolbox = toolbox
         self.jobs = jobs
         self.plugins = plugins
+        self.live = LiveCapture(toolbox, config)
         self.token = secrets.token_urlsafe(24)
         self.server: ThreadingHTTPServer | None = None
         #: Pre-selected capture/features from ``fnet capture.pcapng --features ...``.
@@ -60,8 +62,14 @@ class FnetApp:
                 for key, value in THEMES.items()
             ],
             "theme": self.config.get("theme") or "dark",
+            "language": self.config.get("language") or "zh",
             "tools": tools,
             "plugins": self.plugins.as_list(),
+            "rules": {
+                "file": self.config.get("rules_file", "paths"),
+                "count": self._rule_count(),
+            },
+            "live": {"available": bool(tools.get("tshark", {}).get("available"))},
             "paths": {
                 "user": str(USER_DIR),
                 "logs": str(LOG_DIR),
@@ -87,6 +95,17 @@ class FnetApp:
             "paths": self.config.as_dict("paths"),
             "plugins": self.config.as_dict("plugins"),
         }
+
+    def _rule_count(self) -> int:
+        path = str(self.config.get("rules_file", "paths") or "").strip()
+        if not path:
+            return 0
+        try:
+            from fnet.utils import rules as rules_mod
+
+            return len(rules_mod.load_rules(path))
+        except Exception:  # noqa: BLE001 - a bad path is reported in the UI
+            return 0
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -195,6 +214,16 @@ class Handler(BaseHTTPRequestHandler):
                                    "summary": self.app.jobs.batch_summary()})
             if path == "/api/batch/report":
                 return self._batch_report()
+            if path == "/api/compare":
+                return self._compare()
+            if path == "/api/capture/interfaces":
+                return self._json({"ok": True,
+                                   "interfaces": self.app.live.interfaces()})
+            if path == "/api/capture/status":
+                return self._json({"ok": True,
+                                   "capture": self.app.live.status()})
+            if path == "/api/rules":
+                return self._rules_info()
             if path == "/api/log":
                 return self._log_tail()
             return self._error("未找到", 404)
@@ -254,6 +283,42 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 ok = self.app.jobs.cancel(match.group(1))
                 return self._json({"ok": ok})
+            match = re.fullmatch(r"/api/jobs/([0-9a-f]+)/pause", path)
+            if match:
+                ok = self.app.jobs.pause(match.group(1))
+                return self._json({"ok": ok,
+                                   "text": "将在当前功能结束后暂停" if ok
+                                           else "任务未在运行"})
+            match = re.fullmatch(r"/api/jobs/([0-9a-f]+)/resume", path)
+            if match:
+                job = self.app.jobs.resume(match.group(1))
+                if job is None:
+                    return self._error("任务不可恢复", 400)
+                return self._json({"ok": True, "job": job.as_dict()})
+            if path == "/api/capture/start":
+                data = self._json_body()
+                capture = self.app.live.start(
+                    str(data.get("interface") or ""),
+                    str(data.get("filter") or ""),
+                    str(data.get("name") or ""))
+                return self._json({"ok": True, "capture": capture})
+            if path == "/api/capture/stop":
+                data = self._json_body()
+                capture = self.app.live.stop()
+                job = None
+                if data.get("analyze") and capture.get("path"):
+                    features = data.get("features") or []
+                    handlers = data.get("handlers") or []
+                    params = data.get("params") or {}
+                    selection = list(features) + list(handlers)
+                    if selection:
+                        job = self.app.jobs.submit(
+                            capture["path"], selection, params,
+                            shards=data.get("shards", 1))
+                return self._json({"ok": True, "capture": capture,
+                                   "job": job.as_dict() if job else None})
+            if path == "/api/rules":
+                return self._set_rules()
             match = re.fullmatch(r"/api/history/([0-9a-f]+)/delete", path)
             if match:
                 ok = self.app.jobs.delete_history(match.group(1))
@@ -321,7 +386,8 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(features, list) or not isinstance(params, dict):
             return self._error("features 必须是数组，params 必须是对象")
         selection = list(features) + list(handlers)
-        job = self.app.jobs.submit(pcap, selection, params)
+        job = self.app.jobs.submit(pcap, selection, params,
+                                   shards=data.get("shards", 1))
         self.app.config.add_recent(pcap)
         self.app.config.save()
         logger.info(f"新任务 {job.id}: {Path(pcap).name} / {len(job.features)} 个功能")
@@ -333,37 +399,191 @@ class Handler(BaseHTTPRequestHandler):
         from fnet.paths import CACHE_DIR
         upload_dir = CACHE_DIR / "uploads"
         upload_dir.mkdir(parents=True, exist_ok=True)
-
-        if ctype.startswith("multipart/form-data"):
-            match = re.search(r"boundary=(?:\"([^\"]+)\"|([^;]+))", ctype)
-            if not match:
-                return self._error("缺少 multipart boundary")
-            boundary = (match.group(1) or match.group(2)).strip().encode()
-            raw = self._body(limit)
-            filename, payload = _parse_multipart(raw, boundary)
-        else:
-            filename = urllib.parse.unquote(self.headers.get("X-Filename", "capture.pcap"))
-            payload = self._body(limit)
-
-        if not payload:
-            return self._error("上传内容为空")
-        if len(payload) > limit:
-            return self._error("文件超过大小限制")
-        name = SAFE_NAME.sub("_", Path(filename or "capture.pcap").name)
         kind = (self.headers.get("X-Kind")
                 or (self._query().get("kind") or [""])[0]).strip().lower()
-        if kind in ("keylog", "tls_keylog", "tls-keylog", "tls_key",
-                    "key", "private_key", "tls_private_key", "tls-key"):
-            return self._upload_key(name, payload, kind)
-        if not Path(name).suffix:
-            name += ".pcap"
-        if Path(name).suffix.lower() not in (".pcap", ".pcapng", ".cap", ".dmp", ".etl"):
-            return self._error("仅支持 pcap/pcapng/cap/dmp/etl 文件")
-        target = upload_dir / f"{secrets.token_hex(4)}_{name}"
-        target.write_bytes(payload)
-        logger.good(f"已上传流量包 {name} ({len(payload)} 字节)")
-        self._json({"ok": True, "path": str(target), "name": name,
-                    "size": len(payload)})
+
+        temp: Path | None = None
+        try:
+            if ctype.startswith("multipart/form-data"):
+                match = re.search(r"boundary=(?:\"([^\"]+)\"|([^;]+))", ctype)
+                if not match:
+                    return self._error("缺少 multipart boundary")
+                boundary = (match.group(1) or match.group(2)).strip().encode()
+                filename, temp = self._receive_multipart(
+                    boundary, limit, upload_dir)
+            else:
+                filename = urllib.parse.unquote(
+                    self.headers.get("X-Filename", "capture.pcap"))
+                temp = upload_dir / f"upload-{secrets.token_hex(8)}.part"
+                with temp.open("wb") as handle:
+                    size = self._stream_body(handle, limit)
+                if not size:
+                    return self._error("上传内容为空")
+
+            if temp is None or not temp.is_file() or temp.stat().st_size == 0:
+                return self._error("上传内容为空")
+            size = temp.stat().st_size
+            name = SAFE_NAME.sub("_", Path(filename or "capture.pcap").name)
+
+            if kind in ("keylog", "tls_keylog", "tls-keylog", "tls_key",
+                        "key", "private_key", "tls_private_key", "tls-key"):
+                payload = temp.read_bytes()
+                temp.unlink(missing_ok=True)
+                temp = None
+                return self._upload_key(name, payload, kind)
+
+            if kind in ("rules", "rule", "yara"):
+                return self._upload_rules(name, temp)
+
+            if not Path(name).suffix:
+                name += ".pcap"
+            if Path(name).suffix.lower() not in (".pcap", ".pcapng", ".cap",
+                                                 ".dmp", ".etl"):
+                return self._error("仅支持 pcap/pcapng/cap/dmp/etl 文件")
+            target = upload_dir / f"{secrets.token_hex(4)}_{name}"
+            temp.replace(target)
+            temp = None
+            logger.good(f"已上传流量包 {name} ({size} 字节)")
+            return self._json({"ok": True, "path": str(target), "name": name,
+                               "size": size})
+        finally:
+            if temp is not None:
+                try:
+                    temp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _stream_body(self, handle, limit: int) -> int:
+        """Copy the request body to ``handle`` with constant memory."""
+        try:
+            length = max(0, int(self.headers.get("Content-Length") or 0))
+        except (TypeError, ValueError):
+            length = 0
+        if length > limit:
+            raise ValueError("文件超过大小限制")
+        remaining = length
+        total = 0
+        while remaining > 0:
+            chunk = self.rfile.read(min(65536, remaining))
+            if not chunk:
+                break
+            handle.write(chunk)
+            total += len(chunk)
+            remaining -= len(chunk)
+        return total
+
+    def _receive_multipart(self, boundary: bytes, limit: int,
+                           upload_dir: Path) -> tuple[str, Path]:
+        """Stream a multipart upload to disk without buffering the whole body."""
+        try:
+            length = max(0, int(self.headers.get("Content-Length") or 0))
+        except (TypeError, ValueError):
+            length = 0
+        if length > limit:
+            raise ValueError("文件超过大小限制")
+        reader = _MultipartStream(self.rfile, boundary, length, limit)
+        filename = "capture.pcap"
+        temp: Path | None = None
+        # Skip the preamble and stop on the first boundary line.
+        line = reader.readline()
+        while line and reader.delimiter not in line:
+            line = reader.readline()
+        if not line:
+            raise ValueError("multipart 中没有文件字段")
+        while True:
+            headers: dict[str, str] = {}
+            while True:
+                line = reader.readline()
+                if not line or line in (b"\r\n", b"\n"):
+                    break
+                text = line.decode("utf-8", "replace").rstrip("\r\n")
+                key, _, value = text.partition(":")
+                if key:
+                    headers[key.strip().lower()] = value.strip()
+            disposition = headers.get("content-disposition", "")
+            found = re.search(r'filename="([^"]*)"', disposition)
+            if found and temp is None:
+                filename = found.group(1) or filename
+                temp = upload_dir / f"upload-{secrets.token_hex(8)}.part"
+                with temp.open("wb") as handle:
+                    reader.stream_to(handle)
+            else:
+                reader.drain_part()
+            line = reader.readline()
+            if not line or line.startswith(b"--"):
+                break
+        if temp is None:
+            raise ValueError("multipart 中没有文件字段")
+        return filename, temp
+
+    def _upload_rules(self, name: str, temp: Path) -> None:
+        """Validate and store an imported regex/YARA-subset rule file."""
+        from fnet.paths import CACHE_DIR
+        from fnet.utils import rules as rules_mod
+
+        text = temp.read_text(encoding="utf-8", errors="replace")
+        parsed = rules_mod.parse_rules(text, Path(name).suffix)
+        if not parsed:
+            return self._error("规则文件中没有可用的规则")
+        target_dir = CACHE_DIR / "rules"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        safe = SAFE_NAME.sub("_", Path(name).stem)[:80] or "rules"
+        suffix = Path(name).suffix or ".txt"
+        target = target_dir / f"{secrets.token_hex(4)}_{safe}{suffix}"
+        temp.replace(target)
+        self.app.config.set("rules_file", str(target), "paths")
+        self.app.config.save()
+        logger.good(f"已导入自定义规则 {len(parsed)} 条: {target}")
+        return self._json({
+            "ok": True, "path": str(target), "count": len(parsed),
+            "names": [rule.name for rule in parsed[:50]],
+            "text": f"已导入 {len(parsed)} 条规则",
+        })
+
+    def _rules_info(self) -> None:
+        from fnet.utils import rules as rules_mod
+
+        path = str(self.app.config.get("rules_file", "paths") or "").strip()
+        info = {"file": path, "count": 0, "names": [], "error": ""}
+        if path:
+            try:
+                parsed = rules_mod.load_rules(path)
+                info.update(count=len(parsed),
+                            names=[rule.name for rule in parsed[:100]])
+            except Exception as exc:  # noqa: BLE001 - report, don't fail
+                info["error"] = str(exc)
+        return self._json({"ok": True, **info})
+
+    def _set_rules(self) -> None:
+        data = self._json_body()
+        path = str(data.get("file") or data.get("path") or "").strip()
+        if not path:
+            self.app.config.set("rules_file", "", "paths")
+            self.app.config.save()
+            return self._json({"ok": True, "file": "", "count": 0})
+        from pathlib import Path as _Path
+        from fnet.utils import rules as rules_mod
+
+        target = _Path(path).expanduser()
+        if not target.is_file():
+            return self._error("规则文件不存在")
+        parsed = rules_mod.load_rules(target)
+        self.app.config.set("rules_file", str(target), "paths")
+        self.app.config.save()
+        return self._json({"ok": True, "file": str(target),
+                           "count": len(parsed),
+                           "names": [rule.name for rule in parsed[:100]]})
+
+    def _compare(self) -> None:
+        query = self._query()
+        base = (query.get("base") or [""])[0]
+        target = (query.get("target") or [""])[0]
+        if not base or not target:
+            return self._error("需要 base 和 target 任务 ID")
+        result = self.app.jobs.compare(base, target)
+        if result is None:
+            return self._error("任务不存在", 404)
+        return self._json({"ok": True, **result})
 
     def _upload_key(self, name: str, payload: bytes, kind: str) -> None:
         """Store a TLS keylog / private key and remember it in the config."""
@@ -420,7 +640,7 @@ class Handler(BaseHTTPRequestHandler):
         selection = list(features) + list(handlers)
         jobs = self.app.jobs.submit_batch(
             [item.strip() for item in pcaps], selection, params,
-            data.get("concurrency", 1))
+            data.get("concurrency", 1), shards=data.get("shards", 1))
         for pcap in pcaps:
             self.app.config.add_recent(pcap.strip())
         self.app.config.save()
@@ -720,6 +940,79 @@ def _parse_multipart(raw: bytes, boundary: bytes) -> tuple[str, bytes]:
     raise ValueError("multipart 中没有文件字段")
 
 
+class _NullWriter:
+    """Discard a multipart field without growing memory."""
+
+    def write(self, data) -> int:
+        return len(data)
+
+
+class _MultipartStream:
+    """Incremental multipart reader that writes file parts straight to disk.
+
+    Browsers send a ``Content-Length`` for ``FormData`` uploads; the reader
+    consumes exactly that many bytes and keeps only one chunk plus the
+    boundary-length tail in memory.  This is what lets the 1 GiB upload limit
+    work without the previous O(file size) allocation.
+    """
+
+    def __init__(self, rfile, boundary: bytes, length: int, limit: int) -> None:
+        self.rfile = rfile
+        self.delimiter = b"--" + boundary
+        self.remaining = max(0, int(length))
+        self.limit = max(0, int(limit))
+        self.total = 0
+        self.buffer = b""
+
+    def _fill(self, size: int = 65536) -> bool:
+        if self.remaining <= 0:
+            return False
+        data = self.rfile.read(min(size, self.remaining))
+        if not data:
+            self.remaining = 0
+            return False
+        self.remaining -= len(data)
+        self.total += len(data)
+        if self.limit and self.total > self.limit:
+            raise ValueError("文件超过大小限制")
+        self.buffer += data
+        return True
+
+    def readline(self, limit: int = 65536) -> bytes:
+        while b"\r\n" not in self.buffer and len(self.buffer) < limit:
+            if not self._fill():
+                break
+        index = self.buffer.find(b"\r\n")
+        if index < 0:
+            line, self.buffer = self.buffer, b""
+            return line
+        line = self.buffer[:index + 2]
+        self.buffer = self.buffer[index + 2:]
+        return line
+
+    def stream_to(self, handle) -> bool:
+        """Write one part body to ``handle`` up to the next CRLF+boundary."""
+        marker = b"\r\n" + self.delimiter
+        keep = len(marker) - 1
+        while True:
+            index = self.buffer.find(marker)
+            if index >= 0:
+                handle.write(self.buffer[:index])
+                self.buffer = self.buffer[index + len(marker):]
+                return True
+            if len(self.buffer) > keep:
+                cut = len(self.buffer) - keep
+                handle.write(self.buffer[:cut])
+                self.buffer = self.buffer[cut:]
+            if not self._fill():
+                handle.write(self.buffer)
+                self.buffer = b""
+                return False
+
+    def drain_part(self) -> None:
+        self.stream_to(_NullWriter())
+
+
 def make_server(app: FnetApp, host: str = "127.0.0.1",
                 port: int = 8765) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), Handler)
@@ -744,6 +1037,7 @@ def serve(app: FnetApp, host: str = "127.0.0.1", port: int = 8765,
         except KeyboardInterrupt:
             logger.info("收到中断信号，正在关闭…")
         finally:
+            app.live.shutdown()
             server.shutdown()
             server.server_close()
     return server

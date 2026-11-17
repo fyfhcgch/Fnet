@@ -29,6 +29,7 @@ KINDS: tuple[dict[str, str], ...] = (
     {"key": "dns", "name": "DNS", "level": "warn"},
     {"key": "file", "name": "文件", "level": "info"},
     {"key": "protocol", "name": "协议", "level": "info"},
+    {"key": "rule", "name": "自定义规则", "level": "warn"},
     {"key": "log", "name": "日志", "level": "info"},
     {"key": "other", "name": "其他", "level": "info"},
 )

@@ -277,7 +277,7 @@ def render_markdown(env: dict[str, str], results: list[dict],
     for item in results:
         by_size.setdefault(item["size"], []).append(item)
     for size_bytes, actual in sizes:
-        items = by_size.get(size_bytes, [])
+        items = by_size.get(int(size_bytes // (1024 * 1024)), [])
         lines += [
             f"### {_size_label(size_bytes)}（实际 {actual:,} 字节）",
             "",

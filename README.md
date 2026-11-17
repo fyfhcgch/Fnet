@@ -42,6 +42,10 @@ python3 -m fnet --doctor                # 检查 tshark / java / hashcat 等
 python3 -m fnet --list-features         # 列出 37 个功能与复选框编号
 ```
 
+WebUI 顶栏可切换中文 / English；大文件上传显示进度并可按 `Esc` 取消，
+分析过程中可在功能边界暂停/继续，也可在“任务历史”里对比两个任务的结果。
+工具栏的“实时抓包”会枚举 `tshark -D` 的网卡，停止后可直接送入分析。
+
 也可以安装成命令：
 
 ```bash
@@ -64,6 +68,21 @@ python3 -m fnet -C capture.pcapng --features checkBox_10,webshell.decrypt
 # 传入功能参数
 python3 -m fnet -C capture.pcapng --features checkBox_37 \
   --param webshell_password=pass --param shiro_key=<base64>
+
+# 机器可读输出（任务、findings、统计、产出）
+python3 -m fnet -C capture.pcapng --features checkBox_10 --json
+
+# 无状态功能按帧区间分片；已知 WPA PSK / Kerberos 密钥时直接解密
+python3 -m fnet -C capture.pcapng --features checkBox_10 --shards 4
+python3 -m fnet -C wifi.pcap --features checkBox_18 --wpa-psk 'password'
+python3 -m fnet -C krb5.pcap --features checkBox_45 --keytab /etc/krb5.keytab
+
+# 导入自定义正则/YARA 子集规则，命中写入 findings
+python3 -m fnet -C capture.pcapng --features checkBox_30 --rules rules.yar
+
+# 继续已暂停/中断的任务，或对比两个任务的发现
+python3 -m fnet --resume <job-id>
+python3 -m fnet --compare <base-job-id> <target-job-id> --json
 ```
 
 报告与导出文件写入 `~/.cache/fnet/jobs/<job-id>/`，终端会列出
@@ -81,10 +100,10 @@ tshark 字段提取默认启用磁盘缓存与超时重试，可通过 `config.i
 | 区域       | 说明                                                                                                             |
 | ---------- | ---------------------------------------------------------------------------------------------------------------- |
 | 左侧功能栏 | 37 个功能按 13 个分类折叠展示，可全选/全不选                                                                     |
-| 顶部       | 全局功能搜索、文件/统计/设置/工具菜单、tshark 状态、主题切换                                                     |
+| 顶部       | 全局功能搜索、文件/统计/设置/工具菜单、tshark 状态、语言切换、主题切换                                           |
 | 主区域     | 关键字、HTTP、Webshell、SQL、认证、C2、工控、杂项、文本、设置、关于                                              |
 | 分析结果   | 凭据、哈希、flag、导出文件等汇总为可排序表格，支持筛选、搜索、分页、列显示/隐藏、批量复制、按帧号跳转与 CSV 导出 |
-| 任务历史   | 保存历次分析记录，可回看报告、一键重跑或删除                                                                     |
+| 任务历史   | 保存历次分析记录，可回看报告、一键重跑、对比两个任务的 findings diff 或删除                                      |
 | 批量队列   | 一次拖入多个流量包，按并发数排队执行，可暂停/继续、拖拽排序、逐包查看日志、取消并合并报告                        |
 | 统计图表   | 流量时间线、协议分层、Top 会话与会话拓扑；时间线支持缩放/框选与点击下钻，图表可导出 SVG/PNG                      |
 | 日志区     | 级别过滤、关键字过滤、复制、导出、进度与取消；日志中的帧号可点击定位数据包                                       |
@@ -111,6 +130,32 @@ HTML 报告自带样式、无需联网，适合直接交付或打印成 PDF。
 日志与分析结果中的“帧 N”是可点击按钮：弹窗会显示该帧的摘要、前后文帧和
 `tshark -V` 解码详情，可一键导出包含上下文的小 pcapng 片段，或在检测到
 Wireshark 时直接打开对应帧。
+
+### 自定义规则
+
+“设置 → 自定义规则…”或 `POST /api/rules` 可以导入规则文件，支持逐行正则与
+YARA 子集（`strings`/`condition`、`any/all/N of them`、`$a and $b`）。命中
+结果会写入 findings 的“自定义规则”类别（包含规则名、帧号、协议与片段），
+并参与报告、CSV 导出与任务对比。规则文件路径保存在 `paths.rules_file`，
+也可用 `--rules` 为单次任务临时覆盖。
+
+### 任务对比与断点续跑
+
+`GET /api/compare?base=<id>&target=<id>` 会对比两个任务的 findings，返回
+`added`/`removed`/`common` 与按类别统计；WebUI 的“对比两个任务”与
+`--compare` 使用同一实现。任务在功能边界保存 `completed` 与
+`feature_status`，因此暂停后可以“继续”或 `--resume` 从断点恢复；无状态
+功能还能用 `--shards N` 按帧区间并行分析。
+
+### 性能基准
+
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) 由 `scripts/bench.py` 生成，
+记录 10 MB / 100 MB / 1 GB 抓包上每个功能的耗时与峰值 RSS。1 GB 抓包的
+关键字检测采用分块扫描，内存稳定在约 150 MB；重新生成：
+
+```bash
+python3 scripts/bench.py --sizes 10,100,1000 --features default
+```
 
 ## 外部工具
 
@@ -153,17 +198,19 @@ Fnet/
 │   ├── __main__.py        python -m fnet
 │   ├── cli.py             参数解析、无界面运行、启动 WebUI
 │   ├── app.py             对象图组装（WebUI/CLI/测试共用）
-│   ├── jobs.py            后台任务、进度、取消、报告与导出
+│   ├── jobs.py            后台任务、进度、取消、断点/分片、对比、报告与导出
+│   ├── live.py            tshark 实时抓包控制器
 │   ├── findings.py        结构化结果（类别、级别、筛选、CSV）
 │   ├── report.py          纯文本/Markdown/HTML 报告渲染与章节选择
 │   ├── config.py          config.ini 读写与默认值
 │   ├── features/          37 个分析功能（按主题拆分）
 │   ├── tools/runner.py    外部工具发现与 tshark 封装
-│   ├── utils/             编解码、AES/RC4/MD4/RSA、pcap 辅助
+│   ├── utils/             编解码、AES/RC4/MD4/RSA、pcap、TCP 流重组、
+│   │                      MySQL/Kerberos/邮件/隧道/WPA/规则解析
 │   ├── webui/             HTTP 服务与静态页面
 │   └── assets/            字典、Shiro 密钥、图标、默认配置
 ├── docs/                  架构、功能、WebUI、安全说明
-├── scripts/               样例抓包生成
+├── scripts/               样例抓包生成、性能基准
 ├── tests/                 单元测试、API 冒烟测试与样例 pcap
 └── packaging/             Linux 桌面入口与安装脚本
 ```
@@ -174,10 +221,14 @@ Fnet/
 python3 -m pip install -e '.[samples]'   # 安装测试所需的 scapy
 python3 scripts/make_samples.py          # 生成 tests/data/*.pcap
 python3 -m unittest discover -s tests -v
+node --check fnet/webui/static/app.js    # 前端语法检查
 ```
 
 测试覆盖纯 Python 加密实现（AES/GCM/MD4/RC4/RSA 向量）、编解码、功能注册表、
-WebUI API 冒烟、UI 规格完整性，以及样例抓包上的关键断言。
+WebUI API 冒烟、UI 规格完整性，以及样例抓包上的关键断言。`tests/test_roadmap.py`
+额外覆盖流式上传、自定义规则、暂停/继续、任务对比、CLI JSON 以及 DNS/ICMP
+隧道、SMTP、MySQL、Kerberos、WPA 的集成。CI 在 Python 3.10–3.13 上安装
+`tshark` 后运行全量测试；Docker 镜像与 Compose 文件位于仓库根目录。
 
 ## 许可证
 

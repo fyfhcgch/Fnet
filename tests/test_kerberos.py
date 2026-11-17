@@ -1,501 +1,593 @@
-"""Unit tests for the pure-Python Kerberos helpers (no network/tshark)."""
+"""Unit tests for the Kerberos helpers (no tshark required)."""
 from __future__ import annotations
 
 import hashlib
+import hmac
 import struct
 import unittest
 
 from fnet.utils import crypto, kerberos
 
 
+# ---------------------------------------------------------------------------
+# DER fixture builders (RFC 4120 uses explicit tags)
+# ---------------------------------------------------------------------------
 def tlv(tag: int, value: bytes) -> bytes:
-    length = len(value)
-    if length < 0x80:
-        header = bytes([length])
+    if len(value) < 0x80:
+        header = bytes([len(value)])
     else:
-        raw = length.to_bytes((length.bit_length() + 7) // 8, "big")
+        raw = len(value).to_bytes((len(value).bit_length() + 7) // 8, "big")
         header = bytes([0x80 | len(raw)]) + raw
     return bytes([tag]) + header + value
 
 
 def der_int(value: int) -> bytes:
-    raw = value.to_bytes(max(1, (value.bit_length() + 7) // 8), "big",
-                         signed=True)
+    raw = value.to_bytes(max(1, (value.bit_length() + 8) // 8),
+                         "big", signed=True)
     return tlv(0x02, raw)
 
 
-def seq(*items: bytes) -> bytes:
-    return tlv(0x30, b"".join(items))
+def context(number: int, inner: bytes) -> bytes:
+    return tlv(0xA0 | number, inner)
 
 
-def octets(value: bytes) -> bytes:
-    return tlv(0x04, value)
+def kerberos_string(text: str) -> bytes:
+    return tlv(0x1B, text.encode())
 
 
-def general_string(value: str) -> bytes:
-    return tlv(0x1B, value.encode())
+def make_principal(*parts: str) -> bytes:
+    strings = tlv(0x30, b"".join(kerberos_string(part) for part in parts))
+    return tlv(0x30, context(0, der_int(1)) + context(1, strings))
 
 
-def ctx(number: int, content: bytes, constructed: bool = True) -> bytes:
-    return tlv((0xA0 if constructed else 0x80) + number, content)
-
-
-def principal(name: str, name_type: int = 1) -> bytes:
-    parts = [general_string(part) for part in name.split("/")]
-    return seq(ctx(0, der_int(name_type)), ctx(1, seq(*parts)))
-
-
-def encrypted_data(etype: int, cipher: bytes, kvno: int | None = None) -> bytes:
-    items = [ctx(0, der_int(etype))]
+def make_encrypted(etype: int, cipher: bytes, kvno: int | None = None) -> bytes:
+    body = context(0, der_int(etype))
     if kvno is not None:
-        items.append(ctx(1, der_int(kvno)))
-    items.append(ctx(2, octets(cipher)))
-    return seq(*items)
+        body += context(1, der_int(kvno))
+    body += context(2, tlv(0x04, cipher))
+    return tlv(0x30, body)
+
+
+def make_ticket(realm: str, sname: tuple[str, ...], enc: bytes) -> bytes:
+    body = (context(0, der_int(5))
+            + context(1, kerberos_string(realm))
+            + context(2, make_principal(*sname))
+            + context(3, enc))
+    return tlv(0x61, tlv(0x30, body))
+
+
+def make_rep(app_tag: int, msg_type: int, etype: int = 23,
+             cipher: bytes = b"\x11" * 72) -> bytes:
+    realm = "EXAMPLE.COM"
+    enc = make_encrypted(etype, cipher, kvno=2)
+    body = context(0, der_int(5)) + context(1, der_int(msg_type))
+    body += context(3, kerberos_string(realm))
+    body += context(4, make_principal("alice"))
+    body += context(5, make_ticket(realm, ("krbtgt", realm), enc))
+    body += context(6, enc)
+    return tlv(app_tag, tlv(0x30, body))
+
+
+def make_req(app_tag: int, msg_type: int, etype: int = 23,
+             cipher: bytes = b"\x22" * 72) -> bytes:
+    realm = "EXAMPLE.COM"
+    enc = make_encrypted(etype, cipher)
+    req_body = (
+        context(0, tlv(0x03, b"\x00"))
+        + context(1, make_principal("alice"))
+        + context(2, kerberos_string(realm))
+        + context(3, make_principal("krbtgt", realm))
+        + context(7, der_int(0x1234))
+        + context(8, tlv(0x30, der_int(23) + der_int(18)))
+    )
+    padata_entry = tlv(0x30, context(1, der_int(2))
+                       + context(2, tlv(0x04, enc)))
+    body = context(1, der_int(5)) + context(2, der_int(msg_type))
+    body += context(3, tlv(0x30, padata_entry))
+    body += context(4, tlv(0x30, req_body))
+    return tlv(app_tag, tlv(0x30, body))
 
 
 class DerTest(unittest.TestCase):
-    def test_read_tlv(self):
-        data = b"\x30\x03\x02\x01\x05"
-        self.assertEqual(kerberos.read_tlv(data, 0),
-                         (0x30, b"\x02\x01\x05", 5))
-        self.assertEqual(kerberos.read_tlv(data, 2),
-                         (0x02, b"\x05", 5))
-
-    def test_long_form_length(self):
-        body = b"A" * 200
-        data = tlv(0x04, body)
-        tag, value, nxt = kerberos.read_tlv(data, 0)
+    def test_read_tlv_short_and_long_length(self):
+        short = tlv(0x04, b"abc")
+        tag, value, end = kerberos.read_tlv(short)
+        self.assertEqual((tag, value, end), (0x04, b"abc", len(short)))
+        long_value = bytes(range(256)) * 2
+        long_tlv = tlv(0x04, long_value)
+        tag, value, end = kerberos.read_tlv(long_tlv)
         self.assertEqual(tag, 0x04)
-        self.assertEqual(value, body)
-        self.assertEqual(nxt, len(data))
+        self.assertEqual(value, long_value)
+        self.assertEqual(end, len(long_tlv))
 
-    def test_truncated_raises(self):
-        for data in (b"", b"\x30", b"\x30\x05\x02\x01", b"\x04\x82\x01"):
-            with self.assertRaises(ValueError):
-                kerberos.read_tlv(data, 0)
-
-    def test_scalar_helpers(self):
-        self.assertEqual(kerberos.parse_sequence(seq(der_int(7))),
-                         der_int(7))
-        self.assertEqual(kerberos.parse_int(der_int(42)), 42)
-        self.assertEqual(kerberos.parse_int(der_int(-3)), -3)
-        self.assertEqual(kerberos.parse_octet_string(octets(b"abcd")),
-                         b"abcd")
+    def test_sequence_int_octet_and_general_string(self):
+        sequence = tlv(0x30, der_int(23) + tlv(0x04, b"abc")
+                       + kerberos_string("EXAMPLE.COM"))
+        children, end = kerberos.parse_sequence(sequence)
+        self.assertEqual(end, len(sequence))
+        self.assertEqual([tag for tag, _value in children], [0x02, 0x04, 0x1B])
+        self.assertEqual(kerberos.parse_int(der_int(23))[0], 23)
+        self.assertEqual(kerberos.parse_octet_string(tlv(0x04, b"abc"))[0],
+                         b"abc")
         self.assertEqual(
-            kerberos.parse_bit_string(tlv(0x03, b"\x00\xde\xad")),
-            b"\xde\xad")
-        self.assertEqual(
-            kerberos.parse_general_string(general_string("CTF.LOCAL")),
-            "CTF.LOCAL")
+            kerberos.parse_general_string(kerberos_string("EXAMPLE.COM"))[0],
+            "EXAMPLE.COM")
 
     def test_find_context(self):
-        inner = ctx(0, der_int(5)) + ctx(2, octets(b"abc"))
-        self.assertEqual(kerberos.find_context(inner, 0), der_int(5))
-        self.assertEqual(kerberos.find_context(inner, 2), octets(b"abc"))
-        self.assertIsNone(kerberos.find_context(inner, 9))
-        primitive = tlv(0x82, b"raw")
-        self.assertEqual(kerberos.find_context(primitive, 2), b"raw")
+        children, _end = kerberos.parse_sequence(
+            tlv(0x30, context(0, der_int(5)) + context(3, kerberos_string("X"))))
+        self.assertEqual(kerberos.find_context(children, 0), der_int(5))
+        self.assertIsNone(kerberos.find_context(children, 9))
+
+    def test_truncated_and_invalid_input_raises(self):
+        with self.assertRaises(kerberos.DerError):
+            kerberos.read_tlv(tlv(0x04, b"abc")[:-1])
+        with self.assertRaises(kerberos.DerError):
+            kerberos.read_tlv(b"")
+        with self.assertRaises(kerberos.DerError):
+            kerberos.parse_sequence(der_int(1))
+        with self.assertRaises(kerberos.DerError):
+            kerberos.parse_int(tlv(0x04, b"x"))
 
 
-class Rc4HmacTest(unittest.TestCase):
-    def setUp(self):
-        self.key = bytes(range(16))
-        self.usage = 3
-        self.confounder = b"\xa5" * 8
-        self.plaintext = b"kerberos preauth"
+class CryptoTest(unittest.TestCase):
+    def test_rc4_roundtrip_and_checksum_layout(self):
+        key = crypto.nt_hash("Password123!")
+        plaintext = b"hello kerberos"
+        confounder = b"12345678"
+        cipher = kerberos.rc4_hmac_encrypt(
+            key, 3, plaintext, confounder=confounder)
+        # Usage 3 maps to 8 for RC4-HMAC (RFC 4757).
+        k1 = hmac.new(key, struct.pack("<I", 8), hashlib.md5).digest()
+        data = confounder + plaintext
+        checksum = hmac.new(k1, data, hashlib.md5).digest()
+        self.assertEqual(cipher[:16], checksum)
+        k3 = hmac.new(k1, checksum, hashlib.md5).digest()
+        self.assertEqual(cipher[16:], crypto.rc4(k3, data))
+        decrypted, valid = kerberos.rc4_hmac_decrypt(key, 3, cipher)
+        self.assertTrue(valid)
+        self.assertEqual(decrypted, plaintext)
 
-    def test_roundtrip(self):
-        blob = kerberos.encrypt_encrypted_part(
-            self.plaintext, 23, self.key, self.usage,
-            confounder=self.confounder)
-        self.assertEqual(len(blob), 16 + 8 + len(self.plaintext))
-        plain = kerberos.rc4_hmac_decrypt(self.key, blob, self.usage)
-        self.assertEqual(plain, self.confounder + self.plaintext)
-        self.assertEqual(kerberos.decrypt_encrypted_part(
-            blob, 23, self.key, self.usage), self.confounder + self.plaintext)
+    def test_rc4_bad_checksum(self):
+        key = crypto.nt_hash("Password123!")
+        cipher = bytearray(kerberos.rc4_hmac_encrypt(
+            key, 3, b"payload", confounder=b"abcdefgh"))
+        cipher[0] ^= 0xFF
+        _plain, valid = kerberos.rc4_hmac_decrypt(key, 3, bytes(cipher))
+        self.assertFalse(valid)
 
-    def test_checksum_rejection(self):
-        blob = kerberos.encrypt_encrypted_part(
-            self.plaintext, 23, self.key, self.usage,
-            confounder=self.confounder)
-        self.assertIsNone(
-            kerberos.rc4_hmac_decrypt(self.key, blob, self.usage + 1))
-        tampered = bytearray(blob)
-        tampered[0] ^= 0x01
-        self.assertIsNone(
-            kerberos.rc4_hmac_decrypt(self.key, bytes(tampered), self.usage))
-        tampered = bytearray(blob)
-        tampered[-1] ^= 0x80
-        self.assertIsNone(
-            kerberos.rc4_hmac_decrypt(self.key, bytes(tampered), self.usage))
-        self.assertIsNone(kerberos.rc4_hmac_decrypt(self.key, b"short", 3))
-
-
-class AesCtsTest(unittest.TestCase):
-    def test_roundtrip_both_key_sizes(self):
-        for key_len, etype in ((16, 17), (32, 18)):
+    def test_aes_cts_roundtrip(self):
+        for key_len in (16, 32):
             key = bytes(range(key_len))
-            for size in (17, 33, 48):
-                plaintext = bytes((i * 7 + 1) & 0xFF for i in range(size))
-                confounder = b"\x42" * 16
-                blob = kerberos.encrypt_encrypted_part(
-                    plaintext, etype, key, 3, confounder=confounder)
-                self.assertEqual(len(blob), 16 + size + 12)
-                plain = kerberos.aes_decrypt(key, blob, 3, etype)
-                self.assertEqual(plain, confounder + plaintext)
-                tampered = bytearray(blob)
-                tampered[-1] ^= 0x80
-                self.assertIsNone(
-                    kerberos.aes_decrypt(key, bytes(tampered), 3, etype))
-                self.assertIsNone(kerberos.aes_decrypt(key, blob, 4, etype))
+            for length in (17, 33, 48):
+                plain = bytes((index * 7 + 1) & 0xFF for index in range(length))
+                cipher = kerberos.aes_cts_encrypt(plain, key)
+                self.assertEqual(len(cipher), length)
+                self.assertEqual(kerberos.aes_cts_decrypt(cipher, key), plain)
 
-    def test_cs3_block_ordering(self):
+    def test_aes_cts_rfc3962_vectors(self):
+        key = b"chicken teriyaki"
+        short = b"I would like the "
+        self.assertEqual(kerberos.aes_cts_encrypt(short, key).hex(),
+                         "c6353568f2bf8cb4d8a580362da7ff7f97")
+        full = (b"I would like the General Gau's Chicken, please, "
+                b"and wonton soup.")
+        self.assertEqual(len(full), 64)
+        self.assertEqual(
+            kerberos.aes_cts_encrypt(full, key).hex(),
+            "97687268d6ecccc0c07b25e25ecfe584"
+            "39312523a78662d5be7fcbcc98ebf5a8"
+            "4807efe836ee89a526730dbc2f7bc840"
+            "9dad8bbb96c4cdc03bc103e1a194bbd8")
+
+    def test_aes_hmac_roundtrip_and_bad_checksum(self):
         key = bytes(range(32))
-        basic = b"\x10" * 16 + b"x" * 17  # 33 bytes: one stolen block
-        ciphertext = kerberos.aes_cts_encrypt(basic, key)
-        self.assertEqual(len(ciphertext), len(basic))
-        self.assertEqual(kerberos.aes_cts_decrypt(ciphertext, key), basic)
-        plain_cbc = crypto.aes_cbc_encrypt(
-            basic + b"\x00" * 15, key, b"\x00" * 16, pad=False)
-        self.assertNotEqual(ciphertext, plain_cbc[:len(ciphertext)])
+        plain = b"encrypted part payload"
+        confounder = bytes(range(16))
+        cipher = kerberos.aes_hmac_sha1_encrypt(
+            key, 3, plain, confounder=confounder)
+        ki = kerberos.derive_random(key, 3, 0x55)
+        expected = hmac.new(ki, confounder + plain, hashlib.sha1).digest()[:12]
+        self.assertEqual(cipher[-12:], expected)
+        decrypted, valid = kerberos.aes_hmac_sha1_decrypt(key, 3, cipher)
+        self.assertTrue(valid)
+        self.assertEqual(decrypted, plain)
+        bad = bytearray(cipher)
+        bad[-1] ^= 0x01
+        _plain, valid = kerberos.aes_hmac_sha1_decrypt(key, 3, bytes(bad))
+        self.assertFalse(valid)
 
-    def test_decrypt_rejects_short_and_bad_etype(self):
-        self.assertIsNone(kerberos.aes_decrypt(b"k" * 16, b"x" * 20, 1, 17))
-        self.assertIsNone(kerberos.aes_decrypt(b"k" * 16, b"x" * 40, 1, 16))
+    def test_string_to_key_rfc3962(self):
+        # Iteration count 1 vectors from RFC 3962 appendix B.
+        self.assertEqual(
+            kerberos.string_to_key("password", "ATHENA.MIT.EDUraeburn", 17,
+                                   iterations=1).hex(),
+            "42263c6e89f4fc28b8df68ee09799f15")
+        self.assertEqual(
+            kerberos.string_to_key("password", "ATHENA.MIT.EDUraeburn", 18,
+                                   iterations=1).hex(),
+            "fe697b52bc0d3ce14432ba036a92e65b"
+            "bb52280990a2fa27883998d72af30161")
 
-
-class KeyDerivationTest(unittest.TestCase):
     def test_derive_key_matches_pbkdf2(self):
-        password = "Password123!"
-        salt = b"CTF.LOCALalice"
-        expected16 = hashlib.pbkdf2_hmac("sha1", password.encode(), salt,
-                                        4096, dklen=16)
-        expected32 = hashlib.pbkdf2_hmac("sha1", password.encode(), salt,
-                                        4096, dklen=32)
-        self.assertEqual(kerberos.derive_key(password, salt, 17), expected16)
-        self.assertEqual(kerberos.derive_key(password, salt, 18), expected32)
-        self.assertEqual(len(kerberos.derive_key(password, salt, 17)), 16)
-        self.assertEqual(len(kerberos.derive_key(password, salt, 18)), 32)
-
-    def test_password_salt(self):
+        salt = "EXAMPLE.COMalice"
         self.assertEqual(
-            kerberos.password_salt("CTF.LOCAL", "alice"),
-            b"CTF.LOCALalice")
+            kerberos.derive_key("password", salt, 17),
+            hashlib.pbkdf2_hmac("sha1", b"password", salt.encode(),
+                                4096, 16))
         self.assertEqual(
-            kerberos.password_salt("CTF.LOCAL", "alice/admin"),
-            b"CTF.LOCALaliceadmin")
+            kerberos.derive_key("password", salt, 18),
+            hashlib.pbkdf2_hmac("sha1", b"password", salt.encode(),
+                                4096, 32))
+        self.assertEqual(kerberos.derive_key("Password123!", salt, 23),
+                         crypto.nt_hash("Password123!"))
+        self.assertEqual(kerberos.password_salt("example.com", "alice"),
+                         "EXAMPLE.COMalice")
+
+    def test_encrypted_part_roundtrip(self):
+        key = bytes(range(16))
+        enc_part = kerberos.encrypt_encrypted_part(
+            17, key, 3, b"timestamps", confounder=b"\x00" * 16)
+        result = kerberos.decrypt_encrypted_part(enc_part, key, 3)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["plaintext"], b"timestamps")
+        tampered = dict(enc_part)
+        tampered["cipher"] = enc_part["cipher"][:-1] + bytes(
+            [enc_part["cipher"][-1] ^ 1])
+        result = kerberos.decrypt_encrypted_part(tampered, key, 3)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["checksum_ok"])
 
 
-def counted(value: bytes) -> bytes:
-    return len(value).to_bytes(2, "big") + value
+class MessageParseTest(unittest.TestCase):
+    def test_parse_encrypted_part(self):
+        enc = make_encrypted(23, b"\x11" * 72, kvno=2)
+        parsed = kerberos.parse_encrypted_part(enc)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["etype"], 23)
+        self.assertEqual(parsed["kvno"], 2)
+        self.assertEqual(parsed["cipher"], b"\x11" * 72)
+        self.assertIsNone(kerberos.parse_encrypted_part(b""))
+        self.assertIsNone(kerberos.parse_encrypted_part(b"not der at all"))
+
+    def test_parse_as_rep(self):
+        data = make_rep(0x6B, 11, etype=23, cipher=b"\x44" * 80)
+        parsed = kerberos.parse_as_rep(data)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["msg_type"], 11)
+        self.assertEqual(parsed["cname"], "alice")
+        self.assertEqual(parsed["realm"], "EXAMPLE.COM")
+        self.assertEqual(parsed["sname"], "krbtgt/EXAMPLE.COM")
+        self.assertEqual(parsed["etypes"], [23])
+        self.assertEqual(parsed["padata"], [])
+        self.assertEqual(parsed["enc_part"]["cipher"], b"\x44" * 80)
+        self.assertIsNone(parsed["error"])
+
+    def test_parse_tgs_rep(self):
+        data = make_rep(0x6D, 13, etype=18, cipher=b"\x55" * 96)
+        parsed = kerberos.parse_tgs_rep(data)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["msg_type"], 13)
+        self.assertEqual(parsed["cname"], "alice")
+        self.assertEqual(parsed["sname"], "krbtgt/EXAMPLE.COM")
+        self.assertEqual(parsed["etypes"], [18])
+
+    def test_rep_app_tag_and_msg_type_are_enforced(self):
+        as_rep = make_rep(0x6B, 11)
+        self.assertIsNone(kerberos.parse_tgs_rep(as_rep))
+        tgs_rep = make_rep(0x6D, 13)
+        self.assertIsNone(kerberos.parse_as_rep(tgs_rep))
+        wrong_type = make_rep(0x6B, 13)
+        self.assertIsNone(kerberos.parse_as_rep(wrong_type))
+
+    def test_parse_as_req_with_pa_enc_timestamp(self):
+        data = make_req(0x6A, 10, etype=23, cipher=b"\x66" * 72)
+        parsed = kerberos.parse_as_req(data)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["msg_type"], 10)
+        self.assertEqual(parsed["cname"], "alice")
+        self.assertEqual(parsed["realm"], "EXAMPLE.COM")
+        self.assertEqual(parsed["sname"], "krbtgt/EXAMPLE.COM")
+        self.assertEqual(parsed["etypes"], [23, 18])
+        self.assertEqual([entry["type"] for entry in parsed["padata"]], [2])
+        self.assertEqual(parsed["padata"][0]["name"], "PA-ENC-TIMESTAMP")
+        self.assertEqual(parsed["enc_part"]["etype"], 23)
+        self.assertEqual(parsed["enc_part"]["cipher"], b"\x66" * 72)
+
+    def test_parse_tgs_req(self):
+        data = make_req(0x6C, 12, etype=18, cipher=b"\x77" * 72)
+        parsed = kerberos.parse_tgs_req(data)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["msg_type"], 12)
+        self.assertEqual(parsed["etypes"], [23, 18])
+        self.assertEqual(parsed["enc_part"]["etype"], 18)
+        self.assertIsNone(kerberos.parse_as_req(data))
+
+    def test_malformed_messages_return_none(self):
+        for parser in (kerberos.parse_as_rep, kerberos.parse_tgs_rep,
+                       kerberos.parse_as_req, kerberos.parse_tgs_req):
+            self.assertIsNone(parser(b""))
+            self.assertIsNone(parser(b"\x30\x03\x02\x01\x05"))
+            self.assertIsNone(parser(b"\x6b\x82\xff\xff"))
+            self.assertIsNone(parser(b"\x00" * 32))
 
 
-def build_keytab(realm: str = "CTF.LOCAL", name: str = "alice",
-                 enctype: int = 18, key: bytes | None = None) -> bytes:
-    key = key if key is not None else bytes(range(32))
-    entry = struct.pack(">H", 1) + counted(realm.encode())
-    entry += counted(name.encode())
-    entry += struct.pack(">II", 1, 0)
-    entry += bytes([1]) + struct.pack(">HH", enctype, len(key)) + key
-    entry += struct.pack(">I", 1)
-    return b"\x05\x02" + struct.pack(">I", 1) + entry
+def keytab_entry(realm, components, etype, key, kvno8=1, kvno32=0):
+    def counted(raw):
+        return struct.pack(">H", len(raw)) + raw
 
-
-def build_logon_info() -> bytes:
-    buf = bytearray(256)
-
-    def put_string(field_offset: int, text: str) -> None:
-        offset = len(buf)
-        raw = text.encode("utf-16-le")
-        buf.extend(raw)
-        buf[field_offset:field_offset + 2] = struct.pack("<H", len(raw))
-        buf[field_offset + 2:field_offset + 4] = struct.pack("<H", len(raw))
-        buf[field_offset + 4:field_offset + 8] = struct.pack("<I", offset)
-
-    put_string(48, "alice")
-    put_string(136, "dc01")
-    put_string(144, "CTF.LOCAL")
-    buf[96:98] = struct.pack("<H", 7)
-    buf[98:100] = struct.pack("<H", 2)
-    buf[100:104] = struct.pack("<I", 1104)
-    buf[104:108] = struct.pack("<I", 513)
-    buf[108:112] = struct.pack("<I", 1)
-    buf[112:116] = struct.pack("<I", len(buf))
-    buf.extend(struct.pack("<I", 513))
-    sid_offset = len(buf)
-    buf.extend(bytes([1, 5]) + (5).to_bytes(6, "big"))
-    buf.extend(b"".join(struct.pack("<I", part) for part in (21, 1, 2, 3, 4)))
-    buf[152:156] = struct.pack("<I", sid_offset)
-    return bytes(buf)
-
-
-def build_pac() -> tuple[bytes, bytes]:
-    logon = build_logon_info()
-    lm = b"\x11" * 16
-    nt = b"\x22" * 16
-    credential = struct.pack("<II", 0, 0) + lm + nt
-    count = 2
-    header_length = 8 + count * 12
-    logon_offset = header_length
-    credential_offset = logon_offset + len(logon)
-    header = struct.pack("<II", count, 0)
-    header += struct.pack("<III", 1, logon_offset, len(logon))
-    header += struct.pack("<III", 2, credential_offset, len(credential))
-    return header + logon + credential, nt
+    body = struct.pack(">H", len(components)) + counted(realm.encode())
+    for component in components:
+        body += counted(component.encode())
+    body += struct.pack(">II", 1, 0)
+    body += struct.pack(">B", kvno8)
+    body += struct.pack(">HH", etype, len(key)) + key
+    if kvno32:
+        body += struct.pack(">I", kvno32)
+    return struct.pack(">i", len(body)) + body
 
 
 class KeytabTest(unittest.TestCase):
-    def test_parse_keytab(self):
-        data = build_keytab()
+    def setUp(self):
+        self.rc4_key = bytes(range(16))
+        self.aes_key = bytes(range(32))
+        self.data = (
+            struct.pack(">H", 0x0502)
+            + keytab_entry("EXAMPLE.COM", ["alice"], 23, self.rc4_key,
+                           kvno8=1)
+            + keytab_entry("EXAMPLE.COM", ["alice"], 18, self.aes_key,
+                           kvno8=3, kvno32=7)
+            + keytab_entry("EXAMPLE.COM", ["bob"], 17, b"\xaa" * 16)
+        )
+
+    def test_parse_keytab_entries(self):
+        entries = kerberos.parse_keytab(self.data)
+        self.assertEqual(len(entries), 3)
+        first, second, third = entries
+        self.assertEqual(first["principal"], "alice@EXAMPLE.COM")
+        self.assertEqual(first["realm"], "EXAMPLE.COM")
+        self.assertEqual(first["components"], ["alice"])
+        self.assertEqual(first["etype"], 23)
+        self.assertEqual(first["key"], self.rc4_key)
+        self.assertEqual(first["kvno"], 1)
+        # A 32-bit kvno wins over the legacy byte when both are present.
+        self.assertEqual(second["kvno"], 7)
+        self.assertEqual(second["key"], self.aes_key)
+        self.assertEqual(third["principal"], "bob@EXAMPLE.COM")
+        self.assertEqual(third["etype"], 17)
+
+    def test_keytab_keys_groups_by_principal(self):
+        keys = kerberos.keytab_keys(self.data)
+        self.assertEqual(set(keys), {"alice@EXAMPLE.COM", "bob@EXAMPLE.COM"})
+        self.assertEqual(keys["alice@EXAMPLE.COM"][23], self.rc4_key)
+        self.assertEqual(keys["alice@EXAMPLE.COM"][18], self.aes_key)
+        self.assertEqual(keys["bob@EXAMPLE.COM"][17], b"\xaa" * 16)
+
+    def test_keytab_holes_are_skipped(self):
+        hole = struct.pack(">i", -16) + b"\x00" * 16
+        data = (struct.pack(">H", 0x0502)
+                + keytab_entry("EXAMPLE.COM", ["alice"], 23, self.rc4_key)
+                + hole
+                + keytab_entry("EXAMPLE.COM", ["bob"], 23, b"\xbb" * 16))
         entries = kerberos.parse_keytab(data)
-        self.assertEqual(len(entries), 1)
-        entry = entries[0]
-        self.assertEqual(entry["realm"], "CTF.LOCAL")
-        self.assertEqual(entry["components"], ["alice"])
-        self.assertEqual(entry["principal"], "alice")
-        self.assertEqual(entry["enctype"], 18)
-        self.assertEqual(entry["kvno"], 1)
-        self.assertEqual(entry["key"], bytes(range(32)))
-        self.assertEqual(entry["key_hex"], bytes(range(32)).hex())
+        self.assertEqual([entry["principal"] for entry in entries],
+                         ["alice@EXAMPLE.COM", "bob@EXAMPLE.COM"])
 
-    def test_keytab_keys(self):
-        keytab = kerberos.parse_keytab(build_keytab())
-        self.assertEqual(len(kerberos.keytab_keys(keytab, "ctf.local")), 1)
-        self.assertEqual(
-            len(kerberos.keytab_keys(keytab, "CTF.LOCAL", ["alice"])), 1)
-        self.assertEqual(
-            len(kerberos.keytab_keys(keytab, "CTF.LOCAL", "alice")), 1)
-        self.assertEqual(
-            kerberos.keytab_keys(keytab, "CTF.LOCAL", ["bob"]), [])
-
-    def test_bad_versions(self):
+    def test_keytab_garbage_is_empty(self):
         self.assertEqual(kerberos.parse_keytab(b""), [])
-        self.assertEqual(kerberos.parse_keytab(b"\x05\x01" + b"\x00" * 8), [])
+        self.assertEqual(kerberos.parse_keytab(b"\x05\x02"), [])
+        self.assertEqual(kerberos.parse_keytab(b"\x05\x02\xff\xff\xff"),
+                         [])
+        self.assertEqual(kerberos.keytab_keys(b"junk"), {})
+
+
+LOGON_LEN = 172
+
+
+def build_pac(user="alice", domain="EXAMPLE", password="Password123!"):
+    user_raw = user.encode("utf-16-le")
+    domain_raw = domain.encode("utf-16-le")
+    client_raw = "carol".encode("utf-16-le")
+
+    lm_hash = b"\x11" * 16
+    nt_hash = crypto.nt_hash(password)
+    serialized = (struct.pack("<II", 1, 2) + struct.pack("<I", 40)
+                  + struct.pack("<II", 0, 0) + lm_hash + nt_hash)
+    credential_blob = (struct.pack("<III", 0, 0, len(serialized))
+                       + serialized)
+    client_blob = struct.pack("<QH", 0x1122334455667788,
+                              len(client_raw)) + client_raw
+
+    count = 3
+    logon_offset = 8 + 12 * count
+    credential_offset = logon_offset + LOGON_LEN
+    client_offset = credential_offset + len(credential_blob)
+    strings_offset = client_offset + len(client_blob)
+    user_pointer = strings_offset
+    domain_pointer = strings_offset + len(user_raw)
+
+    logon = bytearray(LOGON_LEN)
+    struct.pack_into("<HHI", logon, 48, len(user_raw), len(user_raw),
+                     user_pointer)
+    struct.pack_into("<HH", logon, 96, 3, 1)
+    struct.pack_into("<III", logon, 100, 1105, 513, 0)
+    struct.pack_into("<HHI", logon, 140, len(domain_raw), len(domain_raw),
+                     domain_pointer)
+    sid = (bytes([1, 4]) + (5).to_bytes(6, "big")
+           + struct.pack("<IIII", 21, 1, 2, 3))
+    logon[148:148 + len(sid)] = sid
+
+    descriptors = [
+        (1, LOGON_LEN, logon_offset),
+        (2, len(credential_blob), credential_offset),
+        (10, len(client_blob), client_offset),
+    ]
+    header = struct.pack("<II", count, 0) + b"".join(
+        struct.pack("<III", *descriptor) for descriptor in descriptors)
+    return (header + bytes(logon) + credential_blob + client_blob
+            + user_raw + domain_raw)
 
 
 class PacTest(unittest.TestCase):
-    def test_logon_and_credential(self):
-        data, nt_hash = build_pac()
-        pac = kerberos.parse_pac(data)
-        self.assertEqual(len(pac["buffers"]), 2)
-        self.assertEqual(pac["buffers"][0]["name"], "LOGON_INFO")
-        logon = pac["logon"]
+    def test_parse_pac_logon_and_credential(self):
+        pac = kerberos.parse_pac(build_pac())
+        self.assertEqual(len(pac["buffers"]), 3)
+        self.assertEqual([buffer["type"] for buffer in pac["buffers"]],
+                         [1, 2, 10])
+        logon = pac["logon_info"]
         self.assertEqual(logon["user"], "alice")
-        self.assertEqual(logon["domain"], "CTF.LOCAL")
-        self.assertEqual(logon["logon_server"], "dc01")
-        self.assertEqual(logon["logon_count"], 7)
-        self.assertEqual(logon["bad_password_count"], 2)
-        self.assertEqual(logon["user_id"], 1104)
-        self.assertEqual(logon["group_ids"], [513])
-        self.assertIn("S-1-5-21-1-2-3-4", logon["sids"])
-        self.assertEqual(logon["domain_sid"], "S-1-5-21-1-2-3-4")
-        credential = pac["credential"]
-        self.assertEqual(credential["version"], 0)
-        self.assertEqual(credential["nt_hash"], nt_hash.hex().upper())
-        self.assertEqual(credential["hash"], nt_hash.hex().upper())
+        self.assertEqual(logon["domain"], "EXAMPLE")
+        self.assertEqual(logon["user_id"], 1105)
+        self.assertEqual(logon["primary_group_id"], 513)
+        self.assertEqual(logon["logon_count"], 3)
+        self.assertEqual(logon["bad_password_count"], 1)
+        self.assertEqual(logon["domain_sid"], "S-1-5-21-1-2-3")
+        self.assertEqual(logon["user_sid"], "S-1-5-21-1-2-3-1105")
+        self.assertEqual(pac["user"], "alice")
+        self.assertEqual(pac["domain"], "EXAMPLE")
+        self.assertIn("S-1-5-21-1-2-3", pac["sids"])
+        self.assertIn("S-1-5-21-1-2-3-1105", pac["sids"])
+        self.assertEqual(pac["client_info"]["name"], "carol")
+        expected = crypto.nt_hash("Password123!").hex().upper()
+        self.assertEqual(pac["credential_info"]["ntlm_hash"], expected)
+        self.assertEqual(pac["ntlm_hash"], expected)
+        self.assertEqual(pac["lm_hash"], (b"\x11" * 16).hex().upper())
+        self.assertEqual(pac["server_checksum"], {})
 
-    def test_short_input_is_tolerated(self):
-        self.assertEqual(kerberos.parse_pac(b"")["buffers"], [])
-        self.assertEqual(kerberos.parse_pac(b"\x01\x00")["logon"], None)
-        pac = kerberos.parse_pac(struct.pack("<II", 2, 0) + b"\x00" * 16)
-        self.assertEqual(pac["logon"], None)
+    def test_parse_pac_server_checksum(self):
+        base = build_pac()
+        blob = struct.pack("<I", 16) + b"\x99" * 16
+        count = 2
+        header = struct.pack("<II", count, 0)
+        logon_offset = 8 + 12 * count
+        checksum_offset = logon_offset + LOGON_LEN
+        header += struct.pack("<III", 1, LOGON_LEN, logon_offset)
+        header += struct.pack("<III", 6, len(blob), checksum_offset)
+        logon = base[8 + 12 * 3:8 + 12 * 3 + LOGON_LEN]
+        pac = kerberos.parse_pac(header + logon + blob)
+        self.assertEqual(pac["server_checksum"]["signature_type"], 16)
+        self.assertEqual(pac["server_checksum"]["signature"], b"\x99" * 16)
 
-
-def build_as_rep(etype: int = 17, cipher: bytes = b"\xaa" * 32,
-                 cname: str = "alice", realm: str = "CTF.LOCAL") -> bytes:
-    padata = seq(seq(ctx(1, der_int(19)),
-                     ctx(2, octets(b"\x01\x02"))))
-    body = seq(
-        ctx(0, der_int(5)),
-        ctx(1, der_int(11)),
-        ctx(2, padata),
-        ctx(3, general_string(realm)),
-        ctx(4, principal(cname)),
-        ctx(6, encrypted_data(etype, cipher, 3)),
-    )
-    return tlv(0x6B, body)
-
-
-def build_tgs_rep(etype: int = 23, cipher: bytes = b"\x33" * 64
-                  ) -> bytes:
-    ticket = seq(
-        ctx(0, der_int(5)),
-        ctx(1, general_string("CTF.LOCAL")),
-        ctx(2, principal("host/server")),
-    )
-    body = seq(
-        ctx(0, der_int(5)),
-        ctx(1, der_int(13)),
-        ctx(3, general_string("CTF.LOCAL")),
-        ctx(4, principal("alice")),
-        ctx(5, ticket),
-        ctx(6, encrypted_data(etype, cipher)),
-    )
-    return tlv(0x6D, body)
-
-
-def build_as_req() -> bytes:
-    padata = seq(seq(ctx(1, der_int(2)),
-                     ctx(2, octets(encrypted_data(23, b"\x44" * 64)))))
-    req_body = seq(
-        ctx(0, tlv(0x03, b"\x00\x00")),
-        ctx(1, principal("alice")),
-        ctx(2, general_string("CTF.LOCAL")),
-        ctx(3, principal("krbtgt/CTF.LOCAL")),
-        ctx(6, der_int(12345)),
-        ctx(7, seq(der_int(23), der_int(18))),
-    )
-    body = seq(
-        ctx(1, der_int(5)),
-        ctx(2, der_int(10)),
-        ctx(3, padata),
-        ctx(4, req_body),
-    )
-    return tlv(0x6A, body)
-
-
-class MessageTest(unittest.TestCase):
-    def test_parse_encrypted_part(self):
-        cipher = b"\x01" * 48
-        part = kerberos.parse_encrypted_part(
-            encrypted_data(18, cipher, kvno=2))
-        self.assertEqual(part["etype"], 18)
-        self.assertEqual(part["kvno"], 2)
-        self.assertEqual(part["cipher"], cipher)
-        self.assertEqual(part["cipher_len"], 48)
-
-    def test_parse_as_rep(self):
-        result = kerberos.parse_as_rep(build_as_rep())
-        self.assertIsNotNone(result)
-        self.assertEqual(result["pvno"], 5)
-        self.assertEqual(result["msg_type"], 11)
-        self.assertEqual(result["realm"], "CTF.LOCAL")
-        self.assertEqual(result["cname"], "alice")
-        self.assertEqual(result["etypes"], [17])
-        self.assertEqual(result["enc_part"]["etype"], 17)
-        self.assertEqual(len(result["padata"]), 1)
-        self.assertEqual(result["padata"][0]["type"], 19)
-        self.assertEqual(result["padata"][0]["name"], "PA-ETYPE-INFO2")
-
-    def test_parse_tgs_rep(self):
-        result = kerberos.parse_tgs_rep(build_tgs_rep())
-        self.assertIsNotNone(result)
-        self.assertEqual(result["realm"], "CTF.LOCAL")
-        self.assertEqual(result["cname"], "alice")
-        self.assertEqual(result["sname"], "host/server")
-        self.assertEqual(result["sname_components"], ["host", "server"])
-        self.assertEqual(result["enc_part"]["etype"], 23)
-
-    def test_parse_as_req(self):
-        result = kerberos.parse_as_req(build_as_req())
-        self.assertIsNotNone(result)
-        self.assertEqual(result["msg_type"], 10)
-        self.assertEqual(result["realm"], "CTF.LOCAL")
-        self.assertEqual(result["cname"], "alice")
-        self.assertEqual(result["sname"], "krbtgt/CTF.LOCAL")
-        self.assertEqual(result["etypes"], [23, 18])
-        self.assertEqual(result["nonce"], 12345)
-        self.assertEqual(result["padata"][0]["type"], 2)
-        self.assertEqual(result["enc_part"]["etype"], 23)
-
-    def test_krb_error(self):
-        body = seq(
-            ctx(0, der_int(5)),
-            ctx(1, der_int(30)),
-            ctx(6, der_int(24)),
-            ctx(9, general_string("CTF.LOCAL")),
-            ctx(10, principal("alice")),
-        )
-        result = kerberos.parse_as_rep(tlv(0x7E, body))
-        self.assertIsNotNone(result)
-        self.assertEqual(result["error_code"], 24)
-        self.assertIn("PREAUTH", result["error"])
-        self.assertEqual(result["cname"], "alice")
-
-    def test_bad_input_returns_none(self):
-        self.assertIsNone(kerberos.parse_as_rep(b"\x00\x01"))
-        self.assertIsNone(kerberos.parse_tgs_rep(b"\x30\x00"))
-        self.assertIsNone(kerberos.parse_as_req(general_string("x")))
+    def test_parse_pac_garbage_returns_defaults(self):
+        for blob in (b"", b"junk", b"\x00" * 8, b"\x05\x00\x00\x00" + b"\xff" * 9):
+            pac = kerberos.parse_pac(blob)
+            self.assertEqual(pac["buffers"], [])
+            self.assertIsNone(pac["logon_info"])
+            self.assertEqual(pac["user"], "")
+            self.assertEqual(pac["sids"], [])
+            self.assertEqual(pac["ntlm_hash"], "")
 
 
 class HashcatTest(unittest.TestCase):
-    def test_rc4_as_rep(self):
-        cipher = bytes(range(40))
-        line = kerberos.hashcat_lines(11, "alice", "ctf.local", "", 23,
-                                      cipher)[0]
-        checksum = cipher[-16:].hex()
-        edata = cipher[:-16].hex()
-        self.assertEqual(
-            line, f"$krb5asrep$23$alice@CTF.LOCAL:{checksum}${edata}")
+    def test_as_rep_rc4_line(self):
+        cipher = b"\xaa" * 16 + b"\xbb" * 8
+        lines = kerberos.hashcat_lines(
+            11, "alice", "example.com", "", 23, cipher)
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("$krb5asrep$23$alice@EXAMPLE.COM:"))
+        checksum, edata = lines[0].split(":", 1)[1].split("$")
+        self.assertEqual(checksum, (b"\xaa" * 16).hex())
+        self.assertEqual(edata, (b"\xbb" * 8).hex())
+
+    def test_tgs_rc4_line(self):
+        cipher = b"\xcc" * 16 + b"\xdd" * 24
+        lines = kerberos.hashcat_lines(
+            13, "alice", "EXAMPLE.COM", "cifs/fileserver", 23, cipher)
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith(
+            "$krb5tgs$23$*alice$EXAMPLE.COM$cifs/fileserver*$"))
+        checksum, edata = lines[0].split("*$", 1)[1].split("$")
+        self.assertEqual(checksum, (b"\xcc" * 16).hex())
+        self.assertEqual(edata, (b"\xdd" * 24).hex())
+
+    def test_aes_lines_split_trailing_checksum(self):
+        cipher = b"\x01" * 40 + b"\x02" * 12
+        for etype in (17, 18):
+            as_line = kerberos.hashcat_lines(
+                11, "alice", "EXAMPLE.COM", "", etype, cipher)[0]
+            self.assertTrue(as_line.startswith(
+                f"$krb5asrep${etype}$alice@EXAMPLE.COM:"))
+            checksum, edata = as_line.split(":", 1)[1].split("$")
+            self.assertEqual(checksum, (b"\x02" * 12).hex())
+            self.assertEqual(edata, (b"\x01" * 40).hex())
+
+            tgs_line = kerberos.hashcat_lines(
+                13, "alice", "EXAMPLE.COM", "host/server", etype, cipher)[0]
+            self.assertTrue(tgs_line.startswith(
+                f"$krb5tgs${etype}$*alice$EXAMPLE.COM$host/server*$"))
+            checksum, edata = tgs_line.split("*$", 1)[1].split("$")
+            self.assertEqual(checksum, (b"\x02" * 12).hex())
+            self.assertEqual(edata, (b"\x01" * 40).hex())
+
+    def test_hashcat_modes(self):
         self.assertEqual(kerberos.hashcat_modes(11, 23), [18200])
-
-    def test_rc4_tgs_rep(self):
-        cipher = bytes(range(48))
-        line = kerberos.hashcat_lines(13, "alice", "CTF.LOCAL",
-                                      "host/server", 23, cipher)[0]
-        self.assertTrue(line.startswith(
-            "$krb5tgs$23$*alice$CTF.LOCAL$host/server*$"))
-        self.assertTrue(line.endswith(cipher[:-16].hex()))
         self.assertEqual(kerberos.hashcat_modes(13, 23), [13100])
+        self.assertEqual(kerberos.hashcat_modes(11, 17), [19800])
+        self.assertEqual(kerberos.hashcat_modes(11, 18), [19900])
+        self.assertEqual(kerberos.hashcat_modes(13, 17), [19600])
+        self.assertEqual(kerberos.hashcat_modes(13, 18), [19700])
+        self.assertEqual(kerberos.hashcat_modes(11, 16), [])
+        self.assertEqual(kerberos.hashcat_modes(14, 23), [])
+        self.assertEqual(kerberos.hashcat_modes("bad", 23), [])
 
-    def test_aes_as_rep_split(self):
-        cipher = bytes(range(48))
-        for etype, mode in ((17, 19800), (18, 19900)):
-            line = kerberos.hashcat_lines(11, "alice", "CTF.LOCAL", "",
-                                          etype, cipher)[0]
-            edata = cipher[:-12].hex()
-            checksum = cipher[-12:].hex()
-            self.assertEqual(
-                line,
-                f"$krb5asrep${etype}$alice@CTF.LOCAL:{edata}${checksum}")
-            self.assertEqual(kerberos.hashcat_modes(11, etype), [mode])
-
-    def test_aes_tgs_rep_split(self):
-        cipher = bytes(range(64))
-        for etype, mode in ((17, 19600), (18, 19700)):
-            line = kerberos.hashcat_lines(13, "alice", "CTF.LOCAL",
-                                          "host/server", etype, cipher)[0]
-            self.assertTrue(line.startswith(
-                f"$krb5tgs${etype}$*alice$CTF.LOCAL$host/server*$"))
-            self.assertTrue(line.endswith(
-                cipher[:-12].hex() + "$" + cipher[-12:].hex()))
-            self.assertEqual(kerberos.hashcat_modes(13, etype), [mode])
-
-    def test_empty_cipher(self):
-        self.assertEqual(kerberos.hashcat_lines(11, "alice", "R", "", 23, b""),
-                         [])
-        self.assertEqual(kerberos.hashcat_modes(11, 1), [])
+    def test_unsupported_combinations_return_empty(self):
+        self.assertEqual(kerberos.hashcat_lines(11, "a", "R", "", 16, b"\x00" * 40), [])
+        self.assertEqual(kerberos.hashcat_lines(12, "a", "R", "", 23, b"\x00" * 40), [])
+        self.assertEqual(kerberos.hashcat_lines(11, "a", "R", "", 23, b"\x00" * 16), [])
+        self.assertEqual(kerberos.hashcat_lines(11, "a", "R", "", 18, b"\x00" * 12), [])
+        self.assertEqual(kerberos.hashcat_lines(11, "a", "R", "", 23, b""), [])
+        self.assertEqual(kerberos.hashcat_lines("bad", "a", "R", "", 23, b"\x00" * 40), [])
 
 
 class TimelineTest(unittest.TestCase):
     def setUp(self):
         self.events = [
-            {"time": "2026-01-01 10:00:02", "frame": 9, "user": "alice",
-             "realm": "ctf.local", "service": "host/server", "msg_type": 13,
-             "src": "10.0.0.2", "error_code": 0},
-            {"time": "2026-01-01 10:00:01", "frame": 2, "user": "alice",
-             "realm": "CTF.LOCAL", "msg_type": 10, "src": "10.0.0.2",
-             "error_code": 24},
-            {"time": "2026-01-01 10:00:01", "frame": 1, "user": "bob",
-             "realm": "CTF.LOCAL", "msg_type": 11, "src": "10.0.0.3"},
+            {"time": 30, "frame": 3, "msg_type": 13, "user": "alice",
+             "realm": "EXAMPLE.COM", "spn": "cifs/fs", "etype": 23},
+            {"time": 10, "frame": 1, "msg_type": 10, "user": "alice",
+             "realm": "EXAMPLE.COM", "etype": 23},
+            {"time": 20, "frame": 2, "msg_type": 11, "user": "alice",
+             "realm": "EXAMPLE.COM", "etype": 23, "error": 24},
+            "not an event",
         ]
 
-    def test_sorted_rows(self):
-        rows = kerberos.build_timeline(self.events)
-        self.assertEqual([row["frame"] for row in rows], [1, 2, 9])
-        self.assertEqual([row["status"] for row in rows],
-                         ["success", "error", "success"])
-        self.assertEqual(rows[1]["msg_type"], "AS-REQ")
-        self.assertEqual(rows[1]["realm"], "CTF.LOCAL")
-        self.assertEqual(rows[2]["service"], "host/server")
-        self.assertEqual(set(rows[0]), {"time", "frame", "user", "realm",
-                                        "service", "msg_type", "src",
-                                        "status"})
+    def test_build_timeline_sorts_and_labels(self):
+        timeline = kerberos.build_timeline(self.events)
+        self.assertEqual(len(timeline), 3)
+        self.assertEqual([item["frame"] for item in timeline], [1, 2, 3])
+        self.assertEqual([item["message"] for item in timeline],
+                         ["AS-REQ", "AS-REP", "TGS-REP"])
+        self.assertEqual(timeline[1]["error"], 24)
+        self.assertEqual(timeline[2]["spn"], "cifs/fs")
+        self.assertIsNone(timeline[0]["error"])
 
-    def test_summary(self):
+    def test_timeline_uses_frame_as_tiebreaker(self):
+        events = [
+            {"time": 5, "frame": 9, "msg_type": 11},
+            {"time": 5, "frame": 2, "msg_type": 10},
+        ]
+        timeline = kerberos.build_timeline(events)
+        self.assertEqual([item["frame"] for item in timeline], [2, 9])
+
+    def test_summarise_timeline(self):
         summary = kerberos.summarise_timeline(self.events)
-        self.assertIn("alice@CTF.LOCAL: 2 (success 1, error 1)", summary)
-        self.assertIn("bob@CTF.LOCAL: 1 (success 1, error 0)", summary)
+        self.assertEqual(summary["count"], 3)
+        self.assertEqual(summary["first"], 10.0)
+        self.assertEqual(summary["last"], 30.0)
+        self.assertEqual(summary["duration"], 20.0)
+        self.assertEqual(summary["messages"],
+                         {"AS-REQ": 1, "AS-REP": 1, "TGS-REP": 1})
+        self.assertEqual(summary["users"], {"alice@EXAMPLE.COM": 3})
+        self.assertEqual(summary["etypes"], {"23": 3})
+        self.assertEqual(summary["errors"], {"24": 1})
+
+    def test_empty_timeline(self):
+        self.assertEqual(kerberos.build_timeline([]), [])
+        summary = kerberos.summarise_timeline([])
+        self.assertEqual(summary["count"], 0)
+        self.assertIsNone(summary["first"])
+        self.assertIsNone(summary["last"])
+        self.assertEqual(summary["duration"], 0.0)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from pathlib import Path
 
 import re
 
@@ -89,7 +90,7 @@ def _decode_label(label: str) -> list[tuple[str, str]]:
 
 
 def dns(ctx: FeatureContext) -> None:
-    from fnet.utils import codec
+    from fnet.utils import codec, tunnel
 
     rows = _dump(ctx, "DNS 查询", ["frame.number", "dns.qry.name",
                                    "dns.qry.type", "dns.a", "dns.aaaa",
@@ -139,6 +140,70 @@ def dns(ctx: FeatureContext) -> None:
     types = Counter(r[2] for r in rows if len(r) > 2 and r[2])
     if types:
         ctx.report("查询类型: " + ", ".join(f"{k}={v}" for k, v in types.most_common()), "info")
+    _dns_tunnel(ctx)
+
+
+def _dns_tunnel(ctx: FeatureContext) -> None:
+    """Ordered chunk reassembly, timeline and decoded output for DNS tunnels."""
+    from fnet.utils import tunnel
+
+    rows = _rows(ctx, ["frame.number", "dns.qry.name", "frame.time_epoch"],
+                 "dns", limit=200_000)
+    if not rows:
+        return
+    result = tunnel.analyse_dns(rows)
+    decoded = result.get("decoded") or []
+    if not decoded:
+        return
+    ctx.report("===== DNS 隧道分块重组 =====", "good")
+    chunks = []
+    for row in rows:
+        row += [""] * (3 - len(row))
+        qname = row[1]
+        if not qname:
+            continue
+        chunks.append({
+            "frame": row[0],
+            "time": float(row[2]) if (row[2] or "").replace(".", "", 1).isdigit()
+            else 0.0,
+            "data": qname.encode("utf-8", "replace"),
+        })
+    timeline = tunnel.timeline(chunks, buckets=20)
+    peak = max((item["bytes"] for item in timeline), default=0)
+    if timeline:
+        ctx.report(
+            f"隧道时间线: {len(timeline)} 个区间，峰值 {peak} 字节/区间",
+            "info")
+        for item in timeline:
+            if not item["bytes"]:
+                continue
+            ctx.report(
+                f"  {item['start']:.3f}-{item['end']:.3f}s "
+                f"{item['frames']} 条 / {item['bytes']} 字节",
+                "debug")
+    for entry in decoded:
+        text = clean_cell(entry.get("text") or "", 400)
+        state = "完整" if entry.get("complete") else \
+            f"缺块 {len(entry.get('missing') or [])}"
+        ctx.report(f"域 {entry.get('session')}: {entry.get('chunks')} 块，{state}",
+                   "good")
+        if text:
+            ctx.report("  " + text, "good")
+            ctx.add_finding("dns", f"DNS 隧道重组 {entry.get('session')}",
+                            detail=text, level="good",
+                            extra={"complete": bool(entry.get("complete")),
+                                   "chunks": entry.get("chunks")})
+        for flag in entry.get("flags") or []:
+            ctx.report(f"  发现 flag: {flag}", "good")
+            ctx.add_finding("flag", flag,
+                            detail=f"DNS 隧道 {entry.get('session')}",
+                            level="good")
+    for item in tunnel.write_decoded(decoded, ctx.output_dir or ".",
+                                     "dns_tunnel"):
+        ctx.report(f"隧道数据已保存: {item['path']} ({item['size']} 字节)",
+                   "info")
+    for flag in result.get("flags") or []:
+        ctx.add_finding("flag", flag, detail="DNS 隧道重组", level="good")
 
 
 def icmp(ctx: FeatureContext) -> None:
@@ -151,6 +216,61 @@ def icmp(ctx: FeatureContext) -> None:
             ctx.report(f"ICMP 数量 {len(rows)}，载荷长度范围 {min(sizes)}..{max(sizes)}", "info")
         if len(set(sizes)) > 5 and len(sizes) > 20:
             ctx.report("载荷长度变化较大，可能存在 ICMP 隧道", "warn")
+    _icmp_tunnel(ctx)
+
+
+def _icmp_tunnel(ctx: FeatureContext) -> None:
+    """Reassemble chunked ICMP echo tunnels and export the decoded data."""
+    from fnet.utils import tunnel
+
+    rows = _rows(ctx, ["frame.number", "ip.src", "ip.dst", "icmp.type",
+                       "icmp.seq", "data.data", "frame.time_epoch"],
+                 "icmp", limit=200_000)
+    if not rows:
+        return
+    result = tunnel.analyse_icmp(rows)
+    decoded = result.get("decoded") or []
+    if not decoded:
+        return
+    ctx.report("===== ICMP 隧道分块重组 =====", "good")
+    chunks = []
+    for row in rows:
+        row += [""] * (7 - len(row))
+        raw = hex_to_bytes(row[5])
+        if not raw:
+            continue
+        chunks.append({
+            "frame": row[0],
+            "time": float(row[6]) if (row[6] or "").replace(".", "", 1).isdigit()
+            else float(row[0] or 0),
+            "data": raw,
+        })
+    timeline = tunnel.timeline(chunks, buckets=20)
+    if timeline:
+        peak = max((item["bytes"] for item in timeline), default=0)
+        ctx.report(f"隧道时间线: {len(timeline)} 个区间，峰值 {peak} 字节/区间",
+                   "info")
+    for entry in decoded:
+        text = clean_cell(entry.get("text") or "", 400)
+        state = "完整" if entry.get("complete") else \
+            f"缺块 {len(entry.get('missing') or [])}"
+        ctx.report(f"会话 {entry.get('session')}: {entry.get('chunks')} 块，{state}",
+                   "good")
+        if text:
+            ctx.report("  " + text, "good")
+            ctx.add_finding("icmp", f"ICMP 隧道重组 {entry.get('session')}",
+                            detail=text, level="good",
+                            extra={"complete": bool(entry.get("complete")),
+                                   "chunks": entry.get("chunks")})
+        for flag in entry.get("flags") or []:
+            ctx.report(f"  发现 flag: {flag}", "good")
+            ctx.add_finding("flag", flag,
+                            detail=f"ICMP 隧道 {entry.get('session')}",
+                            level="good")
+    for item in tunnel.write_decoded(decoded, ctx.output_dir or ".",
+                                     "icmp_tunnel"):
+        ctx.report(f"隧道数据已保存: {item['path']} ({item['size']} 字节)",
+                   "info")
 
 
 def telnet(ctx: FeatureContext) -> None:
@@ -200,6 +320,82 @@ def mysql(ctx: FeatureContext) -> None:
         for user in sorted(users):
             ctx.add_finding("credential", f"MySQL 用户 {user}", level="good",
                             extra={"protocol": "mysql", "account": user})
+    _mysql_sessions(ctx)
+
+
+def _mysql_sessions(ctx: FeatureContext) -> None:
+    """Reassemble MySQL streams so queries/results also work off port 3306."""
+    from fnet.utils import mysql as mysql_mod
+    from fnet.utils.stream import stream_rows
+
+    streams = stream_rows(ctx, "mysql or tcp.port == 3306", limit=80_000)
+    if not streams:
+        return
+    summary = mysql_mod.summarise_stream(streams)
+    if not summary.get("host"):
+        return
+    host = summary.get("host") or ""
+    port = summary.get("port") or ""
+    ctx.report(f"===== MySQL 会话 {host}:{port} =====", "good")
+    version = summary.get("server_version") or ""
+    plugin = summary.get("auth_plugin") or ""
+    if version or plugin:
+        ctx.report(f"服务端版本: {version or '?'}，认证插件: {plugin or '?'}",
+                   "info")
+    for user in summary.get("users") or []:
+        ctx.report(f"登录用户: {user}", "good")
+        ctx.add_finding("credential", f"MySQL 登录用户 {user} @ {host}:{port}",
+                        level="good",
+                        extra={"protocol": "mysql", "account": user,
+                               "host": host, "port": port})
+    if summary.get("databases"):
+        ctx.report("数据库: " + ", ".join(summary["databases"]), "info")
+    queries = summary.get("queries") or []
+    if queries:
+        ctx.report(f"SQL 语句 {len(queries)} 条", "info")
+        for query in queries[:100]:
+            ctx.report("  " + clean_cell(query, 300), "info")
+        ctx.write_output("mysql_queries.txt", "\n".join(queries))
+    result_sets = summary.get("result_sets") or []
+    if result_sets:
+        lines: list[str] = []
+        for result in result_sets[:50]:
+            lines.append(f"-- {result.get('query') or '(no query)'}")
+            columns = result.get("columns") or []
+            if columns:
+                lines.append(" | ".join(columns))
+            for row in (result.get("rows") or [])[:200]:
+                lines.append(" | ".join("" if cell is None else str(cell)
+                                        for cell in row))
+            if result.get("error"):
+                lines.append("错误: " + str(result["error"]))
+        ctx.write_output("mysql_results.txt", "\n".join(lines))
+        ctx.report(f"结果集 {len(result_sets)} 个，已写入 mysql_results.txt",
+                   "info")
+    for entry in summary.get("local_infiles") or []:
+        name = Path(entry.get("filename") or "local_infile.bin").name
+        safe = "".join(ch if ch.isalnum() or ch in "._-" else "_"
+                       for ch in name)[:80] or "local_infile.bin"
+        if entry.get("data"):
+            ctx.write_output(f"mysql_local_infile_{safe}", entry["data"])
+            ctx.report(f"LOAD DATA LOCAL INFILE 内容已保存: {name} "
+                       f"({entry.get('size')} 字节)", "good")
+            ctx.add_finding("file", f"MySQL LOCAL INFILE 上传 {name}",
+                            level="warn")
+    for entry in summary.get("load_file_results") or []:
+        values = [str(value) for value in entry.get("values") or []
+                  if value not in (None, "")]
+        if not values:
+            continue
+        text = "\n".join(values)
+        ctx.report(f"LOAD_FILE 结果 ({clean_cell(str(entry.get('query')), 120)}): "
+                   + clean_cell(text, 300), "good")
+        ctx.add_finding("file", "MySQL LOAD_FILE 读取文件",
+                        detail=clean_cell(text, 400), level="warn",
+                        extra={"protocol": "mysql",
+                               "query": entry.get("query") or ""})
+    for error in summary.get("errors") or []:
+        ctx.report("MySQL 错误: " + clean_cell(str(error), 200), "warn")
 
 
 def smtp(ctx: FeatureContext) -> None:
@@ -211,6 +407,92 @@ def smtp(ctx: FeatureContext) -> None:
     for row in rows:
         if row[0]:
             ctx.report(f"发件人: {row[0]}", "info")
+    _mail_sessions(ctx)
+
+
+def _mail_sessions(ctx: FeatureContext) -> None:
+    """Parse SMTP/IMAP/POP3 transcripts and carve their attachments."""
+    from pathlib import Path as _Path
+
+    from fnet.utils import mail as mail_mod
+    from fnet.utils.stream import stream_rows
+
+    streams = stream_rows(
+        ctx, "smtp or imap or pop or tcp.port == 25 or tcp.port == 465 "
+             "or tcp.port == 587 or tcp.port == 143 or tcp.port == 993 "
+             "or tcp.port == 110 or tcp.port == 995", limit=80_000)
+    if not streams:
+        return
+    found = False
+    for stream in streams:
+        data = getattr(stream, "data", b"") or b""
+        if not data:
+            continue
+        summary = mail_mod.mail_summary("", data)
+        protocol = summary.get("protocol") or ""
+        if protocol not in ("smtp", "imap", "pop3"):
+            continue
+        interesting = any(summary.get(key) for key in (
+            "credentials", "messages", "mail_from", "mailboxes", "uids"))
+        if not interesting:
+            continue
+        found = True
+        where = f"{stream.src}:{stream.sport} -> {stream.dst}:{stream.dport}"
+        ctx.report(f"===== {protocol.upper()} 会话 {where} =====", "good")
+        for item in summary.get("credentials") or []:
+            user = item.get("username") or ""
+            secret = item.get("password") or ""
+            ctx.report(f"凭据 [{item.get('mechanism') or protocol}] "
+                       f"{user}:{secret}", "good")
+            ctx.add_finding("credential", f"{protocol.upper()} 登录 {user}:{secret}",
+                            level="good",
+                            extra={"protocol": protocol, "account": user,
+                                   "secret": secret, "stream": stream.stream})
+        for sender in summary.get("mail_from") or []:
+            ctx.report(f"发件人: {sender}", "info")
+            ctx.add_finding("mail", f"{protocol.upper()} 发件人 {sender}",
+                            level="info", extra={"protocol": protocol})
+        for recipient in summary.get("rcpt_to") or []:
+            ctx.report(f"收件人: {recipient}", "info")
+        for mailbox in summary.get("mailboxes") or []:
+            ctx.report(f"邮箱: {mailbox}", "info")
+        for entry in summary.get("messages") or []:
+            headers = entry.get("summary") or {}
+            subject = headers.get("Subject") or ""
+            sender = headers.get("From") or ""
+            ctx.report(f"邮件: {clean_cell(subject, 120) or '(无主题)'} "
+                       f"来自 {clean_cell(sender, 80)}", "info")
+            ctx.add_finding("mail", clean_cell(subject, 160) or "(无主题)",
+                            detail=clean_cell(sender, 200), level="info",
+                            extra={"protocol": protocol,
+                                   "mailbox": entry.get("mailbox") or "",
+                                   "size": entry.get("size") or 0})
+            message = entry.get("message")
+            try:
+                attachments = mail_mod.attachment_entries(message)
+            except Exception:  # noqa: BLE001 - malformed MIME is not fatal
+                attachments = []
+            for attachment in attachments:
+                raw = attachment.get("data") or b""
+                name = _Path(attachment.get("filename")
+                             or "attachment.bin").name
+                safe = "".join(ch if ch.isalnum() or ch in "._-" else "_"
+                               for ch in name)[:80] or "attachment.bin"
+                if raw:
+                    ctx.write_output(
+                        f"mail_{stream.stream}_{protocol}_{safe}", raw)
+                ctx.report(f"附件: {name} ({attachment.get('size')} 字节, "
+                           f"MD5 {attachment.get('md5')})", "good")
+                ctx.add_finding("file",
+                                f"{protocol.upper()} 附件 {name}",
+                                detail=f"MD5 {attachment.get('md5')}",
+                                level="warn",
+                                extra={"protocol": protocol,
+                                       "filename": name,
+                                       "size": attachment.get("size") or 0,
+                                       "md5": attachment.get("md5") or ""})
+    if not found:
+        ctx.report("邮件流会话中没有识别出命令、凭据或附件", "info")
 
 
 def bluetooth(ctx: FeatureContext) -> None:

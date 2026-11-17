@@ -857,3 +857,69 @@ def decrypt_frames(tk: bytes, rows) -> list[dict]:
             "header_len": decrypted["header_len"],
         })
     return results
+
+
+# ---------------------------------------------------------------------------
+# Minimal classic-pcap reader/writer (stdlib only)
+# ---------------------------------------------------------------------------
+PCAP_MAGIC_LE = 0xA1B2C3D4
+PCAP_MAGIC_BE = 0xD4C3B2A1
+PCAP_MAGIC_NS_LE = 0xA1B23C4D
+PCAP_MAGIC_NS_BE = 0x4D3CB2A1
+LINKTYPE_ETHERNET = 1
+
+
+def read_pcap(path: str | Path) -> tuple[list[tuple[float, bytes]], int]:
+    """Read a classic pcap file into ``[(timestamp, packet_bytes)]``.
+
+    Returns ``(packets, linktype)``; unsupported magic/linktype raises
+    ``ValueError`` so the caller can skip the feedback step cleanly.
+    """
+    data = Path(path).read_bytes()
+    if len(data) < 24:
+        raise ValueError("pcap header truncated")
+    magic = int.from_bytes(data[:4], "little")
+    if magic in (PCAP_MAGIC_LE, PCAP_MAGIC_NS_LE):
+        endian = "<"
+        nano = magic == PCAP_MAGIC_NS_LE
+    elif magic in (PCAP_MAGIC_BE, PCAP_MAGIC_NS_BE):
+        endian = ">"
+        nano = magic == PCAP_MAGIC_NS_BE
+    else:
+        raise ValueError(f"unsupported pcap magic 0x{magic:08x}")
+    linktype = struct.unpack_from(endian + "I", data, 20)[0]
+    if linktype & 0xFFFF0000:  # new-style linktype field
+        linktype = linktype & 0xFFFF
+    packets: list[tuple[float, bytes]] = []
+    offset = 24
+    while offset + 16 <= len(data):
+        seconds, fraction, captured, _original = struct.unpack_from(
+            endian + "IIII", data, offset)
+        offset += 16
+        if captured > len(data) - offset or captured > 16 * 1024 * 1024:
+            break
+        packets.append((
+            seconds + fraction / (1_000_000_000 if nano else 1_000_000),
+            data[offset:offset + captured],
+        ))
+        offset += captured
+    return packets, linktype
+
+
+def write_pcap(path: str | Path, packets, linktype: int = LINKTYPE_ETHERNET
+               ) -> Path:
+    """Write ``[(timestamp, bytes)]`` as a classic little-endian pcap file."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("wb") as handle:
+        handle.write(struct.pack("<IHHiIII", PCAP_MAGIC_LE, 2, 4, 0, 0,
+                                 65_535, int(linktype)))
+        for timestamp, payload in packets or ():
+            blob = bytes(payload or b"")
+            stamp = _float(str(timestamp or 0))
+            seconds = int(stamp)
+            micros = max(0, min(999_999, int(round((stamp - seconds) * 1e6))))
+            handle.write(struct.pack("<IIII", seconds, micros, len(blob),
+                                     len(blob)))
+            handle.write(blob)
+    return target

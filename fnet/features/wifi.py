@@ -88,6 +88,139 @@ def _ssid_for_bssid(values: dict[str, str], messages, ssid_by_bssid) -> str:
     return ssid
 
 
+def _psk_bytes(value: str) -> bytes | None:
+    """Return the raw PMK for a 64-hex PSK, else ``None`` for a passphrase."""
+    text = str(value or "").strip()
+    if re.fullmatch(r"(?i)[0-9a-f]{64}", text):
+        return bytes.fromhex(text)
+    return None
+
+
+def _decrypted_feedback(ctx: FeatureContext, path: Path) -> None:
+    """Run HTTP/DNS extraction over the decrypted pcap."""
+    if ctx.tshark is None:
+        return
+    fields = ["frame.number", "http.request.method", "http.host",
+              "http.request.uri", "http.response.code",
+              "http.authorization", "dns.qry.name"]
+    rows = ctx.tshark.fields(str(path), fields, "http or dns", limit=5_000)
+    http_rows = [row for row in rows if len(row) > 1 and row[1]]
+    dns_rows = [row for row in rows if len(row) > 6 and row[6]]
+    if http_rows:
+        ctx.report(f"解密后 HTTP 请求 {len(http_rows)} 条", "good")
+    seen_hosts: set[str] = set()
+    for row in http_rows[:200]:
+        row += [""] * (len(fields) - len(row))
+        frame, method, host, uri, code, auth, _dns = row[:7]
+        ctx.report(f"[解密:{frame}] {method} {host}{uri} -> {code}", "info")
+        if host and host not in seen_hosts:
+            seen_hosts.add(host)
+            ctx.add_finding("http", f"解密后访问 {host}", frame=frame,
+                            detail=f"{method} {uri}", level="info",
+                            extra={"host": host, "decrypted": True})
+        if auth:
+            ctx.report(f"[解密:{frame}] Authorization: {auth}", "good")
+            ctx.add_finding("credential", "解密后 HTTP 认证头", frame=frame,
+                            detail=auth, level="good",
+                            extra={"protocol": "http", "secret": auth,
+                                   "host": host, "decrypted": True})
+    if dns_rows:
+        names = list(dict.fromkeys(row[6] for row in dns_rows if row[6]))
+        ctx.report("解密后 DNS 域名: " + ", ".join(names[:30]), "info")
+        for name in names[:50]:
+            ctx.add_finding("dns", name, detail="WPA 解密后 DNS 查询",
+                            level="info", extra={"decrypted": True})
+
+
+def _psk_decrypt(ctx: FeatureContext, groups, ssid_by_bssid) -> None:
+    """Derive the CCMP key from a known PSK and decrypt data frames."""
+    psk = str(ctx.params.get("wifi_psk") or "").strip()
+    if not psk:
+        return
+    tshark = ctx.tshark.path if ctx.tshark is not None else ""
+    if not tshark:
+        ctx.report("需要 tshark 才能解密 WPA 数据帧", "warn")
+        return
+    fixed_pmk = _psk_bytes(psk)
+    outdir = Path(ctx.output_dir or ".")
+    decrypted_files: list[Path] = []
+    total = 0
+    valid = 0
+    for (bssid, station), group in groups.items():
+        ctx.check_cancel()
+        pair = wifilib.usable_pair(group)
+        if pair is None:
+            continue
+        m1, m2 = pair
+        ssid = ssid_by_bssid.get(bssid, "")
+        if not ssid:
+            ctx.report(f"{wifilib.mac_colon(bssid)}: 缺少 SSID，无法派生 PMK",
+                       "warn")
+            continue
+        pmk = fixed_pmk or wifilib.derive_pmk(psk, ssid)
+        try:
+            ptk = wifilib.derive_ptk(pmk, m1.nonce, m2.nonce, bssid, station)
+        except ValueError as exc:
+            ctx.report(f"PTK 派生失败: {exc}", "warn")
+            continue
+        label = f"{wifilib.mac_colon(bssid)}_{wifilib.mac_colon(station)}"
+        label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label)
+        temp = outdir / f"wifi_ccmp_{label}.pcap"
+        if station:
+            display = (f"wlan.fc.type == 2 && wlan.fc.protected == 1 && "
+                       f"(wlan.bssid == {wifilib.mac_colon(bssid)} && "
+                       f"(wlan.ta == {wifilib.mac_colon(station)} || "
+                       f"wlan.ra == {wifilib.mac_colon(station)} || "
+                       f"wlan.sa == {wifilib.mac_colon(station)} || "
+                       f"wlan.da == {wifilib.mac_colon(station)}))")
+        else:
+            display = "wlan.fc.type == 2 && wlan.fc.protected == 1"
+        code, out = run([tshark, "-r", ctx.pcap, "-Y", display,
+                         "-F", "pcap", "-w", str(temp)], echo=False,
+                        cancel=ctx.cancel)
+        if code != 0 or not temp.is_file():
+            ctx.report(f"提取加密数据帧失败: {out[-300:]}", "warn")
+            continue
+        try:
+            packets, linktype = wifilib.read_pcap(temp)
+        except (OSError, ValueError) as exc:
+            ctx.report(f"读取临时 pcap 失败: {exc}", "warn")
+            continue
+        finally:
+            temp.unlink(missing_ok=True)
+        if linktype not in (105, 127):
+            ctx.report(f"暂不支持链路类型 {linktype} 的 802.11 解密", "warn")
+            continue
+        rows = [[str(index), raw.hex(), str(ts)]
+                for index, (ts, raw) in enumerate(packets, 1)]
+        frames = wifilib.decrypt_frames(ptk["tk"], rows)
+        ethernet = [(item["time"], item["ethernet"]) for item in frames
+                    if item["ethernet"]]
+        total += len(frames)
+        good = sum(1 for item in frames if item["tag_valid"])
+        valid += good
+        if not ethernet:
+            ctx.report(f"{label}: 未解出可用的以太网帧", "warn")
+            continue
+        target = outdir / f"wifi_decrypted_{label}.pcap"
+        wifilib.write_pcap(target, ethernet, wifilib.LINKTYPE_ETHERNET)
+        decrypted_files.append(target)
+        ctx.report(f"{label}: 解密 {len(ethernet)} 帧（MIC 校验通过 {good}），"
+                   f"已写入 {target.name}", "good")
+        ctx.add_finding("protocol", f"WPA 解密 {label}", level="good",
+                        detail=f"解密 {len(ethernet)} 帧，MIC 通过 {good}",
+                        extra={"bssid": bssid, "station": station,
+                               "frames": len(ethernet), "mic_ok": good})
+    if not decrypted_files:
+        if groups:
+            ctx.report("没有可解密的完整 M1/M2 握手（需要 PSK 与 SSID）", "warn")
+        return
+    ctx.report(f"WPA 解密完成: {total} 帧，MIC 通过 {valid} 帧，"
+               f"输出 {len(decrypted_files)} 个 pcap", "good")
+    for path in decrypted_files[:10]:
+        _decrypted_feedback(ctx, path)
+
+
 def crack(ctx: FeatureContext) -> None:
     rows = tshark_rows(ctx, FIELDS, FILTER, limit=20_000)
     if not rows:
@@ -213,6 +346,8 @@ def crack(ctx: FeatureContext) -> None:
                          "\n".join(eapol_lines) + "\n")
         ctx.report(f"已从 {len(eapol_lines)} 组 M1/M2 握手重建 22000 EAPOL 哈希",
                    "good")
+
+    _psk_decrypt(ctx, groups, ssid_by_bssid)
 
     if sae_frames or sae_suites:
         detail = wifilib.sae_path(sorted(sae_suites)) or (

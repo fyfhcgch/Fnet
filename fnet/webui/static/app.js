@@ -39,9 +39,80 @@
     batch: { ids: [], jobs: [], timer: null, active: false, summary: null, drag: null },
     viz: { timeline: null, hierarchy: null, talkers: null, topology: null, zoom: null, svg: "" },
     tlsKeyKind: "keylog",
+    language: "zh",
+    featureSearch: "",
+    upload: null,
+    paused: false,
+    liveTimer: null,
   };
 
-  const TERMINAL = new Set(["done", "error", "cancelled"]);
+  const TERMINAL = new Set(["done", "error", "cancelled", "paused"]);
+
+  // UI chrome is translated in place; capture logs and reports stay Chinese so
+  // the evidence reads the same regardless of the interface language.
+  const I18N = {
+    zh: {
+      tab_log: "分析日志", tab_findings: "分析结果", tab_artifacts: "产出文件",
+      tab_batch: "批量队列", tab_viz: "统计图表", tab_history: "任务历史",
+      tab_text: "文本工具", tab_about: "关于",
+      menu_file: "文件", menu_stats: "统计", menu_settings: "设置",
+      menu_tools: "工具", menu_special: "专项功能", menu_help: "帮助",
+      search: "搜索功能 / 分类 / handler", select_all: "全选",
+      features_title: "自动分析功能",
+      drop_title: "拖拽流量包到此处",
+      drop_hint: "支持一次拖入多个文件并进入批量队列（pcap / pcapng / cap / dmp / etl）",
+      use_path: "使用", start: "开始分析", pause: "暂停", cancel: "取消",
+      live: "实时抓包", compare: "对比两个任务",
+      settings_webshell: "Webshell 解密设置", settings_shiro: "Shiro 解密设置",
+      settings_winrm: "WinRM 解密设置", settings_sql: "SQL 盲注设置",
+      settings_general: "通用分析设置",
+      status_idle: "空闲", status_running: "运行中", status_paused: "已暂停",
+      status_done: "完成", status_cancelled: "已取消", status_error: "错误",
+    },
+    en: {
+      tab_log: "Log", tab_findings: "Findings", tab_artifacts: "Artifacts",
+      tab_batch: "Batch queue", tab_viz: "Charts", tab_history: "History",
+      tab_text: "Text tools", tab_about: "About",
+      menu_file: "File", menu_stats: "Statistics", menu_settings: "Settings",
+      menu_tools: "Tools", menu_special: "One-click", menu_help: "Help",
+      search: "Search features / categories / handlers", select_all: "Select all",
+      features_title: "Analysis features",
+      drop_title: "Drop a capture here",
+      drop_hint: "Multiple files are queued for a batch run (pcap / pcapng / cap / dmp / etl)",
+      use_path: "Use", start: "Start", pause: "Pause", cancel: "Cancel",
+      live: "Live capture", compare: "Compare jobs",
+      settings_webshell: "Webshell decryption", settings_shiro: "Shiro decryption",
+      settings_winrm: "WinRM decryption", settings_sql: "Blind SQL injection",
+      settings_general: "General analysis",
+      status_idle: "Idle", status_running: "Running", status_paused: "Paused",
+      status_done: "Done", status_cancelled: "Cancelled", status_error: "Error",
+    },
+  };
+
+  function t(key, fallback = "") {
+    const dict = I18N[state.language] || I18N.zh;
+    return dict[key] || (I18N.zh[key] ?? fallback ?? key);
+  }
+
+  function applyLanguage(lang, persist = false) {
+    state.language = lang === "en" ? "en" : "zh";
+    document.documentElement.lang = state.language === "en" ? "en" : "zh-CN";
+    $$("[data-i18n]").forEach((node) => {
+      const value = t(node.dataset.i18n);
+      if (value) node.textContent = value;
+    });
+    $$("[data-i18n-placeholder]").forEach((node) => {
+      const value = t(node.dataset.i18nPlaceholder);
+      if (value) node.placeholder = value;
+    });
+    const selector = $("#lang-select");
+    if (selector) selector.value = state.language;
+    if (state.meta) renderFeatures();
+    if (persist) {
+      saveConfig("config", { language: state.language }).catch(() => {});
+      localStorage.setItem("fnet.lang", state.language);
+    }
+  }
 
   /* ------------------------------------------------------------ helpers */
   async function api(path, options = {}) {
@@ -116,6 +187,8 @@
     restoreRecentFeatures();
     restoreReportSections();
     applyMeta(state.meta);
+    applyLanguage(state.meta.language
+      || localStorage.getItem("fnet.lang") || "zh");
     bindEvents();
     restoreLocalSettings();
     restoreFindingsColumns();
@@ -157,58 +230,8 @@
 
     // Feature list grouped by category.
     state.features = meta.features || [];
-    const container = $("#features");
-    container.innerHTML = "";
-    meta.categories.forEach((category) => {
-      const features = meta.features.filter((f) => f.category === category.key);
-      if (!features.length) return;
-      const details = document.createElement("details");
-      details.className = "feature-group";
-      details.dataset.category = category.key;
-      details.open = ["text", "http", "webshell", "sql", "c2", "auth"].includes(category.key);
-      const count = features.filter((f) => f.default).length;
-      const icon = CATEGORY_ICONS[category.key] || CATEGORY_ICONS.misc;
-      details.innerHTML = `<summary>
-        <span class="group-icon" aria-hidden="true"><svg viewBox="0 0 24 24"
-          fill="none" stroke="currentColor" stroke-width="1.8"
-          stroke-linecap="round" stroke-linejoin="round">${icon}</svg></span>
-        <span class="group-name">${esc(category.name)}</span>
-        <span class="muted small">${features.length} 项${count ? ` · 默认 ${count}` : ""}</span>
-      </summary>`;
-      const list = document.createElement("div");
-      list.className = "feature-list";
-      features.forEach((feature) => {
-        const label = document.createElement("label");
-        label.className = "feature-item";
-        label.title = feature.description || feature.title;
-        label.dataset.search = [feature.title, feature.description || "",
-          feature.handler, category.name, feature.checkbox]
-          .join(" ").toLowerCase();
-        const input = document.createElement("input");
-        input.type = "checkbox";
-        input.value = feature.checkbox;
-        input.dataset.handler = feature.handler;
-        input.checked = !!feature.default;
-        input.addEventListener("change", () => {
-          label.classList.toggle("checked", input.checked);
-          refreshSelected();
-          renderRecentFeatures();
-        });
-        const span = document.createElement("span");
-        span.innerHTML = `<span class="ftitle">${esc(feature.title)}</span>` +
-          (feature.needs && feature.needs.length
-            ? ` <span class="muted small">[${feature.needs.join(", ")}]</span>` : "");
-        label.appendChild(input);
-        label.appendChild(span);
-        list.appendChild(label);
-      });
-      details.appendChild(list);
-      container.appendChild(details);
-    });
-    state.featureCount = meta.features.length;
+    renderFeatures();
     setText("#feature-total", `${meta.features.length} 个功能`);
-    renderPlugins(meta.plugins || []);
-    renderRecentFeatures();
 
     // Config derived defaults.
     const cfg = (meta.config && meta.config.config) || {};
@@ -226,6 +249,94 @@
     badge.className = `badge ${tool && tool.available ? "ok" : "bad"}`;
     badge.title = tool && tool.path ? tool.path : "未找到 tshark";
   }
+
+  function renderFeatures() {
+    const meta = state.meta || {};
+    const english = (state.language || "zh") === "en";
+    const previous = new Set($$("#features input[type=checkbox]:checked")
+      .map((box) => box.value));
+    const hadList = $$("#features input[type=checkbox]").length > 0;
+    const container = $("#features");
+    if (!container) return;
+    container.innerHTML = "";
+    (meta.categories || []).forEach((category) => {
+      const features = (meta.features || [])
+        .filter((f) => f.category === category.key);
+      if (!features.length) return;
+      const label = english
+        ? (category.name_en || category.name) : category.name;
+      const details = document.createElement("details");
+      details.className = "feature-group";
+      details.dataset.category = category.key;
+      details.open = ["text", "http", "webshell", "sql", "c2", "auth"]
+        .includes(category.key) || (state.featureSearch
+          ? features.some((f) => matchesSearch(f, category))
+          : false);
+      const count = features.filter((f) => f.default).length;
+      const icon = CATEGORY_ICONS[category.key] || CATEGORY_ICONS.misc;
+      details.innerHTML = `<summary>
+        <span class="group-icon" aria-hidden="true"><svg viewBox="0 0 24 24"
+          fill="none" stroke="currentColor" stroke-width="1.8"
+          stroke-linecap="round" stroke-linejoin="round">${icon}</svg></span>
+        <span class="group-name">${esc(label)}</span>
+        <span class="muted small">${features.length} ${
+          english ? "items" : "项"}${count
+            ? (english ? ` · ${count} default` : ` · 默认 ${count}`) : ""}</span>
+      </summary>`;
+      const list = document.createElement("div");
+      list.className = "feature-list";
+      features.forEach((feature) => {
+        const title = english && feature.title_en
+          ? feature.title_en : feature.title;
+        const description = english && feature.description_en
+          ? feature.description_en : (feature.description || feature.title);
+        const item = document.createElement("label");
+        item.className = "feature-item";
+        item.title = description;
+        item.dataset.search = [feature.title, feature.title_en || "",
+          feature.description || "", feature.description_en || "",
+          feature.handler, category.name, label, feature.checkbox]
+          .join(" ").toLowerCase();
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.value = feature.checkbox;
+        input.dataset.handler = feature.handler;
+        input.checked = hadList ? previous.has(feature.checkbox)
+          : !!feature.default;
+        item.classList.toggle("checked", input.checked);
+        input.addEventListener("change", () => {
+          item.classList.toggle("checked", input.checked);
+          refreshSelected();
+          renderRecentFeatures();
+        });
+        const span = document.createElement("span");
+        span.innerHTML = `<span class="ftitle">${esc(title)}</span>` +
+          (feature.needs && feature.needs.length
+            ? ` <span class="muted small">[${feature.needs.join(", ")}]</span>`
+            : "");
+        item.appendChild(input);
+        item.appendChild(span);
+        list.appendChild(item);
+      });
+      details.appendChild(list);
+      container.appendChild(details);
+    });
+    state.featureCount = (meta.features || []).length;
+    setText("#feature-total", english
+      ? `${state.featureCount} features`
+      : `${state.featureCount} 个功能`);
+    filterFeatures();
+  }
+
+  function matchesSearch(feature, category) {
+    const query = (state.featureSearch || "").toLowerCase();
+    if (!query) return true;
+    return [feature.title, feature.title_en || "",
+      feature.description || "", feature.description_en || "",
+      feature.handler, category.name, category.name_en || "",
+      feature.checkbox].join(" ").toLowerCase().includes(query);
+  }
+
 
   function renderPlugins(plugins) {
     state.plugins = plugins || [];
@@ -424,6 +535,8 @@
   /* --------------------------------------------------- feature finder */
   function filterFeatures() {
     const query = val("feature-search").toLowerCase();
+    state.featureSearch = query;
+    const english = state.language === "en";
     $("#feature-search-clear").classList.toggle("hidden", !query);
     let visible = 0;
     $$("#features .feature-group").forEach((group) => {
@@ -439,8 +552,8 @@
     });
     $("#feature-empty").classList.toggle("hidden", !query || visible > 0);
     setText("#feature-total", query
-      ? `${visible} / ${state.featureCount} 匹配`
-      : `${state.featureCount} 个功能`);
+      ? `${visible} / ${state.featureCount} ${english ? "matched" : "匹配"}`
+      : `${state.featureCount} ${english ? "features" : "个功能"}`);
   }
 
   function restoreRecentFeatures() {
@@ -537,10 +650,14 @@
 
 
   function statusLabel(status) {
-    return {
-      done: "完成", running: "运行中", queued: "排队",
-      cancelled: "已取消", error: "错误", interrupted: "已中断",
-    }[status] || status;
+    const keys = {
+      running: "status_running", paused: "status_paused", done: "status_done",
+      cancelled: "status_cancelled", error: "status_error",
+    };
+    if (keys[status]) return t(keys[status]);
+    return { queued: state.language === "en" ? "Queued" : "排队",
+      interrupted: state.language === "en" ? "Interrupted" : "已中断" }[status]
+      || status;
   }
 
   async function loadHistory() {
@@ -673,11 +790,57 @@
     refreshSelected();
   }
 
-  async function uploadFile(file) {
-    if (!file) return null;
-    const form = new FormData();
-    form.append("file", file, file.name);
-    return api("/api/upload", { method: "POST", body: form });
+  function uploadFile(file, options = {}) {
+    if (!file) return Promise.resolve(null);
+    const { kind = "", onProgress = null } = options;
+    return new Promise((resolve, reject) => {
+      const form = new FormData();
+      form.append("file", file, file.name);
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/upload");
+      xhr.setRequestHeader("X-Fnet-Token", TOKEN);
+      if (kind) xhr.setRequestHeader("X-Kind", kind);
+      state.upload = { xhr, name: file.name };
+      if (onProgress && xhr.upload) {
+        xhr.upload.onprogress = (event) => {
+          if (event.lengthComputable) onProgress(event.loaded / event.total);
+        };
+      }
+      xhr.onload = () => {
+        state.upload = null;
+        let data = null;
+        try { data = JSON.parse(xhr.responseText || "{}"); }
+        catch (error) { data = { ok: false, error: xhr.responseText }; }
+        if (xhr.status >= 200 && xhr.status < 300 && data.ok !== false) {
+          resolve(data);
+        } else {
+          reject(new Error(data.error || `HTTP ${xhr.status}`));
+        }
+      };
+      xhr.onerror = () => {
+        state.upload = null;
+        reject(new Error("上传连接失败"));
+      };
+      xhr.onabort = () => {
+        state.upload = null;
+        reject(new Error("上传已取消"));
+      };
+      xhr.send(form);
+    });
+  }
+
+  function cancelUpload() {
+    if (!state.upload) return false;
+    state.upload.xhr.abort();
+    state.upload = null;
+    setProgress(0);
+    return true;
+  }
+
+  function uploadProgress(frac, name) {
+    const pct = Math.max(0, Math.min(100, Math.round(frac * 100)));
+    setProgress(pct);
+    setText("#file-meta", `上传 ${name} · ${pct}%（Esc 取消）`);
   }
 
   async function uploadFiles(files) {
@@ -686,10 +849,14 @@
     if (list.length === 1) {
       toast(`正在上传 ${list[0].name}…`, "info");
       try {
-        const data = await uploadFile(list[0]);
+        const data = await uploadFile(list[0], {
+          onProgress: (frac) => uploadProgress(frac, list[0].name),
+        });
         setPcap(data.path, data.name, data.size);
+        setProgress(100);
         toast(`已加载 ${data.name}`, "good");
       } catch (error) {
+        setProgress(0);
         toast(error.message, "error", 7000);
       }
       return;
@@ -697,13 +864,18 @@
     toast(`正在上传 ${list.length} 个流量包…`, "info", 6000);
     const uploaded = [];
     try {
-      for (const file of list) {
-        uploaded.push(await uploadFile(file));
+      for (const [index, file] of list.entries()) {
+        uploaded.push(await uploadFile(file, {
+          onProgress: (frac) => uploadProgress(
+            (index + frac) / list.length, `${file.name} (${index + 1}/${list.length})`),
+        }));
       }
+      setProgress(100);
       setPcap(uploaded[0].path, uploaded[0].name, uploaded[0].size);
       toast(`已上传 ${uploaded.length} 个流量包，开始批量排队`, "good", 5000);
       await startBatch(uploaded.map((item) => item.path));
     } catch (error) {
+      setProgress(0);
       toast(error.message, "error", 8000);
     }
   }
@@ -1276,12 +1448,8 @@
   async function uploadTlsKey(file) {
     if (!file) return;
     const kind = state.tlsKeyKind === "key" ? "key" : "keylog";
-    const form = new FormData();
-    form.append("file", file, file.name);
     try {
-      const data = await api("/api/upload", {
-        method: "POST", body: form, headers: { "X-Kind": kind },
-      });
+      const data = await uploadFile(file, { kind });
       toast(data.text || "TLS 密钥已上传", "good", 6000);
       await refreshMeta();
     } catch (error) {
@@ -1319,11 +1487,43 @@
     zip.removeAttribute("href");
     $("#start-btn").disabled = true;
     $("#cancel-btn").disabled = false;
-    setText("#job-state", label || "分析中");
+    $("#pause-btn").disabled = false;
+    state.paused = false;
+    setPauseButton();
+    setText("#job-state", label || t("status_running"));
     $("#job-state").className = "badge running";
     setProgress(0);
     switchTab("log");
     pollJob(job.id);
+  }
+
+  function setPauseButton() {
+    const button = $("#pause-btn");
+    if (!button) return;
+    button.textContent = state.paused
+      ? (state.language === "en" ? "Resume" : "继续")
+      : t("pause");
+    button.classList.toggle("primary", state.paused);
+  }
+
+  async function togglePause() {
+    if (!state.jobId) return;
+    try {
+      if (state.paused) {
+        const data = await api(`/api/jobs/${state.jobId}/resume`,
+          { method: "POST", body: {} });
+        attachJob(data.job, t("status_running"));
+        toast(state.language === "en" ? "Job resumed" : "任务已继续", "good");
+      } else {
+        await api(`/api/jobs/${state.jobId}/pause`,
+          { method: "POST", body: {} });
+        toast(state.language === "en"
+          ? "Pausing after the current feature"
+          : "将在当前功能结束后暂停", "warn");
+      }
+    } catch (error) {
+      toast(error.message, "error", 7000);
+    }
   }
 
   function setProgress(value) {
@@ -1343,11 +1543,25 @@
       if (TERMINAL.has(data.job.status)) {
         $("#cancel-btn").disabled = true;
         $("#start-btn").disabled = selectedFeatures().length === 0 || !state.pcap;
+        if (data.job.status !== "paused") {
+          state.paused = false;
+          setPauseButton();
+        }
         if (data.job.status === "done") {
+          $("#pause-btn").disabled = true;
           toast(`分析完成：${data.job.feature_titles.length} 个功能`, "good");
         } else if (data.job.status === "cancelled") {
+          $("#pause-btn").disabled = true;
           toast("分析已取消", "warn");
+        } else if (data.job.status === "paused") {
+          state.paused = true;
+          $("#pause-btn").disabled = false;
+          setPauseButton();
+          toast(state.language === "en"
+            ? "Job paused — click Resume to continue"
+            : "任务已暂停，点击“继续”恢复", "warn", 6000);
         } else {
+          $("#pause-btn").disabled = true;
           toast(`分析结束（${data.job.status}）${data.job.error ? "：" + data.job.error : ""}`,
             "error", 8000);
         }
@@ -1355,6 +1569,7 @@
         loadFindings(jobId, { quiet: true });
         return;
       }
+      $("#pause-btn").disabled = false;
       state.pollTimer = setTimeout(() => pollJob(jobId), 450);
     } catch (error) {
       toast(`获取任务状态失败：${error.message}`, "error", 7000);
@@ -1364,11 +1579,13 @@
 
   function updateJob(job, artifacts) {
     setProgress(job.progress);
+    const base = statusLabel(job.status);
     setText("#job-state", job.status === "running"
-      ? (job.current ? `运行中 · ${job.current}` : "运行中")
-      : job.status === "done" ? "完成"
-        : job.status === "cancelled" ? "已取消"
-          : job.status === "error" ? "错误" : job.status);
+      ? (job.current
+        ? `${base} · ${job.current}` : base)
+      : job.status === "paused"
+        ? `${base} · ${job.completed ? job.completed.length : 0}/${job.feature_titles?.length || ""}`
+        : base);
     $("#job-state").className = `badge ${
       job.status === "done" ? "ok" : job.status === "running" ? "running" :
         job.status === "error" ? "bad" : ""}`;
@@ -1796,6 +2013,241 @@
     }
   }
 
+  /* ------------------------------------------------------- compare / rules */
+  async function openCompareDialog() {
+    let jobs = state.history || [];
+    if (jobs.length < 2) {
+      try {
+        const data = await api("/api/history");
+        jobs = data.jobs || [];
+      } catch (error) {
+        jobs = [];
+      }
+    }
+    if (jobs.length < 2) {
+      toast(state.language === "en"
+        ? "At least two history jobs are required"
+        : "至少需要两个历史任务才能对比", "warn");
+      return;
+    }
+    const options = jobs.slice(0, 50).map((job) => ({
+      value: job.id,
+      label: `${job.pcap_name || job.pcap || "capture"} · ${
+        job.finished || job.started || job.created || ""} · ${
+        String(job.id).slice(0, 8)}`,
+    }));
+    const values = await openModal({
+      title: state.language === "en" ? "Compare jobs" : "对比两个任务",
+      fields: [
+        { name: "base", label: state.language === "en" ? "Baseline" : "基准任务",
+          type: "select", options, value: options[1].value },
+        { name: "target", label: state.language === "en" ? "Target" : "对比任务",
+          type: "select", options, value: options[0].value },
+      ],
+    });
+    if (!values) return;
+    if (values.base === values.target) {
+      toast(state.language === "en" ? "Pick two different jobs" : "请选择两个不同任务",
+        "warn");
+      return;
+    }
+    try {
+      const data = await api(`/api/compare?base=${encodeURIComponent(values.base)}`
+        + `&target=${encodeURIComponent(values.target)}`);
+      const counts = data.counts || {};
+      const lines = [];
+      lines.push(state.language === "en"
+        ? `Added ${counts.added || 0}, removed ${counts.removed || 0}, `
+          + `common ${counts.common || 0}`
+        : `新增 ${counts.added || 0} 条，消失 ${counts.removed || 0} 条，`
+          + `共有 ${counts.common || 0} 条`);
+      const section = (label, items) => {
+        if (!items || !items.length) return;
+        lines.push("", `== ${label} ==`);
+        items.slice(0, 80).forEach((item) => {
+          lines.push(`  [${item.kind}] ${item.summary || ""}`);
+        });
+      };
+      section(state.language === "en" ? "Added" : "新增", data.added);
+      section(state.language === "en" ? "Removed" : "消失", data.removed);
+      await openModal({
+        title: state.language === "en" ? "Comparison" : "任务对比",
+        text: lines.join("\n"), hideCancel: true,
+        okText: state.language === "en" ? "Close" : "关闭",
+      });
+    } catch (error) {
+      toast(error.message, "error", 8000);
+    }
+  }
+
+  async function openRulesDialog() {
+    let info = { file: "", count: 0, names: [], error: "" };
+    try {
+      info = await api("/api/rules");
+    } catch (error) {
+      toast(error.message, "error", 7000);
+    }
+    const lines = [];
+    lines.push(state.language === "en"
+      ? `Loaded rules: ${info.count || 0}`
+      : `已加载规则: ${info.count || 0} 条`);
+    if (info.names && info.names.length) {
+      lines.push(info.names.slice(0, 30).join(", "));
+    }
+    if (info.error) lines.push(`${state.language === "en" ? "Error" : "错误"}: ${info.error}`);
+    lines.push(state.language === "en"
+      ? "Leave the path empty to disable custom rules."
+      : "将路径留空可关闭自定义规则。");
+    const values = await openModal({
+      title: state.language === "en" ? "Custom rules" : "自定义规则",
+      text: lines.join("\n"),
+      fields: [{
+        name: "file", label: state.language === "en" ? "Rule file" : "规则文件路径",
+        value: info.file || "", placeholder: "/path/to/rules.yar",
+      }],
+    });
+    if (!values) return;
+    try {
+      const data = await api("/api/rules", {
+        method: "POST", body: { file: values.file },
+      });
+      toast(state.language === "en"
+        ? `Rules: ${data.count || 0}` : `规则已更新: ${data.count || 0} 条`,
+        "good");
+      state.meta.rules = { file: data.file || "", count: data.count || 0 };
+    } catch (error) {
+      toast(error.message, "error", 8000);
+    }
+  }
+
+  async function uploadRulesFile(file) {
+    if (!file) return;
+    try {
+      const data = await uploadFile(file, { kind: "rules" });
+      toast(data.text || (state.language === "en"
+        ? "Rules imported" : "规则文件已导入"), "good", 6000);
+      await refreshMeta();
+    } catch (error) {
+      toast(error.message, "error", 8000);
+    }
+  }
+
+  /* --------------------------------------------------------- live capture */
+  function closeLiveDialog() {
+    $("#live-modal").classList.add("hidden");
+    if (state.liveTimer) {
+      clearInterval(state.liveTimer);
+      state.liveTimer = null;
+    }
+  }
+
+  async function openLiveDialog() {
+    if (!(state.meta.live && state.meta.live.available)) {
+      toast(state.language === "en"
+        ? "Live capture needs tshark" : "实时抓包需要 tshark", "warn");
+      return;
+    }
+    $("#live-modal").classList.remove("hidden");
+    const select = $("#live-interface");
+    select.innerHTML = '<option value="">加载中…</option>';
+    try {
+      const data = await api("/api/capture/interfaces");
+      const interfaces = data.interfaces || [];
+      select.innerHTML = interfaces.length
+        ? interfaces.map((item) =>
+          `<option value="${esc(item.name)}">${esc(item.name)}${
+            item.description ? ` — ${esc(item.description)}` : ""}</option>`).join("")
+        : '<option value="">未找到可用网卡（需要抓包权限）</option>';
+    } catch (error) {
+      select.innerHTML = `<option value="">${esc(error.message)}</option>`;
+    }
+    await refreshLiveStatus();
+    if (state.liveTimer) clearInterval(state.liveTimer);
+    state.liveTimer = setInterval(refreshLiveStatus, 1200);
+  }
+
+  async function refreshLiveStatus() {
+    const box = $("#live-status");
+    if (!box || $("#live-modal").classList.contains("hidden")) return;
+    try {
+      const data = await api("/api/capture/status");
+      const capture = data.capture || {};
+      const running = !!capture.running;
+      $("#live-start").disabled = running;
+      $("#live-stop").disabled = !running;
+      const lines = [];
+      lines.push(state.language === "en"
+        ? `Status: ${running ? "capturing" : "stopped"}`
+        : `状态: ${running ? "抓包中" : "已停止"}`);
+      if (capture.interface) {
+        lines.push(`${state.language === "en" ? "Interface" : "网卡"}: ${capture.interface}`);
+      }
+      if (capture.filter) {
+        lines.push(`${state.language === "en" ? "Filter" : "过滤器"}: ${capture.filter}`);
+      }
+      if (capture.path) {
+        lines.push(`${state.language === "en" ? "File" : "文件"}: ${capture.path}`);
+      }
+      if (running) {
+        lines.push(`${state.language === "en" ? "Elapsed" : "已抓包"}: ${
+          capture.elapsed || 0}s · ${fmtSize(capture.size || 0)}`);
+      } else if (capture.size) {
+        lines.push(`${state.language === "en" ? "Size" : "大小"}: ${fmtSize(capture.size)}`);
+      }
+      if (capture.output) lines.push(capture.output.trim().slice(-800));
+      box.textContent = lines.join("\n");
+    } catch (error) {
+      box.textContent = error.message;
+    }
+  }
+
+  async function startLiveCapture() {
+    const interfaceName = val("live-interface");
+    if (!interfaceName) {
+      toast(state.language === "en" ? "Pick an interface" : "请选择网卡", "warn");
+      return;
+    }
+    try {
+      await api("/api/capture/start", {
+        method: "POST",
+        body: {
+          interface: interfaceName,
+          filter: val("live-filter"),
+          name: val("live-name"),
+        },
+      });
+      toast(state.language === "en" ? "Capture started" : "已开始抓包", "good");
+      await refreshLiveStatus();
+    } catch (error) {
+      setText("#live-status", error.message);
+      toast(error.message, "error", 8000);
+    }
+  }
+
+  async function stopLiveCapture() {
+    try {
+      const analyze = checked("live-analyze");
+      const data = await api("/api/capture/stop", {
+        method: "POST",
+        body: {
+          analyze,
+          features: selectedFeatures(),
+          params: collectParams(),
+        },
+      });
+      const capture = data.capture || {};
+      if (capture.path) setPcap(capture.path);
+      toast(state.language === "en" ? "Capture stopped" : "抓包已停止", "good");
+      await refreshLiveStatus();
+      if (analyze && data.job) {
+        closeLiveDialog();
+        attachJob(data.job, t("status_running"));
+      }
+    } catch (error) {
+      toast(error.message, "error", 8000);
+    }
+  }
+
   /* --------------------------------------------------------------- menus */
   function bindMenus() {
     $$(".menu-btn").forEach((button) => {
@@ -1820,6 +2272,38 @@
     $("#theme-select").addEventListener("change", (event) => {
       applyTheme(event.target.value, true);
       toast(`主题已切换：${event.target.selectedOptions[0].textContent}`, "info", 1800);
+    });
+    const langSelect = $("#lang-select");
+    if (langSelect) {
+      langSelect.addEventListener("change", (event) => {
+        applyLanguage(event.target.value, true);
+        toast(state.language === "en" ? "Language: English" : "界面语言：中文",
+          "info", 1800);
+      });
+    }
+    $("#pause-btn").addEventListener("click", togglePause);
+    $("#history-compare").addEventListener("click", () => {
+      openCompareDialog().catch((error) => toast(error.message, "error", 8000));
+    });
+    $("#rules-input").addEventListener("change", (event) => {
+      uploadRulesFile(event.target.files[0]);
+      event.target.value = "";
+    });
+    $("#live-btn").addEventListener("click", () => {
+      openLiveDialog().catch((error) => toast(error.message, "error", 8000));
+    });
+    $("#live-close").addEventListener("click", closeLiveDialog);
+    $("#live-ok").addEventListener("click", closeLiveDialog);
+    $("#live-start").addEventListener("click", startLiveCapture);
+    $("#live-stop").addEventListener("click", stopLiveCapture);
+    $("#live-modal").addEventListener("click", (event) => {
+      if (event.target === $("#live-modal")) closeLiveDialog();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && state.upload) {
+        cancelUpload();
+        toast("上传已取消", "warn");
+      }
     });
 
     $("#file-input").addEventListener("change", (event) => {
@@ -2359,6 +2843,14 @@
         $("#tls-key-input").accept = state.tlsKeyKind === "key"
           ? ".key,.pem,.crt,.txt" : ".log,.txt,.key,.pem";
         $("#tls-key-input").click();
+        return;
+      }
+      if (action === "rules_settings") {
+        await openRulesDialog();
+        return;
+      }
+      if (action === "upload-rules") {
+        $("#rules-input").click();
         return;
       }
       if (["export_objects", "carve", "repair", "etl"].includes(action)) {

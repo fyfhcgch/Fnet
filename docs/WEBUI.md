@@ -21,7 +21,7 @@ python3 -m fnet capture.pcapng --features checkBox_10,http.extract
 
 ```
 ┌──────────────────────────── 顶栏 ────────────────────────────┐
-│ 品牌  全局搜索  文件/统计/设置/工具…菜单  tshark 徽标  主题选择 │
+│ 品牌 全局搜索 文件/统计/设置/工具…菜单 tshark 徽标 语言 主题 │
 ├──────────┬──────────────────────────────────────────────────┤
 │ 功能侧栏 │  日志 / 结果 / 产出 / 批量 / 图表 / 历史 / 文本 / 关于 │
 │ 13 组    │  （胶囊 Tab 切换）                                │
@@ -39,6 +39,20 @@ python3 -m fnet capture.pcapng --features checkBox_10,http.extract
 - **全局搜索**：顶栏搜索框与侧栏功能搜索双向同步，匹配功能名称、说明、分类
   与 handler；命中时自动展开分组并显示匹配数量，按 `/` 可快速聚焦。
   常用功能会出现在“最近使用”快捷标签中。
+- **语言切换**：顶栏下拉框切换中文 / English。界面外壳、功能标题、功能说明
+  与分类名使用 `title_en` / `description_en` / `name_en`，语言选择写入配置并
+  持久化；日志与报告保持中文，保证证据文本在不同语言下一致。
+- **上传进度与取消**：大文件上传使用 `XMLHttpRequest.upload.onprogress`
+  显示百分比，按 `Esc` 或再次选择文件可中止，服务端会清理未完成的临时文件。
+- **暂停 / 继续**：运行中可点击“暂停”，任务在当前功能结束后停在功能边界并
+  保留 `job.json` 中的完成状态；点击“继续”或 `--resume <job-id>` 从断点续跑。
+- **任务对比**：“任务历史”里的“对比两个任务”选择基准与目标任务，调用
+  `/api/compare` 展示新增与消失的凭据、哈希、flag 等结构化结果。
+- **自定义规则**：“设置 → 自定义规则…”导入 YARA 子集或逐行正则规则文件，
+  命中结果写入 findings 的“自定义规则”类别并进入报告；路径保存为
+  `paths.rules_file`，CLI 也可用 `--rules` 临时覆盖。
+- **实时抓包**：工具栏“实时抓包”选择网卡与 BPF 过滤器，通过 tshark 写入
+  `<cache>/live/`；停止后可直接把结果提交给当前勾选的功能进行分析。
 - **任务历史**：完成的任务写入 `~/.cache/fnet/jobs/<id>/job.json`，可在
   “任务历史”页回看报告、一键重跑或删除；进程异常退出时未完成任务标记为
   “已中断”。历史参数保存在本机缓存目录，不要在不信任的机器上分析含敏感
@@ -108,8 +122,17 @@ python3 -m fnet capture.pcapng --features checkBox_10,http.extract
 | GET | `/api/findings?job=<id>` | 结构化结果（`q`/`kind`/`level` 过滤，`format=csv` 下载） |
 | GET | `/api/packet?job=<id>&frame=N&context=2` | 数据包摘要、相邻帧与 `-V` 解码详情；`format=pcap` 下载片段 |
 | POST | `/api/analyze` | 创建分析任务 |
+| POST | `/api/jobs/<id>/pause` | 请求在当前功能结束后暂停 |
+| POST | `/api/jobs/<id>/resume` | 继续已暂停/中断的任务 |
+| GET | `/api/compare?base=<id>&target=<id>` | 对比两个任务的 findings（新增/消失/共有） |
+| GET | `/api/rules` | 当前自定义规则文件、规则数量与名称 |
+| POST | `/api/rules` | 设置自定义规则文件路径（空字符串关闭） |
+| GET | `/api/capture/interfaces` | 列出 tshark 可见网卡 |
+| GET | `/api/capture/status` | 实时抓包状态、文件、大小与耗时 |
+| POST | `/api/capture/start` | 开始抓包（`interface`、`filter`、`name`） |
+| POST | `/api/capture/stop` | 停止抓包，可选 `analyze` 直接提交分析 |
 | POST | `/api/batch` | 批量创建任务（`pcaps`、`features`、`params`、`concurrency`） |
-| POST | `/api/upload` | 上传流量包（multipart 或原始 body）；`X-Kind: keylog/key` 上传 TLS 密钥 |
+| POST | `/api/upload` | 上传流量包（multipart 流式写入临时文件，或原始 body）；`X-Kind: keylog/key` 上传 TLS 密钥，`X-Kind: rules` 导入规则文件 |
 | GET | `/api/log?job=<id>&since=N` | 仅取增量日志 |
 | GET | `/api/report?job=<id>&format=<html\|markdown>&sections=...` | 渲染可下载/内联查看的报告 |
 | GET | `/api/download?job=<id>&path=<file>` | 下载单个产出 |

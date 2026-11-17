@@ -80,7 +80,7 @@ CS 参数：`cobaltstrike_keys`（keys 文件路径）。
 | 复选框 | Handler | 功能 | 说明 |
 | --- | --- | --- | --- |
 | `checkBox_39` | `ntlm.extract` | NTLM HASH提取 | 从 HTTP/SMB/WinRM 的 NTLMSSP 消息提取账号、域、主机与 NetNTLMv1/v2 哈希，输出 hashcat/john 格式 |
-| `checkBox_45` | `kerberos.parse` | Kerberos解析破解 | 解析 AS-REQ/AS-REP/TGS-REP，生成 Kerberoast / AS-REP roast 哈希 |
+| `checkBox_45` | `kerberos.parse` | Kerberos解析破解 | 解析 AS-REQ/AS-REP/TGS-REP，生成 hashcat 18200/13100/19800/19900/19600/19700 哈希；可用 keytab、账号密码或原始密钥解密响应并解析 PAC、NTLM 哈希与用户时间线 |
 
 NTLM 输出可直接用于：
 
@@ -93,12 +93,12 @@ hashcat -m 5500 ntlm_hashes.txt wordlist.txt   # NetNTLMv1
 
 | 复选框 | Handler | 功能 | 说明 |
 | --- | --- | --- | --- |
-| `checkBox_23` | `flows.dns` | DNS流量分析 | 查询/响应、长标签与重复标签检测；自动尝试 Base64/Base32/Hex/URL 解码并找 flag |
-| `checkBox_20` | `flows.icmp` | ICMP流量分析 | ICMP 载荷、长度分布与隧道迹象 |
+| `checkBox_23` | `flows.dns` | DNS流量分析 | 查询/响应、长标签检测；按域名分块按序重组（Base64/Base32/Hex）、隧道时间线、解码数据落盘与 flag 提取 |
+| `checkBox_20` | `flows.icmp` | ICMP流量分析 | ICMP 载荷、长度分布；按源/目的/ID 重组分块隧道、时间线与解码落盘 |
 | `checkBox_19` | `flows.telnet` | Telnet流量分析 | Telnet 会话内容还原 |
 | `checkBox_27` | `flows.ftp` | FTP流量分析 | USER/PASS、命令、数据通道与传输文件 |
-| `checkBox_28` | `flows.smtp` | SMTP流量分析 | 邮件会话、发件人/收件人/正文 |
-| `checkBox_37` | `flows.mysql` | MYSQL数据分析 | 查询、登录、schema 与结果 |
+| `checkBox_28` | `flows.smtp` | SMTP流量分析 | SMTP/IMAP/POP3 命令与凭据、发件人/收件人/邮箱、MIME 头、正文与附件还原（附件落盘并计算 MD5/SHA256） |
+| `checkBox_37` | `flows.mysql` | MYSQL数据分析 | `mysql_native_password`/`caching_sha2_password` 握手认证、查询、结果集、`LOAD DATA LOCAL INFILE` 上传文件与 `LOAD_FILE()` 读取内容 |
 | `checkBox_41` | `flows.gtp` | 4G/5G通信协议分析 | GTP 隧道、TEID 与异常检测 |
 | `checkBox_35` | `flows.udp` | UDP流分析 | UDP 会话与载荷；输出可能较多 |
 | `checkBox_33` | `flows.tcp` | TCP流分析 | TCP 流重组、会话统计与内容提取 |
@@ -179,6 +179,10 @@ Wi-Fi 处理器默认只做识别和取证，不会自动跑大字典：
 - 只有传入 `wifi_crack=1`（aircrack-ng）或 `wifi_run=1`（hashcat）才真正
   执行破解；
 - 参数：`wordlist`（默认 `fnet/assets/wordlists/wifi_top2000.txt`）。
+- 已知 PSK 时传入 `--wpa-psk <口令|64 位 PMK>`：处理器用 SSID 派生 PMK、
+  由 M1/M2 nonce 派生 CCMP PTK，解密 802.11 数据帧并写出
+  `wifi_decrypted_<bssid>_<sta>.pcap`，再把明文重新送入 HTTP/DNS/认证头
+  分析，形成“破解 → 取证”的链路。
 
 ## TLS / 加密
 
@@ -233,7 +237,7 @@ WebUI 的“文件 → 导出分析报告…”可以勾选章节（`summary`、
 ## 结构化结果
 
 除了人读日志，功能处理器会把值得汇总的发现写成结构化记录：类别（flag、
-凭据、哈希、HTTP、Webshell、SQL、DNS、文件、协议等）、级别、帧号、功能、
+凭据、哈希、HTTP、Webshell、SQL、DNS、文件、协议、自定义规则等）、级别、帧号、功能、
 摘要与详情。任务结束时落盘为：
 
 - `findings.json`：完整记录，供 WebUI、脚本或二次处理使用；

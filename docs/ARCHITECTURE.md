@@ -46,20 +46,37 @@ JobManager ─────────────►  worker thread
 - **数据包定位**：`GET /api/packet` 按 `job`/`frame` 找到抓包路径（历史任务
   从 `job.json` 恢复），调用 `fnet/services.py` 取相邻帧与 `-V` 解码；导出的
   片段写到任务目录 `frames/`，因此会进入产出列表与打包 ZIP。
+- **断点与分片**：`Job` 在 `job.json` 中记录 `completed`、`feature_status`、
+  `succeeded`、`failed`，任务只在功能边界暂停；`/api/jobs/<id>/pause` 设置
+  `pause_event`，`resume()` 从下一个未完成功能继续。注册表中 `shardable=True`
+  的无状态功能可用 `--shards N` 按帧区间切成临时 pcapng，`FeatureContext`
+  通过 `frame_offset` 把分片帧号还原为原始帧号；流重组/解密类功能保持整包
+  执行，避免跨分片状态丢失。
+- **自定义规则**：`fnet/utils/rules.py` 只依赖标准库，解析 YARA 子集与逐行
+  正则；`JobManager._apply_rules()` 在功能结束后扫描 pcap 载荷，把命中写入
+  结构化结果的 `rule` 类别。未显式传 `--rules` 时回退到配置
+  `paths.rules_file`，因此 WebUI 导入的规则对后续任务持续生效。
+- **流式上传**：`/api/upload` 的 multipart 分支边读边写临时文件
+  （`_MultipartStream`/`_stream_body`），内存占用与文件大小无关；结束后校验
+  后缀并原子替换到 `<cache>/uploads/`，异常路径统一删除临时文件。
+- **实时抓包**：`fnet/live.py` 管理单个 tshark 子进程，按 `tshark -D` 解析
+  网卡，输出到 `<cache>/live/`；`FnetApp.live` 由 WebUI 的
+  `/api/capture/*` 路由驱动，服务退出时 `serve()` 调用 `shutdown()` 清理进程。
 
 ## 目录与分层
 
 | 层 | 位置 | 职责 |
 | --- | --- | --- |
-| 入口 | `fnet/__main__.py`, `fnet/cli.py` | 参数解析、启动 WebUI、无头分析 |
+| 入口 | `fnet/__main__.py`, `fnet/cli.py` | 参数解析、启动 WebUI、无头分析、JSON 输出、续跑与任务对比 |
 | 组装 | `fnet/app.py` | `Config`、`ToolBox`、`JobManager`、`PluginManager`、`FnetApp` |
 | 前端 | `fnet/webui/` | HTTP 路由、静态页面、WebUI 资源 |
-| 任务 | `fnet/jobs.py` | 任务生命周期、进度、日志、报告、取消 |
+| 任务 | `fnet/jobs.py` | 任务生命周期、进度、日志、报告、取消、断点/分片、对比 |
+| 实时抓包 | `fnet/live.py` | tshark 网卡枚举与单实例抓包控制 |
 | 结果 | `fnet/findings.py` | 结构化结果的格式、筛选、CSV 导出 |
 | 报告 | `fnet/report.py` | Markdown/HTML 报告渲染、章节选择、旧报告反解 |
 | 功能 | `fnet/features/` | 37 个分析功能，按主题拆文件 |
 | 外部工具 | `fnet/tools/runner.py` | 工具发现、子进程、tshark 字段校验 |
-| 工具库 | `fnet/utils/` | 编解码、AES/RC4/MD4/RSA/GCM、pcap 辅助、TCP 流重组、RESP/PostgreSQL/BSON-MongoDB/WebSocket 解析 |
+| 工具库 | `fnet/utils/` | 编解码、AES/RC4/MD4/RSA/GCM、pcap 辅助、TCP 流重组、RESP/PostgreSQL/BSON-MongoDB/WebSocket/MySQL 解析、Kerberos 原语、DNS/ICMP 隧道、邮件 MIME、WPA CCMP 解密、规则解析 |
 | 配置 | `fnet/config.py` | `config.ini` 默认值、读写、最近文件 |
 
 ## 功能注册表
@@ -102,6 +119,10 @@ Feature("checkBox_10", "关键字检测", "text_scan.keyword_scan", "text",
 6. 前端轮询到终态后展示“分析结果”表格与产出列表，可排序、筛选、复制或
    导出 CSV，也可单文件下载或打包 ZIP。
 
+无头模式复用同一内核：`-C` 建任务并流式打印日志，`--json` 在结束后把任务、
+findings、统计与产出序列化为 JSON；`--resume`/`--compare` 直接调用
+`JobManager.resume()` / `compare()`，因此 CLI、WebUI 与测试看到的结果一致。
+
 ## 配置与路径
 
 - 静态资源：`fnet/assets/`（字典、Shiro 密钥、图标、默认 `config.ini`）。
@@ -127,3 +148,10 @@ Feature("checkBox_10", "关键字检测", "text_scan.keyword_scan", "text",
 - **API 冒烟**：启动临时服务，验证 health/meta/upload/analyze/log/download。
 - **抓包**：`tests/data/*.pcap` 由 `scripts/make_samples.py` 生成，断言
   关键字、HTTP 凭据、Webshell、NTLM、DNS、Modbus/MQTT 等结果。
+- **路线图回归**：`tests/test_roadmap.py` 覆盖流式上传、规则导入与执行、
+  暂停/继续、任务对比、CLI `--json`/`--compare`、实时抓包网卡解析，以及
+  DNS/ICMP 隧道、SMTP、MySQL、Kerberos、WPA 的 handler 集成。
+- **性能**：`scripts/bench.py` 生成 10/100/1000 MB 抓包，按功能记录耗时与
+  峰值 RSS，并写入 [`docs/PERFORMANCE.md`](PERFORMANCE.md)。
+- **CI**：GitHub Actions 在 Python 3.10–3.13 上安装 tshark，运行全量
+  unittest 与 `node --check fnet/webui/static/app.js`。

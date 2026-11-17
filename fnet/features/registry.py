@@ -149,8 +149,7 @@ FEATURES: list[Feature] = [
             "导出 HTTP 传输的文件，识别文件类型并计算 MD5",
             title_en="HTTP file analysis",
             description_en="Carve files transferred over HTTP, identify their "
-                           "type and compute MD5 hashes",
-            shardable=True),
+                           "type and compute MD5 hashes"),
     Feature("checkBox_42", "shiro流量解密", "webshell.shiro", "webshell",
             "Shiro rememberMe 反序列化流量解密（自动识别密钥 / 手动密钥）",
             title_en="Shiro decryption",
@@ -160,20 +159,17 @@ FEATURES: list[Feature] = [
             "根据界面上的正则与成功条件还原布尔/时间盲注结果",
             title_en="Blind SQL injection",
             description_en="Reconstruct boolean/time based blind SQL injection "
-                           "results from configurable patterns",
-            shardable=True),
+                           "results from configurable patterns"),
     Feature("checkBox_46", "SQL二分盲注增强", "sql.binary", "sql",
             "二分法盲注的增强还原（按字符区间推断）",
             title_en="Binary-search blind SQLi",
             description_en="Enhanced reconstruction of binary-search blind SQL "
-                           "injection (character range inference)",
-            shardable=True),
+                           "injection (character range inference)"),
     Feature("checkBox_34", "SQL盲注日志分析", "sql.log_analysis", "sql",
             "从已保存的盲注日志推断注入内容",
             title_en="Blind SQLi log analysis",
             description_en="Infer injected data from a previously saved blind "
-                           "SQL injection log",
-            shardable=True),
+                           "SQL injection log"),
     Feature("checkBox_15", "Cobalt Strike流量分析", "cs.analyze", "c2",
             "CS beacon 元数据/任务解密（需要 .cobaltstrike.beacon_keys）",
             False, ("cryptography",),
@@ -204,7 +200,7 @@ FEATURES: list[Feature] = [
             title_en="ICMP analysis",
             description_en="Hidden data in ICMP payloads and chunked tunnel "
                            "reassembly",
-            shardable=True),
+),
     Feature("checkBox_19", "Telnet流量分析", "flows.telnet", "flow",
             "Telnet 会话内容还原",
             title_en="Telnet analysis",
@@ -220,13 +216,13 @@ FEATURES: list[Feature] = [
             title_en="MySQL analysis",
             description_en="MySQL handshake authentication, queries, result "
                            "sets and LOAD DATA/LOAD_FILE contents",
-            shardable=True),
+),
     Feature("checkBox_28", "SMTP流量分析", "flows.smtp", "flow",
             "SMTP MIME 与附件还原、投递链；同时解析 IMAP / POP3 命令与附件",
             title_en="Mail protocol analysis",
             description_en="SMTP MIME/attachment and delivery chain recovery "
                            "plus IMAP/POP3 commands and attachments",
-            shardable=True),
+),
     Feature("checkBox_23", "DNS流量分析", "flows.dns", "flow",
             "DNS 查询与隐蔽隧道检测：分块按序重组（base32/base64/hex）、"
             "隧道时间线与解码数据落盘",
@@ -234,7 +230,7 @@ FEATURES: list[Feature] = [
             description_en="DNS queries and covert tunnel detection with "
                            "ordered base32/base64/hex chunk reassembly, "
                            "timeline and decoded output",
-            shardable=True),
+),
     Feature("checkBox_41", "4G/5G通信协议分析", "flows.gtp", "flow",
             "GTP 隧道与错误 TEID 检测",
             title_en="4G/5G (GTP) analysis",

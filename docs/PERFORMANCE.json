@@ -1,0 +1,79 @@
+{
+  "environment": {
+    "fnet": "2.19.0",
+    "python": "3.14.10",
+    "platform": "Linux-7.3.4-zen2-2-zen-x86_64-with-glibc2.44",
+    "cpu_count": "24",
+    "tshark": "TShark (Wireshark) 4.7.4.",
+    "generated": "2026-11-17 11:34:46"
+  },
+  "command": "python3 scripts/bench.py --sizes 10,100,1000 --features default",
+  "results": [
+    {
+      "feature": "checkBox_10",
+      "status": "done",
+      "error": "",
+      "seconds": 1.851,
+      "rss_mb": 254.9,
+      "children_rss_mb": 161.4,
+      "findings": 210,
+      "size": 10,
+      "size_bytes": 10485841
+    },
+    {
+      "feature": "checkBox_30",
+      "status": "done",
+      "error": "",
+      "seconds": 0.524,
+      "rss_mb": 150.3,
+      "children_rss_mb": 155.7,
+      "findings": 0,
+      "size": 10,
+      "size_bytes": 10485841
+    },
+    {
+      "feature": "checkBox_10",
+      "status": "done",
+      "error": "",
+      "seconds": 4.129,
+      "rss_mb": 150.5,
+      "children_rss_mb": 152.0,
+      "findings": 0,
+      "size": 100,
+      "size_bytes": 104858628
+    },
+    {
+      "feature": "checkBox_30",
+      "status": "done",
+      "error": "",
+      "seconds": 1.51,
+      "rss_mb": 150.1,
+      "children_rss_mb": 309.9,
+      "findings": 0,
+      "size": 100,
+      "size_bytes": 104858628
+    },
+    {
+      "feature": "checkBox_10",
+      "status": "done",
+      "error": "",
+      "seconds": 36.956,
+      "rss_mb": 150.4,
+      "children_rss_mb": 152.1,
+      "findings": 0,
+      "size": 1000,
+      "size_bytes": 1048576532
+    },
+    {
+      "feature": "checkBox_30",
+      "status": "done",
+      "error": "",
+      "seconds": 8.516,
+      "rss_mb": 149.8,
+      "children_rss_mb": 1082.5,
+      "findings": 0,
+      "size": 1000,
+      "size_bytes": 1048576532
+    }
+  ]
+}

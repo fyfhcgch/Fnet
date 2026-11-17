@@ -12,6 +12,7 @@ Two modes:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -40,6 +41,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--all", action="store_true", help="运行全部 37 个功能")
     parser.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
                         help="传给分析功能的额外参数，可重复")
+    parser.add_argument("--json", action="store_true",
+                        help="只向 stdout 输出 JSON（任务、结构化结果与统计）")
+    parser.add_argument("--rules", default="",
+                        help="导入正则/YARA 子集规则文件，命中写入 findings")
+    parser.add_argument("--shards", type=int, default=1,
+                        help="无状态功能按 N 个帧区间分片执行（默认 1）")
+    parser.add_argument("--resume", default="", metavar="JOB_ID",
+                        help="继续一个已暂停/中断的任务")
+    parser.add_argument("--compare", nargs=2, default=None,
+                        metavar=("BASE", "TARGET"),
+                        help="对比两个任务的 findings（输出新增/消失项）")
+    parser.add_argument("--wpa-psk", default="",
+                        help="已知 WPA/WPA2 PSK，用于解密 802.11 数据帧")
+    parser.add_argument("--keytab", default="",
+                        help="Kerberos keytab，用于解密 AS/TGS 响应与 PAC")
+    parser.add_argument("--kerberos-password", default="",
+                        help="Kerberos 账号密码，用于派生密钥并解密响应")
+    parser.add_argument("--kerberos-key", default="",
+                        help="Kerberos 原始密钥（hex），优先级最高")
     parser.add_argument("--list-features", action="store_true", help="列出全部功能后退出")
     parser.add_argument("--list-tools", action="store_true", help="列出依赖的外部工具后退出")
     parser.add_argument("--doctor", action="store_true", help="检查运行环境后退出")
@@ -107,7 +127,48 @@ def select_features(spec: str, run_all: bool) -> list[str]:
     return selected
 
 
+def _collect_params(args) -> dict:
+    params = parse_params(args.param)
+    if args.rules:
+        params["rules"] = args.rules
+    if args.wpa_psk:
+        params["wifi_psk"] = args.wpa_psk
+    if args.keytab:
+        params["kerberos_keytab"] = args.keytab
+    if args.kerberos_password:
+        params["kerberos_password"] = args.kerberos_password
+    if args.kerberos_key:
+        params["kerberos_key"] = args.kerberos_key
+    return params
+
+
+def _wait_for_job(job, runtime, json_mode: bool = False) -> int:
+    cursor = 0
+    try:
+        while True:
+            for record in job.log.records_since(cursor):
+                if not json_mode:
+                    print(record.line, flush=True)
+                cursor = record.seq
+            if job.status in ("done", "error", "cancelled", "paused"):
+                for record in job.log.records_since(cursor):
+                    if not json_mode:
+                        print(record.line, flush=True)
+                break
+            time.sleep(0.12)
+    except KeyboardInterrupt:
+        print("\n收到中断，正在取消任务…", file=sys.stderr)
+        runtime.jobs.cancel(job.id)
+        if job.thread:
+            job.thread.join(timeout=10)
+        return 130
+    return 0
+
+
 def run_headless(args, runtime) -> int:
+    if not args.capture:
+        print("需要指定流量包", file=sys.stderr)
+        return 2
     capture = Path(args.capture).expanduser()
     if not capture.is_file():
         print(f"流量包不存在: {capture}", file=sys.stderr)
@@ -116,49 +177,99 @@ def run_headless(args, runtime) -> int:
     if not checkboxes:
         print("没有选择任何功能", file=sys.stderr)
         return 2
-    params = parse_params(args.param)
+    params = _collect_params(args)
     try:
-        job = runtime.jobs.submit(str(capture), checkboxes, params)
+        job = runtime.jobs.submit(str(capture), checkboxes, params,
+                                  shards=max(1, args.shards))
     except (ValueError, FileNotFoundError) as exc:
         print(f"无法创建任务: {exc}", file=sys.stderr)
         return 2
 
-    print(f"任务 {job.id} | {capture.name} | {len(job.features)} 个功能")
-    print(f"输出目录: {job.output_dir}")
-    print("-" * 78)
-    cursor = 0
-    try:
-        while True:
-            for record in job.log.records_since(cursor):
-                print(record.line, flush=True)
-                cursor = record.seq
-            if job.status in ("done", "error", "cancelled"):
-                for record in job.log.records_since(cursor):
-                    print(record.line, flush=True)
-                break
-            time.sleep(0.12)
-    except KeyboardInterrupt:
-        print("\n收到中断，正在取消任务…", file=sys.stderr)
-        runtime.jobs.cancel(job.id)
-        job.thread.join(timeout=10) if job.thread else None
-        return 130
+    if not args.json:
+        print(f"任务 {job.id} | {capture.name} | {len(job.features)} 个功能")
+        print(f"输出目录: {job.output_dir}")
+        print("-" * 78)
+    code = _wait_for_job(job, runtime, json_mode=args.json)
+    if code:
+        return code
 
-    print("-" * 78)
-    for label, path in (("报告", job.report_path),
-                        ("Markdown 报告", job.report_markdown_path),
-                        ("HTML 报告", job.report_html_path),
-                        ("结构化结果", job.findings_path),
-                        ("结果 CSV", job.findings_csv_path)):
-        if path:
-            print(f"{label}: {path}")
-    if job.findings:
-        print(f"共记录 {len(job.findings)} 条结构化结果"
-              "（WebUI 的“分析结果”页可排序筛选）")
+    if args.json:
+        found = runtime.jobs.findings_for(job.id, limit=50_000) or {}
+        payload = {
+            "ok": job.status in ("done", "cancelled"),
+            "job": job.as_dict(),
+            "findings": found.get("findings") or [],
+            "count": found.get("total", len(job.findings)),
+            "kinds": found.get("kinds") or {},
+            "artifacts": runtime.jobs.artifacts(job),
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    else:
+        print("-" * 78)
+        for label, path in (("报告", job.report_path),
+                            ("Markdown 报告", job.report_markdown_path),
+                            ("HTML 报告", job.report_html_path),
+                            ("结构化结果", job.findings_path),
+                            ("结果 CSV", job.findings_csv_path)):
+            if path:
+                print(f"{label}: {path}")
+        if job.findings:
+            print(f"共记录 {len(job.findings)} 条结构化结果"
+                  "（WebUI 的“分析结果”页可排序筛选）")
     if job.status == "done":
         return 0
-    if job.status == "cancelled":
+    if job.status in ("cancelled", "paused"):
         return 130
     return 1
+
+
+def run_resume(args, runtime) -> int:
+    job = runtime.jobs.resume(args.resume)
+    if job is None:
+        print(f"任务不可恢复或不存在: {args.resume}", file=sys.stderr)
+        return 2
+    if not args.json:
+        print(f"继续任务 {job.id} | {Path(job.pcap).name} | "
+              f"已完成 {len(job.completed)}/{len(job.features)}")
+        print("-" * 78)
+    code = _wait_for_job(job, runtime, json_mode=args.json)
+    if code:
+        return code
+    if args.json:
+        found = runtime.jobs.findings_for(job.id, limit=50_000) or {}
+        print(json.dumps({
+            "ok": job.status in ("done", "cancelled"),
+            "job": job.as_dict(),
+            "findings": found.get("findings") or [],
+            "count": found.get("total", len(job.findings)),
+            "kinds": found.get("kinds") or {},
+        }, ensure_ascii=False, indent=2, default=str))
+    return 0 if job.status == "done" else 1
+
+
+def run_compare(args, runtime) -> int:
+    base, target = args.compare
+    result = runtime.jobs.compare(base, target)
+    if result is None:
+        print("任务不存在", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({"ok": True, **result}, ensure_ascii=False,
+                         indent=2, default=str))
+        return 0
+    counts = result["counts"]
+    print(f"基准 {base} ({result.get('base_name') or '?'})")
+    print(f"对比 {target} ({result.get('target_name') or '?'})")
+    print(f"新增 {counts['added']} 条，消失 {counts['removed']} 条，"
+          f"共有 {counts['common']} 条")
+    for label, items in (("新增", result["added"]),
+                         ("消失", result["removed"])):
+        if not items:
+            continue
+        print(f"\n== {label} ==")
+        for item in items[:100]:
+            print(f"  [{item.get('kind')}] {item.get('summary')}")
+    return 0
 
 
 def serve(args, runtime) -> int:
@@ -226,6 +337,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cli:
         return run_headless(args, runtime)
+    if args.resume:
+        return run_resume(args, runtime)
+    if args.compare:
+        return run_compare(args, runtime)
     return serve(args, runtime)
 
 
