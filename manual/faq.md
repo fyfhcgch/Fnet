@@ -48,7 +48,7 @@ python3 -m fnet --port 9000
 editcap -c 200000 big.pcapng part.pcapng
 ```
 
-流式上传与断点续跑在路线图中（见仓库 `TODO.md`）。
+上传大小可以在 `config.ini` 的 `max_upload_mb` 中调整；超大抓包建议先切分再分析。
 
 ### 分析很慢
 
@@ -60,7 +60,7 @@ editcap -c 200000 big.pcapng part.pcapng
 ### 想清空历史与缓存
 
 任务产出在 `~/.cache/fnet/jobs/`，可以按任务目录删除；删除前先确认没有要保留的报告。
-用 `FNET_HOME=/tmp/fnet-dev` 可以把开发与日常数据分开。
+用 `FNET_HOME=/tmp/fnet-scratch` 可以把临时分析与日常数据分开。
 
 ## 解密类功能
 
@@ -127,11 +127,12 @@ GFM 表格的渲染器。报告内容来自抓包，分享前请先脱敏。
 不会。Fnet 只读取协议字段，所有解析由 `tshark` 完成；Webshell 与内存马分析只做
 解密和反编译，不运行样本。
 
-### 发现安全漏洞怎么反馈
+### 遇到问题怎么反馈
 
-请不要公开提交 Issue，按 [SECURITY.md]({{ '/docs/SECURITY.html' | relative_url }}) 中的方式私下联系维护者。
+欢迎在 [GitHub Issues](https://github.com/fyfhcgch/Fnet/issues) 提问或提交功能建议。提问时请附上：
 
-## 还想要的功能
+- Fnet 版本（`python3 -m fnet --version`）
+- 操作系统与 `tshark -v` 输出
+- 出错的功能、关键日志行或脱敏后的截图
 
-实时抓包、英文界面、任务对比等已在 `TODO.md` 中列出。新增协议或功能的步骤见
-[CONTRIBUTING.md](https://github.com/fyfhcgch/Fnet/blob/master/CONTRIBUTING.md)。
+请勿上传包含真实凭据、隐私或未授权流量的抓包；需要提供样例时先脱敏或使用自己构造的小包。

@@ -1,8 +1,8 @@
 ---
 layout: page
-title: 使用手册
+title: 用户教程
 permalink: /manual/
-description: Fnet 使用手册：安装、WebUI、功能清单、命令行与常见问题。
+description: Fnet 用户教程：从安装、实战分析到 WebUI、功能与命令行。
 ---
 
 Fnet 有两条使用路径：**WebUI** 适合交互式分析、看图表和整理报告，**命令行**适合
@@ -12,19 +12,25 @@ Fnet 有两条使用路径：**WebUI** 适合交互式分析、看图表和整�
 
 | 你的情况 | 建议阅读 |
 | --- | --- |
-| 第一次使用 | [安装与启动]({{ '/manual/install/' | relative_url }}) → [WebUI 使用]({{ '/manual/webui/' | relative_url }}) |
-| 手上有一个 pcap，想知道该勾哪些功能 | [功能清单]({{ '/manual/features/' | relative_url }}) |
-| 想写脚本批量跑赛题 | [命令行]({{ '/manual/cli/' | relative_url }}) |
+| 第一次使用 | [安装与启动]({{ '/manual/install/' | relative_url }}) → [实战教程]({{ '/manual/tutorial/' | relative_url }}) |
+| 手上有一个 pcap，想直接跟着做 | [实战教程]({{ '/manual/tutorial/' | relative_url }}) |
+| 想按题型查该勾哪些功能 | [功能清单]({{ '/manual/features/' | relative_url }}) |
+| 想批量跑赛题或写脚本 | [命令行]({{ '/manual/cli/' | relative_url }}) |
 | 跑不出结果、报错、解密失败 | [常见问题]({{ '/manual/faq/' | relative_url }}) |
-| 想加一个协议或功能 | [CONTRIBUTING.md](https://github.com/fyfhcgch/Fnet/blob/master/CONTRIBUTING.md) |
 
-## 手册目录
+## 教程目录
 
 <ul class="manual-list">
   <li>
     <a href="{{ '/manual/install/' | relative_url }}">
       <strong>安装与启动</strong>
       <span>系统依赖、可选工具、配置目录、第一次分析</span>
+    </a>
+  </li>
+  <li>
+    <a href="{{ '/manual/tutorial/' | relative_url }}">
+      <strong>实战教程</strong>
+      <span>找 flag、Web 题、SQL 盲注、TLS 解密、凭据与批量复盘</span>
     </a>
   </li>
   <li>
@@ -53,11 +59,7 @@ Fnet 有两条使用路径：**WebUI** 适合交互式分析、看图表和整�
   </li>
 </ul>
 
-## 深入文档
+## 建议阅读顺序
 
-手册讲“怎么用”，下面这些文档讲“为什么这样实现”，主要面向二次开发：
-
-- [功能规格与参数]({{ '/docs/FEATURES.html' | relative_url }})：每个功能的输入、输出文件与可选参数
-- [WebUI 与 HTTP API]({{ '/docs/WEBUI.html' | relative_url }})：接口、批量任务、报告与远程访问
-- [架构说明]({{ '/docs/ARCHITECTURE.html' | relative_url }})：对象图、任务模型与扩展点
-- [安全说明]({{ '/docs/SECURITY.html' | relative_url }})：威胁模型与漏洞反馈方式
+第一次使用按 **安装与启动 → 实战教程 → WebUI 使用** 的顺序走一遍；功能清单和命令行
+可以当作需要时再翻的参考。所有页面都只讲怎么用 Fnet 完成分析。

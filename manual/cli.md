@@ -6,7 +6,8 @@ description: Fnet 无界面用法：参数、功能选择、参数传递、批�
 ---
 
 命令行和 WebUI 共用同一套分析与产出。加 `-C` 就不会启动 WebUI，日志直接打印到
-终端，适合脚本、CI 和远端机器。
+终端，适合批量处理、脚本和没有图形界面的机器。第一次使用建议先跟着
+[实战教程]({{ '/manual/tutorial/' | relative_url }})走一遍。
 
 ## 基本用法
 
@@ -39,7 +40,7 @@ HTML 报告: .../report.html
 | --- | --- |
 | `capture` | 要分析的 pcap / pcapng / cap / dmp / etl 文件 |
 | `-C`, `--cli` | 不启动 WebUI，直接在终端运行 |
-| `--features a,b` | 逗号分隔的功能，可写复选框编号或 handler |
+| `--features a,b` | 逗号分隔的功能，可写复选框编号或功能名 |
 | `--all` | 运行全部 37 个功能 |
 | `--param KEY=VALUE` | 传给功能的参数，可重复 |
 | `--config PATH` | 使用指定的 `config.ini` |
@@ -53,9 +54,9 @@ HTML 报告: .../report.html
 `--features` 支持两种写法，混用也可以：
 
 - 复选框编号：`checkBox_10`、`checkBox_24`
-- handler：`http.extract`、`tls.decrypt`、`protocols.smb2`
+- 功能名：`http.extract`、`tls.decrypt`、`protocols.smb2`
 
-带点的 handler 即使没有复选框也能直接运行，例如
+带点的功能名即使没有复选框也能直接运行，例如
 `--features protocols.redis,forensics.correlate`。
 
 ## 传递功能参数

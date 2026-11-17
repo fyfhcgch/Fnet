@@ -12,7 +12,7 @@ description: 安装 Fnet：tshark 依赖、可选工具、启动 WebUI、配置�
 | Python | 3.10 及以上 |
 | 协议解析 | `tshark`（Wireshark 自带） |
 | 第三方 Python 包 | 运行时**不需要**，全部使用标准库 |
-| 磁盘 | 约 10 MB 源码；分析产出写入用户缓存目录 |
+| 磁盘 | 约 10 MB 程序文件；分析产出写入用户缓存目录 |
 
 `tshark` 是唯一必需的依赖，Fnet 自己不解析协议，只负责组织分析流程与呈现结果。
 
@@ -116,7 +116,7 @@ python3 -m fnet -C capture.pcapng --features checkBox_10,webshell.decrypt
 用环境变量隔离：
 
 ```bash
-FNET_HOME=/tmp/fnet-dev python3 -m fnet --no-browser
+FNET_HOME=/tmp/fnet-scratch python3 -m fnet --no-browser
 ```
 
 ## 常用配置项

@@ -313,3 +313,20 @@ code {
 .highlighter-rouge .highlight {
   background: #f7f2ee;
 }
+
+/* 教程入口卡片 */
+a.card {
+  display: block;
+  color: inherit;
+  text-decoration: none;
+}
+
+a.card:hover {
+  border-color: #dcbcb6;
+  background: #fffaf8;
+  text-decoration: none;
+}
+
+.tutorial-grid {
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+}

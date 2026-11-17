@@ -12,14 +12,15 @@ description: 把 pcap 拖进浏览器，勾选需要的检查项，得到 flag�
     解密后的流量。全部在本机运行，不需要第三方 Python 包，协议解析交给 tshark。
   </p>
   <p class="cta-row">
-    <a class="btn" href="{{ '/manual/install/' | relative_url }}">三分钟上手</a>
+    <a class="btn" href="{{ '/manual/tutorial/' | relative_url }}">开始实战</a>
+    <a class="btn ghost" href="{{ '/manual/install/' | relative_url }}">安装与启动</a>
     <a class="btn ghost" href="{{ '/manual/features/' | relative_url }}">浏览 37 项功能</a>
     <a class="btn ghost" href="https://github.com/fyfhcgch/Fnet">GitHub 仓库</a>
   </p>
 </div>
 
 <p class="shot">
-  <img src="{{ '/docs/images/webui.webp' | relative_url }}"
+  <img src="{{ '/assets/images/webui.webp' | relative_url }}"
        alt="Fnet WebUI：左侧 37 个功能的勾选面板，右侧分析结果表格">
 </p>
 <p class="shot-caption">真实界面截图：暖夜主题下的分析结果页</p>
@@ -75,6 +76,29 @@ python3 -m fnet</code></pre>
   <code>python3 -m fnet -C capture.pcapng --features checkBox_10,webshell.decrypt</code>，
   结果与报告路径会直接打印在终端。详见<a href="{{ '/manual/cli/' | relative_url }}">命令行手册</a>。
 </p>
+
+## 跟着实战走
+
+不知道先勾什么？按你的题型直接进入对应教程：
+
+<div class="feature-grid tutorial-grid">
+  <a class="card tutorial-card" href="{{ '/manual/tutorial/#find-flag' | relative_url }}">
+    <h3>找 flag</h3>
+    <p>默认两项、结果筛选、帧定位与深度扫描。</p>
+  </a>
+  <a class="card tutorial-card" href="{{ '/manual/tutorial/#web' | relative_url }}">
+    <h3>Web / Webshell</h3>
+    <p>HTTP 提取、下载文件、冰蝎哥斯拉与 Shiro 解密。</p>
+  </a>
+  <a class="card tutorial-card" href="{{ '/manual/tutorial/#tls' | relative_url }}">
+    <h3>TLS 解密</h3>
+    <p>上传 keylog 或私钥，继续还原 HTTP/2 与明文凭据。</p>
+  </a>
+  <a class="card tutorial-card" href="{{ '/manual/tutorial/#credentials' | relative_url }}">
+    <h3>凭据提取</h3>
+    <p>NTLM、Kerberos、WinRM 与跨协议账号关联。</p>
+  </a>
+</div>
 
 ## 功能一览
 
@@ -150,13 +174,19 @@ python3 -m fnet</code></pre>
 
 <a class="btn ghost" href="{{ '/manual/features/' | relative_url }}">查看完整功能清单与依赖</a>
 
-## 手册
+## 用户教程
 
 <ul class="manual-list">
   <li>
     <a href="{{ '/manual/install/' | relative_url }}">
       <strong>安装与启动</strong>
       <span>系统依赖、可选工具、配置目录与第一次分析</span>
+    </a>
+  </li>
+  <li>
+    <a href="{{ '/manual/tutorial/' | relative_url }}">
+      <strong>实战教程</strong>
+      <span>找 flag、Web 题、TLS 解密、凭据提取与批量复盘</span>
     </a>
   </li>
   <li>
@@ -181,12 +211,6 @@ python3 -m fnet</code></pre>
     <a href="{{ '/manual/faq/' | relative_url }}">
       <strong>常见问题</strong>
       <span>tshark 缺失、解密无结果、大文件与内存</span>
-    </a>
-  </li>
-  <li>
-    <a href="https://github.com/fyfhcgch/Fnet/blob/master/CONTRIBUTING.md">
-      <strong>参与开发</strong>
-      <span>新增功能、测试要求与提交规范</span>
     </a>
   </li>
 </ul>

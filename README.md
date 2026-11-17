@@ -14,7 +14,7 @@ point it at a pcap/pcapng, tick the checks you need, and read flags, credentials
 reassembled files and decrypted traffic in a local WebUI or from the CLI. Protocol
 parsing is delegated to `tshark`, so there are no Python dependencies to install.
 
-在线手册与功能介绍：<https://fyfhcgch.github.io/Fnet/>
+在线教程与功能介绍：<https://fyfhcgch.github.io/Fnet/>
 
 ## 快速开始
 

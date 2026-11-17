@@ -17,13 +17,15 @@ relative_links:
 header_pages:
   - manual/index.md
   - manual/install.md
+  - manual/tutorial.md
   - manual/webui.md
   - manual/features.md
   - manual/cli.md
   - manual/faq.md
 
-# 站点只发布手册与文档，源码、测试与仓库治理文件不参与构建
+# 站点只发布用户手册；源码、测试、开发文档与仓库治理文件不参与构建
 exclude:
+  - docs
   - fnet
   - tests
   - scripts

@@ -119,11 +119,12 @@ QUIC 识别与解密由该项自动调用（`tls.quic`），不需要额外勾�
 | --- | --- | --- |
 | RDP流量重放 | `checkBox_47` | 用私钥或 keylog 解密 RDP 会话并生成重放文件，需要 `pyrdp-player` |
 
-## 附加深度处理器
+## 高级功能（命令行调用）
 
-这些处理器没有复选框，用 `--features` 或“专项功能”菜单调用：
+这些功能没有复选框，适合进阶分析；可以在“专项功能”菜单里运行，也可以在命令行用
+`--features` 直接调用：
 
-| Handler | 用途 |
+| 功能名 | 用途 |
 | --- | --- |
 | `protocols.credentials` | 依次运行 Redis、MongoDB、PostgreSQL、LDAP、SMB2、WebSocket、HTTP/2 提取器 |
 | `protocols.detect` | 非默认端口的协议特征探测，输出 `protocol_detection.csv` |
@@ -142,7 +143,13 @@ python3 -m fnet -C capture.pcapng --features protocols.credentials
 python3 -m fnet -C capture.pcapng --features text_scan.deep
 ```
 
-完整参数、输出文件名与字段说明见 [功能规格]({{ '/docs/FEATURES.html' | relative_url }})。
+这些功能也可以和复选框功能写在同一次任务里，例如：
+
+```bash
+python3 -m fnet -C capture.pcapng --features checkBox_30,protocols.credentials
+```
+
+参数怎么传、怎么批量跑，见[命令行]({{ '/manual/cli/' | relative_url }})。
 
 ## 选择建议
 
