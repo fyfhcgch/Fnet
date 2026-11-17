@@ -54,7 +54,7 @@ Webshell 解密（冰蝎 3.x/4.x、哥斯拉、蚁剑、菜刀、内存马）没
 | 功能 | 复选框 | 说明 |
 | --- | --- | --- |
 | NTLM HASH提取 | `checkBox_39` | 从 NTLMSSP 认证中提取 NetNTLM 哈希（hashcat 格式） |
-| Kerberos解析破解 | `checkBox_45` | 提取 AS-REQ/AS-REP/TGS-REP，生成 hashcat 13100/18200 哈希 |
+| Kerberos解析破解 | `checkBox_45` | 提取 AS-REQ/AS-REP/TGS-REP，生成 18200/13100/19800/19900 哈希；可用 keytab、账号口令或原始密钥解密响应（19600/19700），解析 PAC、NTLM 哈希与用户时间线 |
 
 ## 协议流量（10）
 
@@ -62,12 +62,12 @@ Webshell 解密（冰蝎 3.x/4.x、哥斯拉、蚁剑、菜刀、内存马）没
 | --- | --- | --- |
 | TCP流分析 | `checkBox_33` | TCP 流重组、会话统计与内容提取（输出可能较多） |
 | UDP流分析 | `checkBox_35` | UDP 会话与载荷提取 |
-| DNS流量分析 | `checkBox_23` | 查询记录、长域名告警与标签解码（疑似 DNS 隧道） |
-| ICMP流量分析 | `checkBox_20` | ICMP 载荷中的隐藏数据与长度异常 |
+| DNS流量分析 | `checkBox_23` | 查询记录、长域名检测；按域名分块按序重组（Base64/Base32/Hex），输出隧道时间线与解码文件 |
+| ICMP流量分析 | `checkBox_20` | ICMP 载荷中的隐藏数据；按源/目的/ID 重组分块隧道、时间线与解码落盘 |
 | FTP流量分析 | `checkBox_27` | 账号密码、命令与传输的文件 |
-| SMTP流量分析 | `checkBox_28` | 邮件会话、发件人 / 收件人与正文 |
+| SMTP流量分析 | `checkBox_28` | SMTP/IMAP/POP3 命令与凭据、发件人 / 收件人 / 邮箱、MIME 头、正文与附件还原（附件落盘并计算 MD5/SHA256） |
 | Telnet流量分析 | `checkBox_19` | Telnet 会话内容还原 |
-| MYSQL数据分析 | `checkBox_37` | 查询、登录信息与 schema |
+| MYSQL数据分析 | `checkBox_37` | `mysql_native_password` / `caching_sha2_password` 握手、查询、结果集、`LOAD DATA LOCAL INFILE` 上传文件与 `LOAD_FILE()` 读取内容 |
 | ARP协议分析 | `checkBox_44` | IP/MAC 冲突、免费 ARP 与异常字段 |
 | 4G/5G通信协议分析 | `checkBox_41` | GTP 隧道与错误 TEID 检测 |
 
@@ -95,7 +95,7 @@ Webshell 解密（冰蝎 3.x/4.x、哥斯拉、蚁剑、菜刀、内存马）没
 
 | 功能 | 复选框 | 说明 |
 | --- | --- | --- |
-| 无线流量暴力破解 | `checkBox_18` | WPA/WPA2 握手字典破解，需要 `aircrack-ng` |
+| 无线流量暴力破解 | `checkBox_18` | WPA/WPA2 握手与 PMKID 识别、hashcat 22000 命令；已知 PSK 时用 `--wpa-psk` 解密 802.11 数据帧并把明文送回 HTTP/DNS/凭据分析 |
 | 蓝牙流量分析 | `checkBox_21` | Bluetooth / BTHCI 协议概览 |
 
 ## TLS / 加密（1）
@@ -150,6 +150,14 @@ python3 -m fnet -C capture.pcapng --features checkBox_30,protocols.credentials
 ```
 
 参数怎么传、怎么批量跑，见[命令行]({{ '/manual/cli/' | relative_url }})。
+
+## 自定义规则
+
+“设置 → 自定义规则…”或 `--rules` 可以导入逐行正则或 YARA 子集
+（`strings` / `condition`、`any/all/N of them`、`$a and $b`）。命中结果写入
+findings 的“自定义规则”类别，包含规则名、帧号、协议与片段，并参与报告、
+CSV 导出与任务对比。WebUI 导入的路径保存在 `paths.rules_file`，后续任务
+自动沿用。
 
 ## 选择建议
 

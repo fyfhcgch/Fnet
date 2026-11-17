@@ -43,6 +43,15 @@ HTML 报告: .../report.html
 | `--features a,b` | 逗号分隔的功能，可写复选框编号或功能名 |
 | `--all` | 运行全部 37 个功能 |
 | `--param KEY=VALUE` | 传给功能的参数，可重复 |
+| `--json` | 结束后只向 stdout 输出 JSON（任务、findings、统计与产出） |
+| `--rules PATH` | 导入正则 / YARA 子集规则文件，命中写入 findings |
+| `--shards N` | 无状态功能按 N 个帧区间分片执行 |
+| `--resume JOB_ID` | 继续已暂停或中断的任务 |
+| `--compare BASE TARGET` | 对比两个任务的 findings（新增 / 消失 / 共有） |
+| `--wpa-psk VALUE` | 已知 Wi-Fi 口令或 64 位 PMK，解密后继续取证 |
+| `--keytab PATH` | Kerberos keytab，用于解密 TGT / TGS 响应 |
+| `--kerberos-password PASS` | 用账号口令派生 Kerberos 密钥 |
+| `--kerberos-key HEX` | 原始 Kerberos 密钥（AES / RC4） |
 | `--config PATH` | 使用指定的 `config.ini` |
 | `--list-features` | 列出全部功能（`*` 为默认勾选） |
 | `--list-tools` | 列出依赖的外部工具 |
@@ -78,6 +87,71 @@ HTML 报告: .../report.html
 | `wordlist` | 字典类功能 | 自定义字典路径 |
 
 `--param` 的值写成 `true` / `false` 会被解析为布尔值。
+
+## 机器可读输出
+
+`--json` 让无头分析只向 stdout 写一个 JSON 对象，日志仍写入任务目录，便于
+脚本、CI 与流水线消费：
+
+```bash
+python3 -m fnet -C capture.pcapng --features checkBox_10 --json > result.json
+python3 - <<'PY'
+import json
+data = json.load(open("result.json"))
+print(data["job"]["status"], data["count"])
+for item in data["findings"]:
+    if item["kind"] in ("credential", "hash", "flag"):
+        print(item["kind"], item["summary"])
+PY
+```
+
+JSON 顶层包含 `ok`、`job`、`findings`、`count`、`kinds`、`stats` 与
+`artifacts`；任务失败时 `ok` 为 `false`，退出码仍按上一节规则返回。
+
+## 断点、分片与任务对比
+
+任务会在每个功能结束时把进度写进 `job.json`。暂停或中断后可以续跑：
+
+```bash
+python3 -m fnet -C capture.pcapng --all
+# Ctrl+C 或 WebUI 里点“暂停”后，用任务 id 继续
+python3 -m fnet --resume 3f9c2a1b7d4e5f60
+```
+
+无状态功能（关键字扫描、协议统计等）支持按帧区间分片，适合大包多核加速：
+
+```bash
+python3 -m fnet -C capture.pcapng --features checkBox_10 --shards 4
+```
+
+流重组、解密类功能需要完整会话，永远整包执行；分片只影响注册表里
+`shardable=True` 的功能。对比两个任务的发现：
+
+```bash
+python3 -m fnet --compare 3f9c2a1b7d4e5f60 8a1b2c3d4e5f6071 --json
+```
+
+结果包含 `added`、`removed`、`common` 与按类别统计，WebUI 的“任务历史 →
+对比两个任务”使用同一实现。
+
+## 解密与自定义规则
+
+```bash
+# 已知 Wi-Fi PSK：解密 802.11 数据帧，再把明文送回 HTTP/DNS/凭据分析
+python3 -m fnet -C wifi.pcap --features checkBox_18 --wpa-psk 'password'
+
+# Kerberos：keytab、账号口令或原始密钥
+python3 -m fnet -C krb5.pcap --features checkBox_45 --keytab /etc/krb5.keytab
+python3 -m fnet -C krb5.pcap --features checkBox_45 \
+  --kerberos-password 'P@ssw0rd' --kerberos-key 0123456789abcdef
+
+# 自定义规则：逐行正则，或 YARA 子集（strings/condition）
+python3 -m fnet -C capture.pcapng --features checkBox_30 --rules rules.yar
+```
+
+规则命中的结果类别是 `rule`，会出现在 `findings.json`、CSV 与报告里。
+WebUI 导入的规则保存在 `paths.rules_file`，后续任务会自动沿用；命令行
+`--rules` 只对当次任务生效。
 
 ## 批处理
 

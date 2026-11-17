@@ -60,9 +60,11 @@ python3 -m fnet --host 0.0.0.0        # 监听所有网卡（注意安全）
 python3 -m fnet capture.pcapng        # 启动后预选抓包
 ```
 
-也可以安装成命令：
+也可以安装成命令（PyPI 发行名是 `fnet-ctf`，安装后仍是 `fnet` 命令）：
 
 ```bash
+pipx install fnet-ctf          # 推荐：隔离环境，自动生成 fnet 命令
+# 或从源码
 python3 -m pip install .
 fnet
 ```

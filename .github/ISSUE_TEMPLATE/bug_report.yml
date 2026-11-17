@@ -40,7 +40,7 @@ body:
     attributes:
       label: Fnet 版本
       description: 界面右下角、`--version` 输出或提交哈希
-      placeholder: 2.18.0
+      placeholder: 2.19.0
     validations:
       required: true
   - type: input
