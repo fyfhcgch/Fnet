@@ -102,8 +102,14 @@ python3 -m fnet -C capture.pcapng --features checkBox_24 \
 | 勾选 | 用途 |
 | --- | --- |
 | **NTLM HASH提取**（`checkBox_39`） | 从 NTLMSSP 认证中提取 NetNTLM 哈希（hashcat 格式） |
-| **Kerberos解析破解**（`checkBox_45`） | 提取 AS-REQ / AS-REP / TGS-REP 并生成 hashcat 哈希 |
+| **Kerberos解析破解**（`checkBox_45`） | 提取 AS-REQ / AS-REP / TGS-REP 并生成 hashcat 哈希；有 keytab、账号口令或原始密钥时还能解密响应、解析 PAC 与用户时间线 |
 | **WINRM流量解密**（`checkBox_43`） | 用 NTLM hash 或密码还原 WinRM 认证与命令 |
+
+```bash
+python3 -m fnet -C krb5.pcap --features checkBox_45 --keytab /etc/krb5.keytab
+python3 -m fnet -C krb5.pcap --features checkBox_45 \
+  --kerberos-password 'P@ssw0rd'
+```
 
 分析完成后在“分析结果”页按类别筛选 `hash`、`credential`、`auth`，可以直接复制或导出 CSV。
 需要跨协议汇总时，用“专项功能”菜单运行 **多协议凭据提取**（`protocols.credentials`）和
@@ -114,7 +120,10 @@ python3 -m fnet -C capture.pcapng --features checkBox_24 \
 
 - **批量**：一次拖入多个 pcap，自动进入“批量队列”；可以暂停、调整顺序、取消单个任务。
 - **重跑**：在“任务历史”里找到旧任务，一键沿用原参数重跑。
-- **对比**：批量结束后把选中任务合并成一份 Markdown / HTML 报告。
+- **续跑**：运行中可暂停，任务停在功能边界；点“继续”或 `--resume <job-id>` 从断点接着跑。
+- **对比**：在“任务历史”里对比两个任务，查看新增/消失的凭据、哈希与 flag；
+  命令行用 `--compare <base> <target>`。
+- **脚本**：`--json` 输出任务、findings、统计与产出，方便接入流水线。
 - **分享**：报告和 CSV 可能包含明文凭据，分享前先脱敏。
 
 ## 一页速查

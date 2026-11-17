@@ -16,8 +16,25 @@ description: 把 pcap 拖进浏览器，勾选需要的检查项，得到 flag�
     <a class="btn ghost" href="{{ '/manual/install/' | relative_url }}">安装与启动</a>
     <a class="btn ghost" href="{{ '/manual/features/' | relative_url }}">浏览 37 项功能</a>
     <a class="btn ghost" href="https://github.com/fyfhcgch/Fnet">GitHub 仓库</a>
+    {%- if site.version %}
+    <span class="badge version-badge">v{{ site.version }}</span>
+    {%- endif %}
   </p>
 </div>
+
+## 2.19.0 更新
+
+- **大包更稳**：关键字检测按帧区间分块扫描，1 GB 抓包峰值内存约 150 MB；
+  multipart 上传流式落盘，不再整包读入内存。
+- **断点与分片**：任务在功能边界暂停/继续（WebUI 与 `--resume`），无状态功能
+  可用 `--shards N` 按帧区间并行。
+- **实时抓包**：选择网卡与 BPF 过滤器直接抓包，停止后可立即送入分析。
+- **对比与规则**：任务历史可对比两个任务的 findings diff；支持逐行正则与
+  YARA 子集规则，命中写入结果与报告。
+- **可编程**：`--json` 输出任务、findings、统计与产出；`--compare` 对比任务。
+- **协议深化**：DNS/ICMP 隧道重组、Kerberos keytab/口令解密与 PAC、
+  SMTP/IMAP/POP3 附件、MySQL 结果集与 LOAD DATA/LOAD_FILE、WPA PSK 解密取证。
+- **界面**：中文 / English 切换、上传进度与取消、暂停/继续。
 
 <p class="shot">
   <img src="{{ '/assets/images/webui.webp' | relative_url }}"
@@ -41,8 +58,17 @@ description: 把 pcap 拖进浏览器，勾选需要的检查项，得到 flag�
     <p>凭据、哈希、flag、导出文件汇总成可排序表格，可导出 CSV 与 Markdown / HTML 报告。</p>
   </div>
   <div class="card">
-    <h3>批量与回看</h3>
-    <p>多包排队分析、任务历史一键重跑、统计图表与会话拓扑，赛后复盘不用重来一遍。</p>
+    <h3>大包与长任务</h3>
+    <p>分块扫描与流式上传控制内存；任务可暂停/续跑，无状态功能按帧区间分片。</p>
+  </div>
+  <div class="card">
+    <h3>可复盘、可对比</h3>
+    <p>任务历史一键重跑，对比两个任务的 findings diff；实时抓包后直接送入分析。</p>
+  </div>
+  <div class="card">
+    <h3>可编程</h3>
+    <p><code>--json</code> 输出任务与 findings，<code>--rules</code> 导入正则/YARA 子集，
+       <code>--compare</code> 与 WebUI 共用同一实现。</p>
   </div>
 </div>
 
@@ -108,7 +134,7 @@ python3 -m fnet</code></pre>
   <div class="card">
     <span class="badge">1 项</span>
     <h3>文本与关键字</h3>
-    <p>flag 与自定义正则扫描，支持十六进制、Base64 / Hex / URL 编码关键词。</p>
+    <p>flag 与自定义正则扫描，支持十六进制、Base64 / Hex / URL 编码关键词；大包按帧区间分块扫描。</p>
   </div>
   <div class="card">
     <span class="badge">2 项</span>
@@ -133,12 +159,12 @@ python3 -m fnet</code></pre>
   <div class="card">
     <span class="badge">2 项</span>
     <h3>认证与凭据</h3>
-    <p>NTLM 哈希与 Kerberos 票据提取，直接生成 hashcat 可用的格式。</p>
+    <p>NTLM 哈希与 Kerberos 票据；keytab/口令/原始密钥解密、PAC 与用户时间线，输出 hashcat 格式。</p>
   </div>
   <div class="card">
     <span class="badge">10 项</span>
     <h3>协议流量</h3>
-    <p>TCP / UDP / DNS / ICMP / FTP / SMTP / Telnet / MySQL / ARP / GTP 会话与载荷。</p>
+    <p>TCP / UDP / DNS / ICMP / FTP / SMTP / Telnet / MySQL / ARP / GTP；DNS/ICMP 隧道重组、邮件附件、MySQL 结果集与 LOAD。</p>
   </div>
   <div class="card">
     <span class="badge">7 项</span>
@@ -153,7 +179,7 @@ python3 -m fnet</code></pre>
   <div class="card">
     <span class="badge">2 项</span>
     <h3>无线与蓝牙</h3>
-    <p>WPA/WPA2 握手字典破解，蓝牙 / BTHCI 协议概览。</p>
+    <p>WPA/WPA2 握手与 PMKID；已知 PSK 时解密数据帧，把明文送回 HTTP/DNS/凭据分析。</p>
   </div>
   <div class="card">
     <span class="badge">1 项</span>
@@ -192,7 +218,7 @@ python3 -m fnet</code></pre>
   <li>
     <a href="{{ '/manual/webui/' | relative_url }}">
       <strong>WebUI 使用</strong>
-      <span>上传、勾选、结果表格、帧定位、历史、批量与报告</span>
+      <span>上传进度、暂停/继续、语言切换、任务对比、实时抓包、报告与历史</span>
     </a>
   </li>
   <li>
@@ -204,13 +230,13 @@ python3 -m fnet</code></pre>
   <li>
     <a href="{{ '/manual/cli/' | relative_url }}">
       <strong>命令行</strong>
-      <span>无界面运行、参数传递、批处理与退出码</span>
+      <span>JSON 输出、规则、分片、续跑、任务对比与批处理</span>
     </a>
   </li>
   <li>
     <a href="{{ '/manual/faq/' | relative_url }}">
       <strong>常见问题</strong>
-      <span>tshark 缺失、解密无结果、大文件与内存</span>
+      <span>tshark 缺失、解密无结果、大文件内存与上传</span>
     </a>
   </li>
 </ul>

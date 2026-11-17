@@ -41,21 +41,25 @@ python3 -m fnet --port 9000
 
 ### 上传大文件报错或占用内存过高
 
-上传大小上限由 `max_upload_mb` 控制（默认 1024）。目前上传会把内容先读入内存，
-超大抓包建议先用 `editcap` 按时间或包数切分，再放进批量队列：
+上传大小上限由 `max_upload_mb` 控制（默认 1024）。multipart 上传会边读边写
+临时文件，内存占用与文件大小无关；分析阶段的关键字检测也会按帧区间分块扫描，
+1 GB 抓包通常稳定在约 150 MB。仍然报错时，多半是超过上限或磁盘空间不足：
 
 ```bash
-editcap -c 200000 big.pcapng part.pcapng
+editcap -c 200000 big.pcapng part.pcapng   # 也可以先按包数切分
 ```
 
-上传大小可以在 `config.ini` 的 `max_upload_mb` 中调整；超大抓包建议先切分再分析。
+上传与缓存目录都受 `FNET_HOME` 控制；`config.ini` 的 `max_upload_mb` 可调整上限。
 
 ### 分析很慢
 
 - 先只勾选相关功能，“全选”适合小包
+- 无状态功能可以用 `--shards N` 按帧区间分片；WebUI 里可用断点续跑的暂停/继续
 - 启用 `tshark_cache` 后，同一抓包与字段集不会重复解析
 - 调大 `tshark_timeout` 只影响超时，不会提速；字段与行数上限可按机器调整
 - 批量队列的并发数不要超过机器核数
+- 参考 [`docs/PERFORMANCE.md`](https://github.com/fyfhcgch/Fnet/blob/master/docs/PERFORMANCE.md)
+  的 10 MB / 100 MB / 1 GB 基准数据
 
 ### 想清空历史与缓存
 
