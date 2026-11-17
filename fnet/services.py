@@ -1,0 +1,581 @@
+"""Non-job actions exposed by the WebUI menus.
+
+Each function is synchronous and returns a ``dict`` with at least ``ok`` and
+``text``; the HTTP layer serialises the dict.  Long external commands accept
+a cancellation event.
+"""
+from __future__ import annotations
+
+import base64
+import gzip
+import os
+import re
+import subprocess
+import threading
+import zlib
+from collections import Counter
+from pathlib import Path
+
+from fnet.logger import logger
+from fnet.paths import CACHE_DIR
+from fnet.tools.runner import ToolBox, run
+from fnet.utils import codec
+from fnet.utils.pcap import conversations
+
+
+def _result(ok: bool, text: str, **extra) -> dict:
+    data = {"ok": ok, "text": text}
+    data.update(extra)
+    return data
+
+
+def _safe_outdir(name: str) -> Path:
+    path = CACHE_DIR / name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _tshark(toolbox: ToolBox, cancel=None):
+    tshark = toolbox.tshark()
+    if tshark is None:
+        return None, _result(False, "未找到 tshark，请先安装 Wireshark/tshark")
+    return tshark, None
+
+
+# ---------------------------------------------------------------------------
+# File menu
+# ---------------------------------------------------------------------------
+def export_all_objects(pcap: str, toolbox: ToolBox,
+                       cancel: threading.Event | None = None) -> dict:
+    tshark, error = _tshark(toolbox)
+    if error:
+        return error
+    outdir = _safe_outdir("objects")
+    lines = []
+    total = 0
+    for protocol in ("http", "smb", "ftp", "tftp", "imf", "dicom"):
+        target = outdir / protocol
+        code, out = tshark.export_objects(pcap, protocol, target, cancel=cancel)
+        files = [p for p in target.rglob("*") if p.is_file()]
+        total += len(files)
+        status = "OK" if code == 0 else f"跳过({code})"
+        lines.append(f"{protocol:6s} {status:12s} {len(files):4d} 个文件 -> {target}")
+        if code != 0 and out.strip():
+            lines.append("  " + out.strip().splitlines()[-1][:200])
+    return _result(True, "\n".join(lines), output_dir=str(outdir), count=total)
+
+
+def carve_files(pcap: str, toolbox: ToolBox,
+                cancel: threading.Event | None = None) -> dict:
+    outdir = _safe_outdir("carved")
+    if toolbox.path("foremost"):
+        code, out = toolbox.run_tool("foremost", ["-i", pcap, "-o", str(outdir)],
+                                     cancel=cancel)
+        if code == 0:
+            return _result(True, out or f"文件已分离到 {outdir}",
+                           output_dir=str(outdir))
+    if toolbox.path("binwalk"):
+        code, out = toolbox.run_tool("binwalk", ["-e", "--directory", str(outdir), pcap],
+                                     cancel=cancel)
+        if code == 0:
+            return _result(True, out or f"文件已分离到 {outdir}",
+                           output_dir=str(outdir))
+    # Always available fallback: tshark object export.
+    logger.warn("未找到 foremost/binwalk，改用 tshark 导出对象")
+    data = export_all_objects(pcap, toolbox, cancel)
+    data["text"] = "未找到 foremost/binwalk，已使用 tshark 导出对象\n" + data["text"]
+    return data
+
+
+def repair_pcap(pcap: str, toolbox: ToolBox,
+                cancel: threading.Event | None = None) -> dict:
+    if not toolbox.path("pcapfix"):
+        return _result(False, "未找到 pcapfix（Debian/Ubuntu: apt install pcapfix）")
+    outdir = _safe_outdir("repaired")
+    outfile = outdir / (Path(pcap).stem + "_fixed.pcap")
+    code, out = toolbox.run_tool("pcapfix", ["-o", str(outfile), pcap],
+                                 cancel=cancel)
+    if code == 0 and outfile.exists():
+        return _result(True, out or f"修复完成: {outfile}", output=str(outfile))
+    return _result(False, out or f"pcapfix 退出码 {code}")
+
+
+def etl_to_pcapng(source: str, toolbox: ToolBox,
+                  cancel: threading.Event | None = None) -> dict:
+    if not toolbox.path("etl2pcapng"):
+        return _result(False, "未找到 etl2pcapng（https://github.com/nettrace/etl2pcapng）")
+    outdir = _safe_outdir("converted")
+    outfile = outdir / (Path(source).stem + ".pcapng")
+    code, out = toolbox.run_tool("etl2pcapng", [source, str(outfile)],
+                                 cancel=cancel)
+    if code == 0 and outfile.exists():
+        return _result(True, out or f"转换完成: {outfile}", output=str(outfile))
+    return _result(False, out or f"etl2pcapng 退出码 {code}")
+
+
+# ---------------------------------------------------------------------------
+# Packet navigation (log frame links)
+# ---------------------------------------------------------------------------
+FRAME_FIELDS = ["frame.number", "frame.time_relative", "frame.len",
+                "_ws.col.protocol", "_ws.col.info"]
+MAX_PACKET_DETAIL = 60_000
+
+
+def clamp_frame(value) -> int | None:
+    """Accept ``frame``/``i`` style text, reject anything unsafe."""
+    try:
+        frame = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return frame if 1 <= frame <= 1_000_000_000 else None
+
+
+def clamp_context(value, default: int = 2, maximum: int = 20) -> int:
+    try:
+        context = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(0, min(context, maximum))
+
+
+def frame_range(frame: int, context: int = 2) -> tuple[int, int]:
+    return max(1, frame - context), frame + context
+
+
+def _frame_rows(tshark, pcap: str, lo: int, hi: int, cancel=None) -> list[dict]:
+    rows = tshark.fields(
+        pcap, FRAME_FIELDS,
+        f"frame.number >= {lo} && frame.number <= {hi}", cancel=cancel)
+    items = []
+    for row in rows:
+        row += [""] * (len(FRAME_FIELDS) - len(row))
+        items.append({
+            "frame": row[0],
+            "time": row[1],
+            "length": row[2],
+            "protocol": row[3],
+            "info": row[4],
+        })
+    return items
+
+
+def frame_detail(pcap: str, frame, toolbox: ToolBox, context=2,
+                 cancel: threading.Event | None = None) -> dict:
+    """One packet plus its surrounding frames, used by the log frame links."""
+    number = clamp_frame(frame)
+    if number is None:
+        return _result(False, "帧号无效")
+    context = clamp_context(context)
+    tshark, error = _tshark(toolbox, cancel)
+    if error:
+        return error
+    lo, hi = frame_range(number, context)
+    neighbors = _frame_rows(tshark, pcap, lo, hi, cancel)
+    packet = next((item for item in neighbors
+                   if item["frame"] == str(number)), None)
+    if packet is None:
+        return _result(False, f"抓包中没有帧 {number}")
+    code, detail = run(
+        [tshark.path, "-r", pcap, "-Y", f"frame.number == {number}", "-V"],
+        timeout=120, echo=False, cancel=cancel)
+    detail = detail.strip()
+    if code != 0 and not detail:
+        detail = f"tshark 退出码 {code}"
+    if len(detail) > MAX_PACKET_DETAIL:
+        detail = detail[:MAX_PACKET_DETAIL] + "\n… （解码输出过长，已截断）"
+    return _result(
+        True, f"帧 {number}: {packet['protocol']} {packet['info']}",
+        packet=packet, neighbors=neighbors, detail=detail,
+        range=[lo, hi], frame=number,
+        tools={"wireshark": bool(toolbox.path("wireshark"))})
+
+
+def extract_frames(pcap: str, frame, toolbox: ToolBox, output: str | Path,
+                   context=2, cancel: threading.Event | None = None) -> dict:
+    """Write a small pcapng clip around ``frame`` for external inspection."""
+    number = clamp_frame(frame)
+    if number is None:
+        return _result(False, "帧号无效")
+    context = clamp_context(context)
+    tshark, error = _tshark(toolbox, cancel)
+    if error:
+        return error
+    lo, hi = frame_range(number, context)
+    target = Path(output)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    code, text = run(
+        [tshark.path, "-r", str(pcap),
+         "-Y", f"frame.number >= {lo} && frame.number <= {hi}",
+         "-w", str(target)], timeout=120, echo=False, cancel=cancel)
+    if code != 0 or not target.is_file() or target.stat().st_size == 0:
+        return _result(False, text.strip() or f"tshark 导出片段失败（退出码 {code}）")
+    return _result(True, f"已导出帧 {lo}-{hi} 到 {target.name}",
+                   path=str(target), range=[lo, hi],
+                   size=target.stat().st_size)
+
+
+def open_wireshark(pcap: str, frame, toolbox: ToolBox) -> dict:
+    """Launch the desktop Wireshark filtered to one frame (local WebUI only)."""
+    number = clamp_frame(frame)
+    if number is None:
+        return _result(False, "帧号无效")
+    if not Path(pcap).is_file():
+        return _result(False, f"抓包文件不存在: {pcap}")
+    path = toolbox.path("wireshark")
+    if not path:
+        return _result(False, "未找到 Wireshark，请在设置中指定路径或安装 wireshark")
+    try:
+        subprocess.Popen(
+            [path, "-r", str(pcap), "-Y", f"frame.number == {number}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=os.name == "posix")
+    except OSError as exc:
+        return _result(False, f"无法启动 Wireshark: {exc}")
+    logger.info(f"已请求 Wireshark 打开帧 {number}")
+    return _result(True, f"已在 Wireshark 中打开帧 {number}")
+
+
+# ---------------------------------------------------------------------------
+# Statistics menu
+# ---------------------------------------------------------------------------
+def port_scan(pcap: str, toolbox: ToolBox,
+              cancel: threading.Event | None = None) -> dict:
+    tshark, error = _tshark(toolbox, cancel)
+    if error:
+        return error
+    rows = tshark.fields(
+        pcap, ["ip.dst", "tcp.dstport", "tcp.flags.syn", "tcp.flags.ack"],
+        "tcp.flags.syn == 1 && tcp.flags.ack == 0", cancel=cancel)
+    seen: dict[tuple[str, str], int] = Counter()
+    for row in rows:
+        row += [""] * (4 - len(row))
+        if row[0] and row[1]:
+            seen[(row[0], row[1])] += 1
+    if not seen:
+        return _result(False, "没有发现 TCP SYN 扫描流量")
+    lines = [f"{'目标地址':<40s} {'端口':>6s} {'SYN 次数':>8s}"]
+    for (host, port), count in sorted(seen.items(),
+                                      key=lambda kv: (kv[0][0], int(kv[0][1]) if kv[0][1].isdigit() else 0)):
+        lines.append(f"{host:<40s} {port:>6s} {count:>8d}")
+    return _result(True, "\n".join(lines), count=len(seen))
+
+
+def http_uri_stats(pcap: str, toolbox: ToolBox,
+                   cancel: threading.Event | None = None) -> dict:
+    tshark, error = _tshark(toolbox, cancel)
+    if error:
+        return error
+    rows = tshark.fields(pcap, ["http.request.uri"], "http.request",
+                         cancel=cancel)
+    counter = Counter(row[0] for row in rows if row and row[0])
+    if not counter:
+        return _result(False, "没有发现 HTTP 请求")
+    lines = [f"{count:6d}  {uri}" for uri, count in counter.most_common(500)]
+    return _result(True, "\n".join(lines), count=len(counter))
+
+
+def ip_conversations(pcap: str, toolbox: ToolBox,
+                     cancel: threading.Event | None = None) -> dict:
+    tshark, error = _tshark(toolbox, cancel)
+    if error:
+        return error
+    text = conversations(tshark.path, pcap, "ip")
+    if not text.strip():
+        return _result(False, "没有发现 IP 会话")
+    return _result(True, text)
+
+
+def protocol_hierarchy(pcap: str, toolbox: ToolBox,
+                       cancel: threading.Event | None = None) -> dict:
+    tshark, error = _tshark(toolbox, cancel)
+    if error:
+        return error
+    from fnet.tools.runner import run
+
+    code, out = run([tshark.path, "-r", pcap, "-q", "-z", "io,phs"],
+                    cancel=cancel, echo=False)
+    if code != 0:
+        return _result(False, out or "协议分层统计失败")
+    return _result(True, out)
+
+
+def bucket_timeline(rows, buckets: int = 60) -> tuple[list[dict], float, float]:
+    """Aggregate ``(time, length)`` samples into fixed-width buckets.
+
+    Kept free of tshark so the chart maths can be unit tested.
+    """
+    samples: list[tuple[float, int]] = []
+    for row in rows or []:
+        row = list(row) + ["", ""]
+        try:
+            stamp = float(str(row[0]).strip())
+        except (TypeError, ValueError):
+            continue
+        length = 0
+        try:
+            length = int(float(str(row[1]).strip()))
+        except (TypeError, ValueError):
+            pass
+        samples.append((stamp, max(0, length)))
+    if not samples:
+        return [], 0.0, 0.0
+    try:
+        count = max(1, min(int(buckets), 240))
+    except (TypeError, ValueError):
+        count = 60
+    low = min(stamp for stamp, _ in samples)
+    high = max(stamp for stamp, _ in samples)
+    width = max((high - low) / count, 1e-6)
+    points = [{"time": low + index * width, "frames": 0, "bytes": 0}
+              for index in range(count)]
+    for stamp, length in samples:
+        index = min(int((stamp - low) / width), count - 1)
+        points[index]["frames"] += 1
+        points[index]["bytes"] += length
+    return points, low, high
+
+
+TOPOLOGY_FIELDS = ["ip.src", "ip.dst", "tcp.srcport", "tcp.dstport",
+                   "udp.srcport", "udp.dstport", "frame.len",
+                   "_ws.col.protocol", "frame.number"]
+
+
+def _endpoint(ip: str, port: str) -> str:
+    return f"{ip}:{port}" if ip and port else (ip or "?")
+
+
+def session_topology(pcap: str, toolbox: ToolBox,
+                     cancel: threading.Event | None = None) -> dict:
+    """Aggregate IP endpoints and their conversations for the topology view.
+
+    Kept independent of the chart maths so the node/edge layout can be tested.
+    """
+    tshark, error = _tshark(toolbox, cancel)
+    if error:
+        return error
+    rows = tshark.fields(pcap, TOPOLOGY_FIELDS, "ip", cancel=cancel)
+    edges: dict[tuple[str, str], dict] = {}
+    nodes: dict[str, dict] = {}
+    for raw in rows:
+        row = list(raw) + [""] * (len(TOPOLOGY_FIELDS) - len(raw))
+        src, dst = row[0], row[1]
+        if not src or not dst:
+            continue
+        sport = row[2] or row[4]
+        dport = row[3] or row[5]
+        try:
+            length = int(float(row[6] or 0))
+        except (TypeError, ValueError):
+            length = 0
+        protocol = (row[7] or "").split(",")[-1].strip() or "IP"
+        frame = row[8]
+        left, right = _endpoint(src, sport), _endpoint(dst, dport)
+        first, second = sorted((left, right))
+        key = (first, second)
+        edge = edges.get(key)
+        if edge is None:
+            edge = edges[key] = {
+                "source": left, "target": right, "frames": 0, "bytes": 0,
+                "protocols": Counter(), "first_frame": frame,
+                "last_frame": frame, "frames_list": [],
+            }
+        edge["frames"] += 1
+        edge["bytes"] += length
+        edge["protocols"][protocol] += 1
+        edge["last_frame"] = frame
+        if len(edge["frames_list"]) < 12:
+            edge["frames_list"].append(frame)
+        for endpoint, ip, port in ((left, src, sport), (right, dst, dport)):
+            node = nodes.get(endpoint)
+            if node is None:
+                node = nodes[endpoint] = {
+                    "id": endpoint, "ip": ip, "port": port,
+                    "frames": 0, "bytes": 0, "protocols": Counter(),
+                    "peers": set(),
+                }
+            node["frames"] += 1
+            node["bytes"] += length
+            node["protocols"][protocol] += 1
+            node["peers"].add(right if endpoint == left else left)
+
+    if not edges:
+        return _result(False, "没有可用于拓扑的 IP 会话")
+    ranked = sorted(nodes.values(), key=lambda item: item["bytes"],
+                    reverse=True)[:60]
+    kept = {item["id"] for item in ranked}
+    selected = [edge for key, edge in edges.items()
+                if key[0] in kept and key[1] in kept]
+    selected.sort(key=lambda item: item["bytes"], reverse=True)
+    selected = selected[:200]
+    total_bytes = sum(item["bytes"] for item in edges.values())
+    node_items = [{
+        "id": item["id"], "ip": item["ip"], "port": item["port"],
+        "frames": item["frames"], "bytes": item["bytes"],
+        "peers": len(item["peers"]),
+        "protocols": [name for name, _count in
+                      item["protocols"].most_common(4)],
+    } for item in ranked]
+    edge_items = [{
+        "source": item["source"], "target": item["target"],
+        "frames": item["frames"], "bytes": item["bytes"],
+        "protocol": item["protocols"].most_common(1)[0][0],
+        "protocols": [name for name, _count in
+                      item["protocols"].most_common(4)],
+        "first_frame": item["first_frame"], "last_frame": item["last_frame"],
+        "frames_list": item["frames_list"],
+    } for item in selected]
+    text = (f"{len(node_items)} 个节点 · {len(edge_items)} 条会话 · "
+            f"{total_bytes} 字节 · {len(rows)} 帧")
+    return _result(True, text, nodes=node_items, edges=edge_items,
+                   total_bytes=total_bytes, total_frames=len(rows),
+                   max_bytes=max((item["bytes"] for item in node_items),
+                                 default=0))
+
+
+def protocol_detail(pcap: str, toolbox: ToolBox, protocol: str,
+                    limit: int = 300,
+                    cancel: threading.Event | None = None) -> dict:
+    """Packet list for one protocol label, used by the chart drilldown."""
+    name = str(protocol or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,40}", name):
+        return _result(False, "协议名称无效")
+    tshark, error = _tshark(toolbox, cancel)
+    if error:
+        return error
+    known = {"http", "tls", "dns", "tcp", "udp", "quic", "smb2", "ldap",
+             "websocket", "http2", "ftp", "smtp", "telnet", "icmp", "arp",
+             "mqtt", "modbus", "s7comm", "goose", "gtp", "ssh", "rdp"}
+    key = name.lower().replace("/", "")
+    display = key if key in known else f'frame.protocols contains "{key}"'
+    try:
+        count = max(1, min(int(limit), 1000))
+    except (TypeError, ValueError):
+        count = 300
+    rows = tshark.fields(
+        pcap, ["frame.number", "frame.time_relative", "ip.src", "ip.dst",
+               "_ws.col.protocol", "_ws.col.info", "frame.len"],
+        display, cancel=cancel)[:count]
+    packets = []
+    for raw in rows:
+        row = list(raw) + [""] * (7 - len(raw))
+        packets.append({"frame": row[0], "time": row[1], "src": row[2],
+                        "dst": row[3], "protocol": row[4], "info": row[5],
+                        "length": row[6]})
+    if not packets:
+        return _result(False, f"没有找到 {name} 数据包")
+    return _result(True, f"{name}: {len(packets)} 个数据包",
+                   protocol=name, packets=packets, filter=display)
+
+
+def traffic_timeline(pcap: str, toolbox: ToolBox, buckets=60,
+                     cancel: threading.Event | None = None) -> dict:
+    tshark, error = _tshark(toolbox, cancel)
+    if error:
+        return error
+    rows = tshark.fields(pcap, ["frame.time_relative", "frame.len"], "",
+                         cancel=cancel)
+    points, low, high = bucket_timeline(rows, buckets)
+    if not points:
+        return _result(False, "没有可用于时间线的数据包")
+    total_frames = sum(point["frames"] for point in points)
+    total_bytes = sum(point["bytes"] for point in points)
+    duration = max(0.0, high - low)
+    text = (f"{total_frames} 帧 · {total_bytes} 字节 · 时间跨度 {duration:.3f}s "
+            f"· {len(points)} 个时间桶")
+    return _result(True, text, points=points, duration=duration,
+                   total_frames=total_frames, total_bytes=total_bytes,
+                   start=low, end=high, buckets=len(points))
+
+
+def timeline_packets(pcap: str, toolbox: ToolBox, start, end,
+                     limit: int = 200,
+                     cancel: threading.Event | None = None) -> dict:
+    """Packets inside a timeline bucket (click-to-drilldown)."""
+    try:
+        low, high = float(start), float(end)
+    except (TypeError, ValueError):
+        return _result(False, "时间范围无效")
+    if not (0 <= low <= high < 1e9):
+        return _result(False, "时间范围无效")
+    tshark, error = _tshark(toolbox, cancel)
+    if error:
+        return error
+    try:
+        count = max(1, min(int(limit), 1000))
+    except (TypeError, ValueError):
+        count = 200
+    display = (f"frame.time_relative >= {low:.6f} && "
+               f"frame.time_relative <= {high:.6f}")
+    rows = tshark.fields(
+        pcap, ["frame.number", "frame.time_relative", "ip.src", "ip.dst",
+               "_ws.col.protocol", "_ws.col.info", "frame.len"],
+        display, cancel=cancel)[:count]
+    packets = []
+    for raw in rows:
+        row = list(raw) + [""] * (7 - len(raw))
+        packets.append({"frame": row[0], "time": row[1], "src": row[2],
+                        "dst": row[3], "protocol": row[4], "info": row[5],
+                        "length": row[6]})
+    if not packets:
+        return _result(False, "该时间范围内没有数据包")
+    return _result(True, f"{low:.2f}s–{high:.2f}s: {len(packets)} 个数据包",
+                   packets=packets, start=low, end=high)
+
+
+# ---------------------------------------------------------------------------
+# Text tools
+# ---------------------------------------------------------------------------
+def _readable(value: str, threshold: float = 0.75) -> bool:
+    if not value:
+        return False
+    good = sum(ch in codec.PRINTABLE or ch.isprintable() for ch in value)
+    return good / len(value) >= threshold
+
+
+def decode_text(text: str) -> dict:
+    candidates: list[dict] = []
+    seen: set[str] = set()
+
+    def add(label: str, value: str, threshold: float = 0.75) -> None:
+        if not value or value == text or value in seen:
+            return
+        if not _readable(value, threshold) and not codec.find_flags(value):
+            return
+        seen.add(value)
+        candidates.append({"label": label, "value": value[:8000]})
+
+    add("Base64", codec.b64decode_text(text))
+    add("Base32", codec.b32decode_text(text))
+    add("Hex", codec.hexdecode_text(text))
+    add("URL", codec.urldecode_text(text))
+    add("ROT13", codec.rot13(text))
+    add("GBK", codec.gbk_text(text))
+
+    raw = None
+    try:
+        cleaned = re.sub(r"\s+", "", text)
+        raw = base64.b64decode(cleaned + "=" * (-len(cleaned) % 4))
+    except Exception:  # noqa: BLE001
+        raw = None
+    if raw:
+        for label, func in (("Gzip", gzip.decompress), ("Zlib", zlib.decompress)):
+            try:
+                add(label, func(raw).decode("utf-8", "replace"))
+            except Exception:  # noqa: BLE001
+                pass
+        for key, out in codec.single_byte_xor_candidates(raw, limit=3):
+            decoded = out.decode("latin-1", "replace")
+            if sum(ch.isalpha() for ch in decoded) >= 4:
+                add(f"XOR 0x{key:02x}", decoded, threshold=0.95)
+
+    for index, item in enumerate(codec.decode_chain(text, rounds=3)):
+        if codec.find_flags(item) or (item.isascii() and item.isprintable()
+                                      and any(ch.isalpha() for ch in item)):
+            add(f"解码链 #{index + 1}", item)
+    if not candidates:
+        candidates.append({"label": "原始文本（未识别编码）", "value": text[:8000]})
+
+    flags = sorted(set(codec.find_flags(text)) |
+                   {f for c in candidates for f in codec.find_flags(c["value"])})
+    return _result(True, "\n".join(f"[{c['label']}]\n{c['value']}" for c in candidates),
+                   candidates=candidates, flags=flags)

@@ -1,0 +1,73 @@
+name: Bug 报告
+description: 分析结果异常、界面报错或运行崩溃
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先确认问题能稳定复现，并尽量附上可公开的最小样例抓包。
+        如果涉及安全漏洞，请不要在这里发帖，按 [SECURITY.md](../blob/master/docs/SECURITY.md) 的方式反馈。
+  - type: textarea
+    id: what
+    attributes:
+      label: 问题描述
+      description: 发生了什么？与实际预期差在哪里？
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 启动 python3 -m fnet --no-browser
+        2. 选择抓包 xxx.pcapng
+        3. 勾选功能 ...
+        4. 观察到 ...
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 运行方式
+      options:
+        - WebUI
+        - 无界面 CLI
+        - 两者都有
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Fnet 版本
+      description: 界面右下角、`--version` 输出或提交哈希
+      placeholder: 2.18.0
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: 环境
+      description: 操作系统、Python 与 tshark 版本
+      placeholder: Ubuntu 24.04 / Python 3.12.3 / tshark 4.2.2
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志或截图
+      description: 粘贴相关日志（注意去掉敏感信息），或附上界面截图
+      render: text
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "python3 -m fnet --doctor 输出"
+      render: text
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 我已检索过现有 Issue，没有重复报告
+          required: true
+        - label: 我使用的样例数据可以公开
+          required: false

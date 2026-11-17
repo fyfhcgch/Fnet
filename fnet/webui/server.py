@@ -1,0 +1,749 @@
+"""Local HTTP server for the Fnet WebUI.
+
+The server binds to loopback by default.  Every mutating request must carry
+the random per-process token embedded in ``index.html``; this blocks CSRF
+from other sites while keeping the UI a plain browser tab.
+"""
+from __future__ import annotations
+
+import json
+import mimetypes
+import re
+import secrets
+import threading
+import urllib.parse
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+from fnet import APP_DISPLAY_NAME, __version__
+from fnet.logger import logger
+
+STATIC_DIR = Path(__file__).with_name("static")
+MAX_JSON = 4 * 1024 * 1024
+SAFE_NAME = re.compile(r"[^A-Za-z0-9._\-\u4e00-\u9fff]+")
+
+
+class FnetApp:
+    """Process-wide application state shared by HTTP handlers and CLI."""
+
+    def __init__(self, config, toolbox, jobs, plugins) -> None:
+        self.config = config
+        self.toolbox = toolbox
+        self.jobs = jobs
+        self.plugins = plugins
+        self.token = secrets.token_urlsafe(24)
+        self.server: ThreadingHTTPServer | None = None
+        #: Pre-selected capture/features from ``fnet capture.pcapng --features ...``.
+        self.initial_pcap = ""
+        self.initial_features: list[str] = []
+
+    def meta(self) -> dict:
+        from fnet.features.registry import CATEGORIES, FEATURES, feature_dict
+        from fnet.findings import kind_catalogue
+        from fnet.paths import CACHE_DIR, DEFAULT_WORDLIST, LOG_DIR, USER_DIR
+        from fnet.report import DEFAULT_SECTIONS, section_catalogue
+        from fnet.themes import THEMES
+
+        tools = {}
+        for key, available in self.toolbox.availability().items():
+            tools[key] = {"available": available, "path": self.toolbox.path(key)}
+        return {
+            "app": APP_DISPLAY_NAME,
+            "version": __version__,
+            "token": self.token,
+            "features": [feature_dict(f) for f in FEATURES],
+            "categories": CATEGORIES,
+            "themes": [
+                {"key": key, "name": value["name"],
+                 "colors": {k: v for k, v in value.items() if k != "name"}}
+                for key, value in THEMES.items()
+            ],
+            "theme": self.config.get("theme") or "dark",
+            "tools": tools,
+            "plugins": self.plugins.as_list(),
+            "paths": {
+                "user": str(USER_DIR),
+                "logs": str(LOG_DIR),
+                "cache": str(CACHE_DIR),
+                "wordlist": str(DEFAULT_WORDLIST),
+            },
+            "config": self.config_snapshot(),
+            "recent": self.config.recent_files(),
+            "report": {
+                "sections": section_catalogue(),
+                "default_sections": list(DEFAULT_SECTIONS),
+            },
+            "findings": {"kinds": kind_catalogue()},
+            "initial": {
+                "pcap": self.initial_pcap,
+                "features": list(self.initial_features),
+            },
+        }
+
+    def config_snapshot(self) -> dict:
+        return {
+            "config": self.config.as_dict("config"),
+            "paths": self.config.as_dict("paths"),
+            "plugins": self.config.as_dict("plugins"),
+        }
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "FnetWebUI"
+    protocol_version = "HTTP/1.1"
+
+    # -- plumbing ------------------------------------------------------
+    @property
+    def app(self) -> FnetApp:
+        return self.server.app  # type: ignore[attr-defined]
+
+    def log_message(self, fmt: str, *args) -> None:
+        logger.debug("http " + (fmt % args))
+
+    def _send(self, status: int, body: bytes, content_type: str,
+              extra: dict[str, str] | None = None) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if extra:
+            for key, value in extra.items():
+                self.send_header(key, value)
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _json(self, data, status: int = 200) -> None:
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self._send(status, body, "application/json; charset=utf-8",
+                   {"Cache-Control": "no-store"})
+
+    def _error(self, message: str, status: int = 400) -> None:
+        self._json({"ok": False, "error": message}, status)
+
+    def _query(self) -> dict[str, list[str]]:
+        return urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+
+    def _token_ok(self) -> bool:
+        supplied = (self.headers.get("X-Fnet-Token")
+                    or (self._query().get("token") or [""])[0])
+        return secrets.compare_digest(supplied, self.app.token)
+
+    def _body(self, limit: int = MAX_JSON) -> bytes:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > limit:
+            raise ValueError("请求体过大")
+        return self.rfile.read(length) if length else b""
+
+    def _json_body(self) -> dict:
+        raw = self._body()
+        if not raw:
+            return {}
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("JSON 必须是对象")
+        return data
+
+    # -- routes --------------------------------------------------------
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        try:
+            if path in ("/", "/index.html"):
+                return self._index()
+            if path == "/favicon.ico":
+                return self._favicon()
+            if path.startswith("/static/"):
+                return self._static(path[len("/static/"):])
+            if path == "/api/health":
+                return self._json({"ok": True, "version": __version__})
+            if not path.startswith("/api/"):
+                return self._error("未找到", 404)
+            if not self._token_ok():
+                return self._error("无效的访问令牌，请刷新页面", 403)
+            if path == "/api/meta":
+                return self._json(self.app.meta())
+            if path == "/api/config":
+                return self._json({"ok": True, **self.app.config_snapshot()})
+            if path == "/api/jobs":
+                return self._json({"ok": True, "jobs": [j.as_dict() for j in self.app.jobs.list()]})
+            if path == "/api/history":
+                return self._json({"ok": True, "jobs": self.app.jobs.history()})
+            match = re.fullmatch(r"/api/history/([0-9a-f]+)", path)
+            if match:
+                detail = self.app.jobs.history_detail(match.group(1))
+                if detail is None:
+                    return self._error("任务历史不存在", 404)
+                return self._json({"ok": True, **detail})
+            match = re.fullmatch(r"/api/jobs/([0-9a-f]+)", path)
+            if match:
+                return self._job(match.group(1))
+            if path == "/api/download":
+                return self._download()
+            if path == "/api/findings":
+                return self._findings()
+            if path == "/api/packet":
+                return self._packet()
+            if path == "/api/report":
+                return self._report()
+            if path == "/api/batch":
+                return self._json({"ok": True,
+                                   "summary": self.app.jobs.batch_summary()})
+            if path == "/api/batch/report":
+                return self._batch_report()
+            if path == "/api/log":
+                return self._log_tail()
+            return self._error("未找到", 404)
+        except Exception as exc:  # noqa: BLE001 - return a clean API error
+            logger.error(f"HTTP GET {path} 失败: {exc}")
+            return self._error(str(exc), 500)
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        try:
+            if path == "/api/upload":
+                if not self._token_ok():
+                    return self._error("无效的访问令牌", 403)
+                return self._upload()
+            if not path.startswith("/api/"):
+                return self._error("未找到", 404)
+            if not self._token_ok():
+                return self._error("无效的访问令牌，请刷新页面", 403)
+            if path == "/api/analyze":
+                return self._analyze()
+            if path == "/api/batch":
+                return self._batch()
+            if path == "/api/batch/pause":
+                return self._json({"ok": True,
+                                   "summary": self.app.jobs.pause_batch()})
+            if path == "/api/batch/resume":
+                return self._json({"ok": True,
+                                   "summary": self.app.jobs.resume_batch()})
+            if path == "/api/batch/reorder":
+                data = self._json_body()
+                ids = data.get("ids") or data.get("jobs") or []
+                if not isinstance(ids, list):
+                    return self._error("ids 必须是数组")
+                return self._json({
+                    "ok": True,
+                    "summary": self.app.jobs.reorder_batch(ids),
+                })
+            if path == "/api/batch/concurrency":
+                data = self._json_body()
+                return self._json({
+                    "ok": True,
+                    "summary": self.app.jobs.set_batch_concurrency(
+                        data.get("concurrency", 1)),
+                })
+            if path == "/api/action":
+                return self._action()
+            if path == "/api/decode":
+                return self._decode()
+            if path == "/api/config":
+                return self._set_config()
+            if path == "/api/shutdown":
+                self._json({"ok": True, "message": "服务正在关闭"})
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                return
+            match = re.fullmatch(r"/api/jobs/([0-9a-f]+)/cancel", path)
+            if match:
+                ok = self.app.jobs.cancel(match.group(1))
+                return self._json({"ok": ok})
+            match = re.fullmatch(r"/api/history/([0-9a-f]+)/delete", path)
+            if match:
+                ok = self.app.jobs.delete_history(match.group(1))
+                return self._json({"ok": ok, "text": "历史任务已删除" if ok else "任务不存在"})
+            return self._error("未找到", 404)
+        except json.JSONDecodeError as exc:
+            return self._error(f"JSON 解析失败: {exc}", 400)
+        except (FileNotFoundError, ValueError) as exc:
+            return self._error(str(exc), 400)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"HTTP POST {path} 失败: {exc}")
+            return self._error(str(exc), 500)
+
+    # -- static --------------------------------------------------------
+    def _index(self) -> None:
+        template = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        html = (template
+                .replace("__TOKEN__", self.app.token)
+                .replace("__VERSION__", __version__)
+                .replace("__APP__", APP_DISPLAY_NAME))
+        self._send(200, html.encode("utf-8"), "text/html; charset=utf-8",
+                   {"Cache-Control": "no-store",
+                    "Content-Security-Policy":
+                        "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+                        "script-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+                        "connect-src 'self'"})
+
+    def _favicon(self) -> None:
+        for candidate in (STATIC_DIR / "favicon.ico",):
+            if candidate.exists():
+                return self._send(200, candidate.read_bytes(), "image/x-icon")
+        return self._error("未找到", 404)
+
+    def _static(self, relative: str) -> None:
+        relative = urllib.parse.unquote(relative)
+        target = (STATIC_DIR / relative).resolve()
+        if not str(target).startswith(str(STATIC_DIR.resolve())) or not target.is_file():
+            return self._error("未找到", 404)
+        ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        self._send(200, target.read_bytes(), ctype,
+                   {"Cache-Control": "public, max-age=300"})
+
+    # -- API -----------------------------------------------------------
+    def _job(self, job_id: str) -> None:
+        job = self.app.jobs.get(job_id)
+        if job is None:
+            return self._error("任务不存在", 404)
+        cursor = int((self._query().get("cursor") or ["0"])[0] or 0)
+        records = job.log.records_since(cursor)
+        self._json({
+            "ok": True,
+            "job": job.as_dict(),
+            "logs": [r.as_dict() for r in records],
+            "cursor": job.log.last_seq,
+            "artifacts": self.app.jobs.artifacts(job) if job.status in
+                         ("done", "error", "cancelled") else [],
+        })
+
+    def _analyze(self) -> None:
+        data = self._json_body()
+        pcap = str(data.get("pcap") or "").strip()
+        features = data.get("features") or data.get("checkboxes") or []
+        handlers = data.get("handlers") or []
+        params = data.get("params") or {}
+        if not isinstance(features, list) or not isinstance(params, dict):
+            return self._error("features 必须是数组，params 必须是对象")
+        selection = list(features) + list(handlers)
+        job = self.app.jobs.submit(pcap, selection, params)
+        self.app.config.add_recent(pcap)
+        self.app.config.save()
+        logger.info(f"新任务 {job.id}: {Path(pcap).name} / {len(job.features)} 个功能")
+        return self._json({"ok": True, "job": job.as_dict()})
+
+    def _upload(self) -> None:
+        limit = self.app.config.get_int("max_upload_mb", fallback=1024) * 1024 * 1024
+        ctype = self.headers.get("Content-Type", "")
+        from fnet.paths import CACHE_DIR
+        upload_dir = CACHE_DIR / "uploads"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+
+        if ctype.startswith("multipart/form-data"):
+            match = re.search(r"boundary=(?:\"([^\"]+)\"|([^;]+))", ctype)
+            if not match:
+                return self._error("缺少 multipart boundary")
+            boundary = (match.group(1) or match.group(2)).strip().encode()
+            raw = self._body(limit)
+            filename, payload = _parse_multipart(raw, boundary)
+        else:
+            filename = urllib.parse.unquote(self.headers.get("X-Filename", "capture.pcap"))
+            payload = self._body(limit)
+
+        if not payload:
+            return self._error("上传内容为空")
+        if len(payload) > limit:
+            return self._error("文件超过大小限制")
+        name = SAFE_NAME.sub("_", Path(filename or "capture.pcap").name)
+        kind = (self.headers.get("X-Kind")
+                or (self._query().get("kind") or [""])[0]).strip().lower()
+        if kind in ("keylog", "tls_keylog", "tls-keylog", "tls_key",
+                    "key", "private_key", "tls_private_key", "tls-key"):
+            return self._upload_key(name, payload, kind)
+        if not Path(name).suffix:
+            name += ".pcap"
+        if Path(name).suffix.lower() not in (".pcap", ".pcapng", ".cap", ".dmp", ".etl"):
+            return self._error("仅支持 pcap/pcapng/cap/dmp/etl 文件")
+        target = upload_dir / f"{secrets.token_hex(4)}_{name}"
+        target.write_bytes(payload)
+        logger.good(f"已上传流量包 {name} ({len(payload)} 字节)")
+        self._json({"ok": True, "path": str(target), "name": name,
+                    "size": len(payload)})
+
+    def _upload_key(self, name: str, payload: bytes, kind: str) -> None:
+        """Store a TLS keylog / private key and remember it in the config."""
+        from fnet.paths import CACHE_DIR
+
+        if len(payload) > 8 * 1024 * 1024:
+            return self._error("密钥文件过大（上限 8 MiB）")
+        text = payload.decode("utf-8", "replace")
+        is_keylog = kind in ("keylog", "tls_keylog", "tls-keylog", "tls_key")
+        if is_keylog:
+            markers = ("CLIENT_RANDOM", "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+                       "SERVER_HANDSHAKE_TRAFFIC_SECRET", "EXPORTER_SECRET",
+                       "EARLY_EXPORTER_SECRET", "RESUMPTION_MASTER_SECRET")
+            if not any(marker in text for marker in markers):
+                return self._error("不是有效的 NSS keylog（缺少 CLIENT_RANDOM 等标签）")
+            target_dir = CACHE_DIR / "keys"
+            config_key = "tls_keylog"
+            suffix = Path(name).suffix or ".log"
+        else:
+            if "PRIVATE KEY" not in text:
+                return self._error("不是有效的 PEM 私钥（缺少 PRIVATE KEY）")
+            target_dir = CACHE_DIR / "keys"
+            config_key = "tls_private_key"
+            suffix = Path(name).suffix or ".pem"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        safe = SAFE_NAME.sub("_", Path(name).stem)[:80] or config_key
+        target = target_dir / f"{secrets.token_hex(4)}_{safe}{suffix}"
+        target.write_bytes(payload)
+        self.app.config.set(config_key, str(target), "paths")
+        self.app.config.save()
+        logger.good(f"已保存 TLS {'keylog' if is_keylog else '私钥'}: {target}")
+        self._json({
+            "ok": True, "path": str(target), "kind": "keylog" if is_keylog else "key",
+            "config": config_key, "size": len(payload),
+            "text": f"已保存 {name}，并写入设置 {config_key}",
+        })
+
+    def _batch(self) -> None:
+        data = self._json_body()
+        pcaps = data.get("pcaps")
+        features = data.get("features") or data.get("checkboxes") or []
+        handlers = data.get("handlers") or []
+        params = data.get("params") or {}
+        if not isinstance(pcaps, list) or not pcaps:
+            return self._error("pcaps 必须是非空数组")
+        if len(pcaps) > 50:
+            return self._error("一次最多提交 50 个流量包")
+        if not all(isinstance(item, str) and item.strip() for item in pcaps):
+            return self._error("pcaps 中只能包含路径字符串")
+        if not isinstance(features, list) or not isinstance(params, dict):
+            return self._error("features 必须是数组，params 必须是对象")
+        if not isinstance(handlers, list):
+            return self._error("handlers 必须是数组")
+        selection = list(features) + list(handlers)
+        jobs = self.app.jobs.submit_batch(
+            [item.strip() for item in pcaps], selection, params,
+            data.get("concurrency", 1))
+        for pcap in pcaps:
+            self.app.config.add_recent(pcap.strip())
+        self.app.config.save()
+        logger.info(f"新批量任务 {len(jobs)} 个: "
+                    + "、".join(Path(item).name for item in pcaps))
+        return self._json({"ok": True, "count": len(jobs),
+                           "jobs": [job.as_dict() for job in jobs],
+                           "summary": self.app.jobs.batch_summary()})
+
+    def _batch_report(self) -> None:
+        """Download one merged report for the selected batch jobs."""
+        query = self._query()
+        raw = (query.get("jobs") or [""])[0]
+        ids = [item.strip() for item in raw.split(",") if item.strip()]
+        result = self.app.jobs.merged_report(
+            ids, (query.get("format") or ["md"])[0],
+            (query.get("sections") or [""])[0] or None)
+        if result is None:
+            return self._error("没有可用于合并报告的任务", 404)
+        filename = urllib.parse.quote(result["filename"])
+        self._send(200, result["content"].encode("utf-8"),
+                   result["content_type"],
+                   {"Content-Disposition":
+                    f"attachment; filename*=UTF-8''{filename}",
+                    "Cache-Control": "no-store"})
+
+    def _action(self) -> None:
+        data = self._json_body()
+        action = str(data.get("action") or "")
+        pcap = str(data.get("pcap") or "")
+        toolbox = self.app.toolbox
+        from fnet import services
+
+        if action == "stats":
+            sub = data.get("sub") or ""
+            if sub == "ports":
+                return self._json(services.port_scan(pcap, toolbox))
+            if sub == "http_uri":
+                return self._json(services.http_uri_stats(pcap, toolbox))
+            if sub == "ip":
+                return self._json(services.ip_conversations(pcap, toolbox))
+            if sub == "hierarchy":
+                return self._json(services.protocol_hierarchy(pcap, toolbox))
+            if sub == "timeline":
+                return self._json(services.traffic_timeline(
+                    pcap, toolbox, data.get("buckets", 60)))
+            if sub == "topology":
+                return self._json(services.session_topology(pcap, toolbox))
+            if sub == "protocol":
+                return self._json(services.protocol_detail(
+                    pcap, toolbox, data.get("protocol") or "",
+                    data.get("limit", 300)))
+            if sub == "timeline_packets":
+                return self._json(services.timeline_packets(
+                    pcap, toolbox, data.get("start"), data.get("end"),
+                    data.get("limit", 200)))
+            return self._error("未知统计项")
+        if action == "export_objects":
+            return self._json(services.export_all_objects(pcap, toolbox))
+        if action == "carve":
+            return self._json(services.carve_files(pcap, toolbox))
+        if action == "repair":
+            return self._json(services.repair_pcap(pcap, toolbox))
+        if action == "etl":
+            return self._json(services.etl_to_pcapng(pcap, toolbox))
+        if action == "http_login":
+            job = self.app.jobs.submit(pcap, ["flows.http_login"])
+            return self._json({"ok": True, "job": job.as_dict()})
+        if action == "open_path":
+            from fnet.utils.system import open_path
+
+            target = Path(str(data.get("path") or ""))
+            if not target.exists():
+                return self._error("路径不存在")
+            ok = open_path(target)
+            return self._json({"ok": ok, "text": f"已交给系统打开: {target}"})
+        if action == "open_wireshark":
+            from fnet import services
+
+            job_id = str(data.get("job") or "")
+            pcap = self.app.jobs.pcap_for(job_id)
+            if not pcap:
+                return self._error("任务不存在或流量包已被删除")
+            return self._json(services.open_wireshark(
+                pcap, data.get("frame"), toolbox))
+        if action == "open_log":
+            from fnet.paths import LOG_DIR
+            from fnet.utils.system import open_path
+
+            open_path(LOG_DIR)
+            return self._json({"ok": True, "text": f"日志目录: {LOG_DIR}"})
+        if action == "plugin_add":
+            name = str(data.get("name") or "").strip()
+            command = str(data.get("command") or "").strip()
+            if not name or not command:
+                return self._error("需要工具名称和命令")
+            self.app.plugins.add(name, command)
+            return self._json({"ok": True, "text": f"已添加 {name}",
+                               "plugins": self.app.plugins.as_list()})
+        if action == "plugin_remove":
+            name = str(data.get("name") or "")
+            ok = self.app.plugins.remove(name)
+            return self._json({"ok": ok, "plugins": self.app.plugins.as_list()})
+        if action == "plugin_run":
+            key = str(data.get("key") or "")
+            target = str(data.get("target") or "")
+            text = self.app.plugins.run(key, target)
+            return self._json({"ok": True, "text": text})
+        if action == "open_url":
+            from fnet.utils.system import open_url
+
+            url = str(data.get("url") or "")
+            if not url.startswith(("http://", "https://")):
+                return self._error("仅支持 http(s) URL")
+            open_url(url)
+            return self._json({"ok": True, "text": url})
+        if action == "update_check":
+            return self._json({
+                "ok": True,
+                "text": ("Fnet 不主动联网检查更新。\n"
+                         "请通过项目仓库获取最新版本。"),
+            })
+        if action == "save_config":
+            self.app.config.save()
+            return self._json({"ok": True, "text": "配置已保存"})
+        if action == "reload_config":
+            self.app.config.load()
+            self.app.toolbox.config = self.app.config
+            return self._json({"ok": True, "text": "配置已重新加载",
+                               "config": self.app.config_snapshot()})
+        return self._error(f"未知操作: {action}")
+
+    def _decode(self) -> None:
+        from fnet.services import decode_text
+
+        data = self._json_body()
+        text = str(data.get("text") or "")
+        if len(text) > 2_000_000:
+            return self._error("文本过长")
+        return self._json(decode_text(text))
+
+    def _set_config(self) -> None:
+        data = self._json_body()
+        section = str(data.get("section") or "config")
+        values = data.get("values") or {}
+        if section not in ("config", "paths", "plugins"):
+            return self._error("未知配置节")
+        if not isinstance(values, dict):
+            return self._error("values 必须是对象")
+        self.app.config.set_many({k: str(v) for k, v in values.items()}, section)
+        self.app.config.save()
+        if section == "config" and "theme" in values:
+            self.app.config.save()
+        return self._json({"ok": True, "config": self.app.config_snapshot()})
+
+    def _download(self) -> None:
+        job_id = (self._query().get("job") or [""])[0]
+        relative = (self._query().get("path") or [""])[0]
+        job = self.app.jobs.get(job_id)
+        if job is None:
+            return self._error("任务不存在", 404)
+        if not relative:
+            target = self.app.jobs.zip_artifacts(job)
+        else:
+            base = job.output_dir.resolve()
+            target = (base / relative).resolve()
+            if not str(target).startswith(str(base)) or not target.is_file():
+                return self._error("文件不存在", 404)
+        data = target.read_bytes()
+        name = urllib.parse.quote(target.name)
+        self._send(200, data, "application/octet-stream",
+                   {"Content-Disposition": f"attachment; filename*=UTF-8''{name}",
+                    "Cache-Control": "no-store"})
+
+    def _findings(self) -> None:
+        """Structured findings as JSON, or as a CSV download."""
+        query = self._query()
+        job_id = (query.get("job") or [""])[0]
+        fmt = (query.get("format") or ["json"])[0].strip().lower()
+        if fmt == "csv":
+            result = self.app.jobs.export_findings(job_id, "csv")
+            if result is None:
+                return self._error("任务不存在", 404)
+            filename = urllib.parse.quote(result["filename"])
+            self._send(200, result["content"].encode("utf-8"),
+                       "text/csv; charset=utf-8",
+                       {"Content-Disposition":
+                        f"attachment; filename*=UTF-8''{filename}",
+                        "Cache-Control": "no-store"})
+            return
+        found = self.app.jobs.findings_for(
+            job_id,
+            query=(query.get("q") or [""])[0],
+            kind=(query.get("kind") or [""])[0],
+            level=(query.get("level") or [""])[0],
+            limit=safe_limit((query.get("limit") or [""])[0]),
+        )
+        if found is None:
+            return self._error("任务不存在", 404)
+        return self._json({"ok": True, "job": job_id, **found})
+
+    def _packet(self) -> None:
+        """Packet detail + context, or a downloadable pcapng clip."""
+        from fnet import services
+
+        query = self._query()
+        job_id = (query.get("job") or [""])[0]
+        frame = services.clamp_frame((query.get("frame") or [""])[0])
+        if frame is None:
+            return self._error("帧号无效")
+        pcap = self.app.jobs.pcap_for(job_id)
+        if not pcap:
+            return self._error("任务不存在或流量包已被删除", 404)
+        context = services.clamp_context((query.get("context") or [""])[0])
+        if (query.get("format") or ["json"])[0].strip().lower() == "pcap":
+            output = self.app.jobs.output_dir_for(job_id)
+            if output is None:
+                return self._error("任务输出目录不存在", 404)
+            name = f"frame-{frame}-ctx{context}.pcapng"
+            result = services.extract_frames(
+                pcap, frame, self.app.toolbox, output / "frames" / name,
+                context)
+            if not result.get("ok"):
+                return self._error(result.get("text") or "片段导出失败")
+            target = Path(result["path"])
+            data = target.read_bytes()
+            filename = urllib.parse.quote(target.name)
+            self._send(200, data, "application/vnd.tcpdump.pcap",
+                       {"Content-Disposition":
+                        f"attachment; filename*=UTF-8''{filename}",
+                        "Cache-Control": "no-store"})
+            return
+        detail = services.frame_detail(
+            pcap, frame, self.app.toolbox, context)
+        if not detail.get("ok"):
+            return self._error(detail.get("text") or "无法读取数据包", 404)
+        return self._json({"ok": True, "job": job_id, **detail})
+
+    def _report(self) -> None:
+        """Render a Markdown/HTML report for a live or historical job."""
+        query = self._query()
+        job_id = (query.get("job") or [""])[0]
+        fmt = (query.get("format") or ["html"])[0]
+        sections = (query.get("sections") or [""])[0] or None
+        result = self.app.jobs.export_report(job_id, fmt, sections)
+        if result is None:
+            return self._error("任务不存在", 404)
+        inline = (query.get("inline") or ["0"])[0].lower() in ("1", "true", "yes")
+        disposition = "inline" if inline else "attachment"
+        filename = urllib.parse.quote(result["filename"])
+        extra = {
+            "Content-Disposition": f"{disposition}; filename*=UTF-8''{filename}",
+            "Cache-Control": "no-store",
+        }
+        if result["content_type"].startswith("text/html"):
+            extra["Content-Security-Policy"] = (
+                "default-src 'none'; style-src 'unsafe-inline'; img-src data:")
+        self._send(200, result["content"].encode("utf-8"),
+                   result["content_type"], extra)
+
+    def _log_tail(self) -> None:
+        from fnet.logger import logger as global_logger
+
+        limit = int((self._query().get("limit") or ["300"])[0] or 300)
+        self._json({"ok": True,
+                    "logs": [r.as_dict() for r in global_logger.tail(limit)]})
+
+
+def safe_limit(value, default: int = 5000, maximum: int = 50_000) -> int:
+    """Parse a user supplied row limit, clamping bad input to a default."""
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(number, maximum))
+
+
+def _parse_multipart(raw: bytes, boundary: bytes) -> tuple[str, bytes]:
+    """Tiny multipart/form-data parser (``cgi`` is gone in Python 3.13+)."""
+    delimiter = b"--" + boundary
+    filename = "capture.pcap"
+    for part in raw.split(delimiter):
+        if not part or part in (b"--\r\n", b"--", b"\r\n"):
+            continue
+        part = part.lstrip(b"\r\n")
+        head, sep, body = part.partition(b"\r\n\r\n")
+        if not sep:
+            continue
+        headers = head.decode("utf-8", "replace")
+        match = re.search(r'filename="([^"]*)"', headers)
+        if match is None:
+            continue
+        filename = match.group(1) or filename
+        if body.endswith(b"\r\n"):
+            body = body[:-2]
+        return filename, body
+    raise ValueError("multipart 中没有文件字段")
+
+
+def make_server(app: FnetApp, host: str = "127.0.0.1",
+                port: int = 8765) -> ThreadingHTTPServer:
+    server = ThreadingHTTPServer((host, port), Handler)
+    server.daemon_threads = True
+    server.app = app  # type: ignore[attr-defined]
+    app.server = server
+    return server
+
+
+def serve(app: FnetApp, host: str = "127.0.0.1", port: int = 8765,
+          open_browser: bool = True, block: bool = True) -> ThreadingHTTPServer:
+    server = make_server(app, host, port)
+    actual_port = server.server_address[1]
+    url = f"http://{host}:{actual_port}/"
+    logger.good(f"Fnet WebUI 已启动: {url}")
+    logger.info("按 Ctrl+C 停止服务")
+    if open_browser:
+        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+    if block:
+        try:
+            server.serve_forever(poll_interval=0.25)
+        except KeyboardInterrupt:
+            logger.info("收到中断信号，正在关闭…")
+        finally:
+            server.shutdown()
+            server.server_close()
+    return server

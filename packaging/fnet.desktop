@@ -1,0 +1,15 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Fnet
+Name[zh_CN]=Fnet 流量分析
+GenericName=CTF Traffic Analyzer
+Comment=Local CTF network traffic analysis toolbox
+Comment[zh_CN]=本地 CTF 网络流量分析工具箱
+Exec=fnet
+TryExec=fnet
+Icon=fnet
+Terminal=false
+Categories=Development;Security;Network;
+Keywords=ctf;pcap;pcapng;wireshark;tshark;forensics;
+StartupNotify=true

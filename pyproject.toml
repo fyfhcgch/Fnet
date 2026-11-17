@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fnet"
+version = "2.18.0"
+description = "Fnet - 开源 CTF 网络流量分析工具箱（WebUI，Linux/macOS/Windows）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Fnet contributors" }]
+keywords = ["ctf", "pcap", "pcapng", "wireshark", "tshark", "forensics", "security"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Web Environment",
+  "Intended Audience :: Information Technology",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
+]
+
+dependencies = []
+
+[project.optional-dependencies]
+# Only needed by scripts/make_samples.py and the optional tests that build
+# captures from scratch; the analyser itself only needs tshark.
+samples = ["scapy>=2.5"]
+# Accelerated RSA / certificate helpers; the pure-Python fallback covers
+# everything the analyser itself uses.
+crypto = ["cryptography>=41"]
+# RDP 会话解密播放（需要 pyrdp-player 可执行文件）。
+rdp = ["pyrdp-mitm>=1.0"]
+
+[project.urls]
+Homepage = "https://github.com/fyfhcgch/Fnet"
+Repository = "https://github.com/fyfhcgch/Fnet"
+Issues = "https://github.com/fyfhcgch/Fnet/issues"
+
+[project.scripts]
+fnet = "fnet.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["fnet*"]
+
+[tool.setuptools.package-data]
+fnet = [
+  "assets/*.ini",
+  "assets/*.ico",
+  "assets/*.yaml",
+  "assets/*.txt",
+  "assets/wordlists/*.txt",
+  "webui/static/*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,47 @@
+name: 功能建议
+description: 新增协议支持、分析能力或界面改进
+labels: [enhancement]
+body:
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 使用场景
+      description: 你在什么赛题/取证场景下需要它？现有功能为什么不够？
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望的行为或输出
+      description: 希望看到什么日志、产出文件或界面元素？
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: 所属方向
+      options:
+        - 协议解析
+        - 凭据 / 取证关联
+        - TLS / 加密
+        - WebShell / SQL / Web 攻击
+        - 无线 / 哈希
+        - 文件还原
+        - 界面与可视化
+        - 工程 / 性能
+    validations:
+      required: true
+  - type: textarea
+    id: sample
+    attributes:
+      label: 样例数据
+      description: 能否提供可公开的抓包？没有也可以，说明协议版本与字段即可。
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 我已检索过现有 Issue 与 `TODO.md`
+          required: true
+        - label: 我愿意提交 PR 实现它
+          required: false

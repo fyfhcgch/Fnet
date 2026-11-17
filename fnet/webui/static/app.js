@@ -1,0 +1,2626 @@
+/* Fnet WebUI - vanilla JS, no external dependencies. */
+(() => {
+  "use strict";
+
+  const TOKEN = window.FNET_TOKEN;
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+  const esc = (value) => String(value ?? "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+  const state = {
+    meta: null,
+    pcap: "",
+    fileName: "",
+    jobId: null,
+    cursor: 0,
+    logs: [],
+    artifacts: [],
+    findings: [],
+    findingsVisible: [],
+    findingsJob: null,
+    findingsKinds: {},
+    findingsDerived: false,
+    findingsTruncated: false,
+    findingsSort: { key: "seq", dir: 1 },
+    findingsPage: 1,
+    findingsPageSize: 100,
+    findingsSelected: new Set(),
+    findingsHidden: new Set(),
+    history: [],
+    features: [],
+    recentFeatures: [],
+    reportSections: [],
+    pollTimer: null,
+    decodeText: "",
+    localSeq: 0,
+    featureCount: 0,
+    batch: { ids: [], jobs: [], timer: null, active: false, summary: null, drag: null },
+    viz: { timeline: null, hierarchy: null, talkers: null, topology: null, zoom: null, svg: "" },
+    tlsKeyKind: "keylog",
+  };
+
+  const TERMINAL = new Set(["done", "error", "cancelled"]);
+
+  /* ------------------------------------------------------------ helpers */
+  async function api(path, options = {}) {
+    const opts = { ...options };
+    const headers = { "X-Fnet-Token": TOKEN, ...(opts.headers || {}) };
+    if (opts.body && typeof opts.body !== "string" &&
+        !(opts.body instanceof FormData)) {
+      headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(opts.body);
+    }
+    const response = await fetch(path, { ...opts, headers });
+    let data = null;
+    const type = response.headers.get("content-type") || "";
+    if (type.includes("application/json")) {
+      data = await response.json();
+    } else {
+      const text = await response.text();
+      data = { ok: response.ok, text };
+    }
+    if (!response.ok || data.ok === false) {
+      throw new Error(data.error || data.text || `HTTP ${response.status}`);
+    }
+    return data;
+  }
+
+  function toast(message, kind = "info", timeout = 4200) {
+    const node = $("#toast");
+    node.textContent = message;
+    node.className = `toast ${kind}`;
+    clearTimeout(node._timer);
+    node._timer = setTimeout(() => node.classList.add("hidden"), timeout);
+  }
+
+  function val(id) { const el = $("#" + id); return el ? el.value.trim() : ""; }
+  function checked(id) { const el = $("#" + id); return !!(el && el.checked); }
+  function setVal(id, value) { const el = $("#" + id); if (el) el.value = value ?? ""; }
+  function setChecked(id, value) { const el = $("#" + id); if (el) el.checked = !!value; }
+  function setText(sel, value) { const el = $(sel); if (el) el.textContent = value ?? ""; }
+
+  function fmtSize(bytes) {
+    if (!bytes && bytes !== 0) return "";
+    const units = ["B", "KB", "MB", "GB"];
+    let value = bytes, unit = 0;
+    while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+    return `${value.toFixed(unit ? 1 : 0)} ${units[unit]}`;
+  }
+
+  // Line icons keep the sidebar readable without loading an icon font.
+  const CATEGORY_ICONS = {
+    text: '<path d="M4 6h16M4 12h16M4 18h10"/>',
+    http: '<circle cx="12" cy="12" r="8"/><path d="M4 12h16M12 4c2.2 2.3 3.3 5 3.3 8S14.2 17.7 12 20M12 4c-2.2 2.3-3.3 5-3.3 8S9.8 17.7 12 20"/>',
+    webshell: '<path d="m8 8-4 4 4 4M16 8l4 4-4 4M13.5 6l-3 12"/>',
+    sql: '<ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v12c0 1.7 3.1 3 7 3s7-1.3 7-3V6M5 12c0 1.7 3.1 3 7 3s7-1.3 7-3"/>',
+    c2: '<path d="M12 3v6M12 15v6M3 12h6M15 12h6"/><circle cx="12" cy="12" r="3"/>',
+    auth: '<rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v2"/>',
+    flow: '<path d="M4 7h11l-3-3M20 17H9l3 3"/>',
+    ics: '<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h8M8 13h8M8 17h4"/>',
+    usb: '<path d="M12 21V5m0 0 3 3m-3-3L9 8"/><path d="M8 13h8M8 13l-2-2m2 2v3M16 13l2-2m-2 2v3"/>',
+    wireless: '<path d="M4 9a12 12 0 0 1 16 0M7 12.5a8 8 0 0 1 10 0M10 16a4 4 0 0 1 4 0"/><circle cx="12" cy="19" r="1"/>',
+    tls: '<path d="M12 3.5 19 6v5c0 4-3 7-7 9-4-2-7-5-7-9V6z"/><path d="M9.5 11.5 11 13l3.5-3.5"/>',
+    misc: '<path d="M12 3.5 14 9l5.5 2-5.5 2-2 5.5-2-5.5L4.5 11 10 9z"/>',
+    rdp: '<rect x="3.5" y="5" width="17" height="11" rx="2"/><path d="M8 20h8M12 16v4"/>',
+  };
+
+  function nowTime() {
+    return new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  }
+
+  /* --------------------------------------------------------------- init */
+  async function init() {
+    state.meta = await api("/api/meta");
+    restoreRecentFeatures();
+    restoreReportSections();
+    applyMeta(state.meta);
+    bindEvents();
+    restoreLocalSettings();
+    restoreFindingsColumns();
+    applyTheme(state.meta.theme || "dark");
+    applyInitial(state.meta.initial);
+    refreshSelected();
+    setText("#version", state.meta.version);
+    setText("#about-version", state.meta.version);
+    setText("#user-dir", state.meta.paths.user);
+    renderTools(state.meta.tools);
+    renderRuntime();
+    loadHistory().catch(() => {});
+    if (!state.meta.tools.tshark?.available) {
+      toast("未找到 tshark，依赖 tshark 的分析功能不可用。\nDebian/Ubuntu: sudo apt install tshark",
+        "warn", 9000);
+    }
+  }
+
+  function applyMeta(meta) {
+    // Theme selector
+    const select = $("#theme-select");
+    select.innerHTML = "";
+    meta.themes.forEach((theme) => {
+      const option = document.createElement("option");
+      option.value = theme.key;
+      option.textContent = theme.name;
+      select.appendChild(option);
+    });
+    select.value = meta.theme || "dark";
+
+    // Structured finding kinds for the result table filter.
+    const kinds = (meta.findings && meta.findings.kinds) || [];
+    state.findingsKinds = Object.fromEntries(
+      kinds.map((kind) => [kind.key, kind.name]));
+    const kindSelect = $("#findings-kind");
+    kindSelect.innerHTML = '<option value="all">全部类别</option>' +
+      kinds.map((kind) =>
+        `<option value="${esc(kind.key)}">${esc(kind.name)}</option>`).join("");
+
+    // Feature list grouped by category.
+    state.features = meta.features || [];
+    const container = $("#features");
+    container.innerHTML = "";
+    meta.categories.forEach((category) => {
+      const features = meta.features.filter((f) => f.category === category.key);
+      if (!features.length) return;
+      const details = document.createElement("details");
+      details.className = "feature-group";
+      details.dataset.category = category.key;
+      details.open = ["text", "http", "webshell", "sql", "c2", "auth"].includes(category.key);
+      const count = features.filter((f) => f.default).length;
+      const icon = CATEGORY_ICONS[category.key] || CATEGORY_ICONS.misc;
+      details.innerHTML = `<summary>
+        <span class="group-icon" aria-hidden="true"><svg viewBox="0 0 24 24"
+          fill="none" stroke="currentColor" stroke-width="1.8"
+          stroke-linecap="round" stroke-linejoin="round">${icon}</svg></span>
+        <span class="group-name">${esc(category.name)}</span>
+        <span class="muted small">${features.length} 项${count ? ` · 默认 ${count}` : ""}</span>
+      </summary>`;
+      const list = document.createElement("div");
+      list.className = "feature-list";
+      features.forEach((feature) => {
+        const label = document.createElement("label");
+        label.className = "feature-item";
+        label.title = feature.description || feature.title;
+        label.dataset.search = [feature.title, feature.description || "",
+          feature.handler, category.name, feature.checkbox]
+          .join(" ").toLowerCase();
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.value = feature.checkbox;
+        input.dataset.handler = feature.handler;
+        input.checked = !!feature.default;
+        input.addEventListener("change", () => {
+          label.classList.toggle("checked", input.checked);
+          refreshSelected();
+          renderRecentFeatures();
+        });
+        const span = document.createElement("span");
+        span.innerHTML = `<span class="ftitle">${esc(feature.title)}</span>` +
+          (feature.needs && feature.needs.length
+            ? ` <span class="muted small">[${feature.needs.join(", ")}]</span>` : "");
+        label.appendChild(input);
+        label.appendChild(span);
+        list.appendChild(label);
+      });
+      details.appendChild(list);
+      container.appendChild(details);
+    });
+    state.featureCount = meta.features.length;
+    setText("#feature-total", `${meta.features.length} 个功能`);
+    renderPlugins(meta.plugins || []);
+    renderRecentFeatures();
+
+    // Config derived defaults.
+    const cfg = (meta.config && meta.config.config) || {};
+    const paths = (meta.config && meta.config.paths) || {};
+    setVal("wordlist", cfg.passwddir || meta.paths.wordlist);
+    setVal("sql_success", cfg.sql_success || "");
+    setVal("sql_time_threshold", cfg.sql_time_threshold || "1.0");
+    setVal("webshell_password", cfg.webshell_password || "");
+    setVal("shiro_key", cfg.shiro_key || "");
+    setVal("winrm_port", cfg.winrm_port || "5985");
+
+    const badge = $("#tshark-badge");
+    const tool = meta.tools.tshark;
+    badge.textContent = tool && tool.available ? "tshark 就绪" : "tshark 缺失";
+    badge.className = `badge ${tool && tool.available ? "ok" : "bad"}`;
+    badge.title = tool && tool.path ? tool.path : "未找到 tshark";
+  }
+
+  function renderPlugins(plugins) {
+    state.plugins = plugins || [];
+    const about = $("#about-tools");
+    if (!about) return;
+    // User tools are also shown in the tools menu via the manage dialog.
+  }
+
+  function renderTools(tools) {
+    const box = $("#about-tools");
+    if (!box) return;
+    const names = {
+      tshark: "tshark", wireshark: "Wireshark", java: "Java",
+      aircrack: "aircrack-ng", hashcat: "hashcat", john: "John",
+      foremost: "foremost", binwalk: "binwalk", pcapfix: "pcapfix",
+      etl2pcapng: "etl2pcapng", pyrdp_player: "pyrdp-player",
+    };
+    box.innerHTML = Object.entries(tools).map(([key, info]) => `
+      <div class="tool-item" title="${esc(info.path || "未找到")}">
+        <span class="dot ${info.available ? "ok" : ""}"></span>
+        <span>${esc(names[key] || key)}</span>
+        <span class="muted small">${info.available ? "可用" : "未安装"}</span>
+      </div>`).join("");
+  }
+
+  function renderRuntime() {
+    const box = $("#about-runtime");
+    if (!box) return;
+    const p = state.meta.paths;
+    box.innerHTML = `
+      <dt>版本</dt><dd>${esc(state.meta.version)}</dd>
+      <dt>用户目录</dt><dd>${esc(p.user)}</dd>
+      <dt>日志目录</dt><dd>${esc(p.logs)}</dd>
+      <dt>缓存目录</dt><dd>${esc(p.cache)}</dd>
+      <dt>内置字典</dt><dd>${esc(p.wordlist)}</dd>`;
+  }
+
+  /* -------------------------------------------------------------- theme */
+  function applyTheme(key, persist = false) {
+    const theme = (state.meta.themes || []).find((t) => t.key === key)
+      || (state.meta.themes || [])[0];
+    if (!theme) return;
+    Object.entries(theme.colors || {}).forEach(([name, value]) => {
+      document.documentElement.style.setProperty(`--${name}`, value);
+    });
+    document.documentElement.dataset.theme = theme.key;
+    $("#theme-select").value = theme.key;
+    if (persist) {
+      saveConfig("config", { theme: theme.key }).catch(() => {});
+      localStorage.setItem("fnet.theme", theme.key);
+    }
+  }
+
+  /* ------------------------------------------------------------ logging */
+  function parseQuery() {
+    const query = val("log-search");
+    if (!query) return null;
+    try { return new RegExp(query, "i"); }
+    catch (error) { return { test: (text) => text.toLowerCase().includes(query.toLowerCase()), literal: query }; }
+  }
+
+  function recordMatches(record) {
+    const level = val("log-level") || "all";
+    if (level !== "all" && record.level !== level) return false;
+    const query = parseQuery();
+    if (!query) return true;
+    const matched = query.test(record.text) || query.test(record.line || "");
+    if (checked("log-filter")) return matched;
+    return true;
+  }
+
+  function highlight(text) {
+    const query = val("log-search");
+    if (!query) return esc(text);
+    try {
+      const rx = new RegExp(`(${query})`, "gi");
+      return String(text).split(rx).map((part, index) =>
+        index % 2 ? `<mark>${esc(part)}</mark>` : esc(part)).join("");
+    } catch (error) {
+      return esc(text);
+    }
+  }
+
+  function frameLinks(html) {
+    // Log lines use "帧 123" or a leading "[123]"; make the number clickable.
+    return String(html).replace(
+      /^\[(?:<mark>)?(\d+)(?:<\/mark>)?\]|帧(\s*)(?:<mark>)?(\d+)(?:<\/mark>)?/g,
+      (match, bracket, space, frame) => {
+        const number = bracket || frame;
+        return `<button type="button" class="frame-link" data-frame="${number}" ` +
+          `title="查看数据包 ${number}">帧${space || " "}${number}</button>`;
+      });
+  }
+
+  function logLineHtml(record) {
+    return `<span class="log-time">${esc(record.time || nowTime())}</span> ` +
+      `<span class="log-tag">${esc(record.tag || "[*]")}</span> ` +
+      `<span class="log-text">${frameLinks(highlight(record.text || ""))}</span>`;
+  }
+
+  function appendRecord(record) {
+    if (!recordMatches(record)) return;
+    const log = $("#log");
+    const empty = $(".log-empty", log);
+    if (empty) empty.remove();
+    const line = document.createElement("div");
+    line.className = `log-line ${record.level || "info"}`;
+    line.innerHTML = logLineHtml(record);
+    log.appendChild(line);
+    while (log.childElementCount > 6000) log.removeChild(log.firstElementChild);
+    if (checked("auto-scroll")) log.scrollTop = log.scrollHeight;
+  }
+
+  function reRenderLog() {
+    const log = $("#log");
+    log.innerHTML = "";
+    const visible = state.logs.filter(recordMatches);
+    visible.slice(-4000).forEach((record) => {
+      // Bypass the filter check again (already filtered).
+      const line = document.createElement("div");
+      line.className = `log-line ${record.level || "info"}`;
+      line.innerHTML = logLineHtml(record);
+      log.appendChild(line);
+    });
+    if (!visible.length) {
+      log.innerHTML = '<div class="log-empty">暂无日志。选择一个流量包和功能后点击“开始分析”。</div>';
+    }
+    if (checked("auto-scroll")) log.scrollTop = log.scrollHeight;
+  }
+
+  function appendLogs(records) {
+    (records || []).forEach((record) => {
+      state.logs.push(record);
+      appendRecord(record);
+    });
+    if (state.logs.length > 30000) state.logs.splice(0, state.logs.length - 30000);
+  }
+
+  function appendSystem(text, level = "info") {
+    String(text || "").split("\n").forEach((line) => {
+      if (!line.trim()) return;
+      const record = {
+        seq: `local-${++state.localSeq}`, time: nowTime(),
+        level, tag: level === "error" ? "[-]" : level === "warn" ? "[!]" :
+          level === "good" ? "[+]" : "[*]", text: line,
+      };
+      state.logs.push(record);
+      appendRecord(record);
+    });
+  }
+
+  /* --------------------------------------------------------------- jobs */
+  function collectParams() {
+    return {
+      keywords: val("keywords"),
+      auto_regex: checked("auto_regex"),
+      post_only: checked("post_only"),
+      decode: checked("decode_aux"),
+      webshell_mode: val("webshell_mode") || "off",
+      webshell_password: val("webshell_password"),
+      webshell_filter: val("webshell_filter"),
+      shiro_mode: val("shiro_mode"),
+      shiro_remember: val("shiro_remember") || "rememberMe",
+      shiro_key: val("shiro_key"),
+      shiro_enctype: val("shiro_enctype"),
+      winrm_auth: val("winrm_auth"),
+      winrm_ntlm: val("winrm_ntlm"),
+      winrm_password: val("winrm_password"),
+      winrm_port: val("winrm_port"),
+      sql_regex: val("sql_regex"),
+      sql_success: val("sql_success"),
+      sql_compare: val("sql_compare"),
+      sql_time_threshold: val("sql_time_threshold"),
+      sql_char: checked("sql_char"),
+      sql_reverse: checked("sql_reverse"),
+      sql_log: val("sql_log"),
+      wordlist: val("wordlist"),
+    };
+  }
+
+  function selectedFeatures() {
+    return $$("#features input[type=checkbox]:checked").map((el) => el.value);
+  }
+
+  function refreshSelected() {
+    const count = selectedFeatures().length;
+    setText("#selected-count", `${count} / ${state.featureCount} 项`);
+    $("#start-btn").disabled = !state.pcap || count === 0;
+    $("#toggle-all").textContent = count === state.featureCount ? "全不选" : "全选";
+    $$("#features .feature-item").forEach((item) => {
+      const box = item.querySelector("input[type=checkbox]");
+      item.classList.toggle("checked", !!(box && box.checked));
+    });
+  }
+
+  /* --------------------------------------------------- feature finder */
+  function filterFeatures() {
+    const query = val("feature-search").toLowerCase();
+    $("#feature-search-clear").classList.toggle("hidden", !query);
+    let visible = 0;
+    $$("#features .feature-group").forEach((group) => {
+      let groupVisible = 0;
+      $$(".feature-item", group).forEach((item) => {
+        const match = !query || item.dataset.search.includes(query);
+        item.classList.toggle("hidden", !match);
+        if (match) groupVisible += 1;
+      });
+      group.classList.toggle("hidden", groupVisible === 0);
+      if (query && groupVisible) group.open = true;
+      visible += groupVisible;
+    });
+    $("#feature-empty").classList.toggle("hidden", !query || visible > 0);
+    setText("#feature-total", query
+      ? `${visible} / ${state.featureCount} 匹配`
+      : `${state.featureCount} 个功能`);
+  }
+
+  function restoreRecentFeatures() {
+    try {
+      const raw = JSON.parse(localStorage.getItem("fnet.recentFeatures") || "[]");
+      state.recentFeatures = Array.isArray(raw)
+        ? raw.filter((item) => typeof item === "string" && item).slice(0, 8) : [];
+    } catch (error) {
+      state.recentFeatures = [];
+    }
+  }
+
+  function rememberFeatures(features) {
+    const known = new Set(state.features.map((feature) => feature.checkbox));
+    const next = features.filter((item) => known.has(item));
+    state.recentFeatures = [...new Set([...next, ...state.recentFeatures])].slice(0, 8);
+    try {
+      localStorage.setItem("fnet.recentFeatures",
+        JSON.stringify(state.recentFeatures));
+    } catch (error) {}
+    renderRecentFeatures();
+  }
+
+  function renderRecentFeatures() {
+    const box = $("#recent-features");
+    if (!box) return;
+    const byCheckbox = new Map(state.features.map((feature) =>
+      [feature.checkbox, feature]));
+    const items = state.recentFeatures
+      .map((checkbox) => byCheckbox.get(checkbox))
+      .filter(Boolean);
+    box.innerHTML = "";
+    box.classList.toggle("hidden", !items.length);
+    if (!items.length) return;
+    const title = document.createElement("span");
+    title.className = "recent-label";
+    title.textContent = "最近使用";
+    box.appendChild(title);
+    items.forEach((feature) => {
+      const input = $$("#features input[type=checkbox]")
+        .find((el) => el.value === feature.checkbox);
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = `recent-chip${input && input.checked ? " active" : ""}`;
+      chip.textContent = feature.title;
+      chip.title = feature.description || feature.handler;
+      chip.addEventListener("click", () => {
+        const box2 = $$("#features input[type=checkbox]")
+          .find((el) => el.value === feature.checkbox);
+        if (!box2) return;
+        box2.checked = !box2.checked;
+        box2.dispatchEvent(new Event("change"));
+      });
+      box.appendChild(chip);
+    });
+  }
+
+  /* ------------------------------------------------------- report export */
+  function reportCatalog() {
+    return (state.meta.report && state.meta.report.sections) || [];
+  }
+
+  function restoreReportSections() {
+    const keys = new Set(reportCatalog().map((item) => item.key));
+    const fallback = (state.meta.report && state.meta.report.default_sections) || [];
+    let saved = [];
+    try {
+      saved = JSON.parse(localStorage.getItem("fnet.reportSections") || "[]");
+    } catch (error) {
+      saved = [];
+    }
+    if (!Array.isArray(saved)) saved = [];
+    saved = saved.filter((key) => keys.has(key));
+    state.reportSections = saved.length ? saved : fallback.filter((key) => keys.has(key));
+  }
+
+  function saveReportSections(sections) {
+    state.reportSections = sections;
+    try {
+      localStorage.setItem("fnet.reportSections", JSON.stringify(sections));
+    } catch (error) {}
+  }
+
+  function reportUrl(jobId, format = "html", inline = false) {
+    const params = new URLSearchParams({
+      job: jobId, format, token: TOKEN,
+    });
+    if (state.reportSections.length) {
+      params.set("sections", state.reportSections.join(","));
+    }
+    if (inline) params.set("inline", "1");
+    return `/api/report?${params.toString()}`;
+  }
+
+
+  function statusLabel(status) {
+    return {
+      done: "完成", running: "运行中", queued: "排队",
+      cancelled: "已取消", error: "错误", interrupted: "已中断",
+    }[status] || status;
+  }
+
+  async function loadHistory() {
+    const data = await api("/api/history");
+    state.history = data.jobs || [];
+    setText("#history-count", String(state.history.length));
+    renderHistory();
+  }
+
+  function renderHistory() {
+    const box = $("#history");
+    if (!box) return;
+    if (!state.history.length) {
+      box.innerHTML = '<div class="muted">还没有历史任务。完成一次分析后会自动记录。</div>';
+      return;
+    }
+    box.innerHTML = "";
+    state.history.forEach((job) => {
+      const row = document.createElement("div");
+      row.className = "history-item";
+      const status = job.status || "";
+      const titles = (job.feature_titles || []).join("、");
+      const when = job.finished || job.started || job.created || "";
+      row.innerHTML = `
+        <div class="history-main">
+          <div class="history-title">
+            <span class="badge ${status === "done" ? "ok" : status === "running" ? "running" : status === "error" ? "bad" : ""}">${esc(statusLabel(status))}</span>
+            <strong>${esc(job.pcap_name || job.pcap || "未知流量包")}</strong>
+          </div>
+          <div class="muted small">${esc(when)} · ${(job.features || []).length} 个功能 · 任务 ${esc(String(job.id).slice(0, 8))}</div>
+          <div class="muted small history-features">${esc(titles)}</div>
+        </div>
+        <div class="history-actions">
+          <a class="ghost small" href="${esc(reportUrl(job.id))}" download title="下载 HTML 报告">HTML</a>
+          <button class="ghost small" data-history="view" data-id="${esc(job.id)}">查看报告</button>
+          <button class="ghost small" data-history="rerun" data-id="${esc(job.id)}">重跑</button>
+          <button class="ghost small danger-text" data-history="delete" data-id="${esc(job.id)}">删除</button>
+        </div>`;
+      box.appendChild(row);
+    });
+  }
+
+  async function viewHistory(jobId) {
+    const data = await api(`/api/history/${encodeURIComponent(jobId)}`);
+    const job = data.job || {};
+    const params = Object.entries(job.params || {})
+      .filter(([, value]) => value !== "" && value !== null && value !== undefined)
+      .map(([key, value]) => `${key}=${value}`).join("  ") || "（无）";
+    const files = (data.artifacts || []).map((item) => item.name).join("、") || "（无）";
+    const report = data.report || "（该任务没有报告文本）";
+    let findingsLine = "（无）";
+    try {
+      const found = await api(`/api/findings?job=${encodeURIComponent(jobId)}&limit=1`);
+      const kinds = Object.entries(found.kinds || {}).map(([key, count]) =>
+        `${state.findingsKinds[key] || key}×${count}`).join(" · ");
+      findingsLine = `${found.total} 条${kinds ? `（${kinds}）` : ""}` +
+        (found.derived ? " · 由日志推断" : "");
+    } catch (error) {}
+    await openModal({
+      title: `任务报告 · ${String(jobId).slice(0, 8)}`,
+      text: `参数: ${params}\n结构化结果: ${findingsLine}\n产出: ${files}\n\n${report}` +
+        (data.report_truncated ? "\n\n… 报告过长，已截断。" : ""),
+      hideCancel: true, okText: "关闭",
+    });
+  }
+
+  async function rerunHistory(jobId) {
+    const job = state.history.find((item) => item.id === jobId);
+    if (!job) { toast("找不到历史任务", "warn"); return; }
+    setPcap(job.pcap, job.pcap_name);
+    const wanted = new Set(job.features || []);
+    $$("#features input[type=checkbox]").forEach((input) => {
+      input.checked = wanted.has(input.value) || wanted.has(input.dataset.handler);
+    });
+    refreshSelected();
+    renderRecentFeatures();
+    rememberFeatures(job.features || []);
+    await startJob(job.features || [], job.params || {}, "重跑历史任务");
+  }
+
+  async function deleteHistory(jobId) {
+    if (!confirm("确定删除该历史任务及其产出文件吗？")) return;
+    await api(`/api/history/${encodeURIComponent(jobId)}/delete`, {
+      method: "POST", body: {},
+    });
+    toast("历史任务已删除", "good");
+    if (state.jobId === jobId) {
+      state.jobId = null;
+      state.logs = [];
+      state.artifacts = [];
+      $("#log").innerHTML = "";
+      $("#artifacts").innerHTML = "";
+      setText("#artifact-count", "0");
+      resetFindings();
+      setText("#job-state", "空闲");
+      $("#job-state").className = "badge muted";
+      setProgress(0);
+      const zip = $("#download-zip");
+      zip.classList.add("disabled");
+      zip.removeAttribute("href");
+      $("#start-btn").disabled = selectedFeatures().length === 0 || !state.pcap;
+    }
+    await loadHistory();
+  }
+
+  function applyInitial(initial) {
+    // ``fnet capture.pcapng --features ...`` preselects both the capture and
+    // the feature checkboxes; without it the WebUI simply uses the defaults.
+    if (!initial) return;
+    const boxes = $$("#features input[type=checkbox]");
+    if (Array.isArray(initial.features) && initial.features.length) {
+      const wanted = new Set(initial.features);
+      boxes.forEach((box) => { box.checked = wanted.has(box.value); });
+    }
+    if (initial.pcap) {
+      setPcap(initial.pcap);
+      toast(`已预选流量包: ${initial.pcap.split(/[\\/]/).pop()}`, "good");
+    }
+    renderRecentFeatures();
+  }
+
+  function setPcap(path, name, size) {
+    state.pcap = path || "";
+    state.fileName = name || (path ? path.split(/[\\/]/).pop() : "");
+    setText("#file-name", state.fileName || "未选择流量包");
+    setText("#file-meta", state.pcap
+      ? `${state.pcap}${size ? ` · ${fmtSize(size)}` : ""}`
+      : "选择或上传一个抓包文件开始");
+    setVal("pcap-path", state.pcap);
+    refreshSelected();
+  }
+
+  async function uploadFile(file) {
+    if (!file) return null;
+    const form = new FormData();
+    form.append("file", file, file.name);
+    return api("/api/upload", { method: "POST", body: form });
+  }
+
+  async function uploadFiles(files) {
+    const list = Array.from(files || []).filter(Boolean);
+    if (!list.length) return;
+    if (list.length === 1) {
+      toast(`正在上传 ${list[0].name}…`, "info");
+      try {
+        const data = await uploadFile(list[0]);
+        setPcap(data.path, data.name, data.size);
+        toast(`已加载 ${data.name}`, "good");
+      } catch (error) {
+        toast(error.message, "error", 7000);
+      }
+      return;
+    }
+    toast(`正在上传 ${list.length} 个流量包…`, "info", 6000);
+    const uploaded = [];
+    try {
+      for (const file of list) {
+        uploaded.push(await uploadFile(file));
+      }
+      setPcap(uploaded[0].path, uploaded[0].name, uploaded[0].size);
+      toast(`已上传 ${uploaded.length} 个流量包，开始批量排队`, "good", 5000);
+      await startBatch(uploaded.map((item) => item.path));
+    } catch (error) {
+      toast(error.message, "error", 8000);
+    }
+  }
+
+  async function startBatch(paths) {
+    if (!paths || !paths.length) { toast("请先选择流量包", "warn"); return; }
+    const features = selectedFeatures();
+    if (!features.length) { toast("请至少选择一个分析功能", "warn"); return; }
+    const concurrency = Number(val("batch-concurrency")) || 1;
+    try {
+      const data = await api("/api/batch", {
+        method: "POST",
+        body: {
+          pcaps: paths, features, params: collectParams(), concurrency,
+        },
+      });
+      state.batch.ids = (data.jobs || []).map((job) => job.id);
+      state.batch.jobs = data.jobs || [];
+      state.batch.summary = data.summary || null;
+      state.batch.active = state.batch.jobs.length > 0;
+      rememberFeatures(features);
+      renderBatch();
+      switchTab("batch");
+      toast(`已提交 ${state.batch.jobs.length} 个任务（并发 ${concurrency}）`,
+        "good", 4000);
+      pollBatch();
+    } catch (error) {
+      toast(error.message, "error", 8000);
+    }
+  }
+
+  async function pollBatch() {
+    if (!state.batch.ids.length) { renderBatch(); return; }
+    clearTimeout(state.batch.timer);
+    state.batch.timer = null;
+    try {
+      const [data, batch] = await Promise.all([
+        api("/api/jobs"), api("/api/batch"),
+      ]);
+      const wanted = new Set(state.batch.ids);
+      const jobs = (data.jobs || []).filter((job) => wanted.has(job.id));
+      if (jobs.length) state.batch.jobs = jobs;
+      state.batch.summary = batch.summary || state.batch.summary;
+      state.batch.active = jobs.some((job) => !TERMINAL.has(job.status));
+      renderBatch();
+      if (state.batch.active) {
+        state.batch.timer = setTimeout(pollBatch, 1500);
+      } else {
+        loadHistory().catch(() => {});
+        state.batch.active = false;
+      }
+    } catch (error) {
+      toast(`批量队列刷新失败：${error.message}`, "error", 7000);
+      state.batch.timer = setTimeout(pollBatch, 5000);
+    }
+  }
+
+  function orderedBatchJobs(jobs) {
+    const pending = (state.batch.summary && state.batch.summary.pending) || [];
+    const rank = new Map(pending.map((id, index) => [id, index]));
+    const weight = (job) => job.status === "running" ? 0
+      : job.status === "queued" ? 1 : 2;
+    return [...jobs].sort((left, right) => {
+      const diff = weight(left) - weight(right);
+      if (diff) return diff;
+      if (left.status === "queued" && right.status === "queued") {
+        return (rank.get(left.id) ?? 1e9) - (rank.get(right.id) ?? 1e9);
+      }
+      return String(left.created || "").localeCompare(String(right.created || ""));
+    });
+  }
+
+  function renderBatch() {
+    const box = $("#batch");
+    if (!box) return;
+    const jobs = state.batch.jobs || [];
+    const snapshot = state.batch.summary || {};
+    setText("#batch-count", String(snapshot.total ?? jobs.length));
+    const counted = jobs.reduce((acc, job) => {
+      acc[job.status] = (acc[job.status] || 0) + 1;
+      return acc;
+    }, {});
+    const paused = snapshot.paused ? " · 已暂停" : "";
+    const summary = jobs.length
+      ? `共 ${jobs.length} 个 · 运行 ${counted.running || 0} · 排队 ${counted.queued || 0} · 完成 ${counted.done || 0} · 失败 ${counted.error || 0} · 并发 ${snapshot.concurrency || val("batch-concurrency") || 1}${paused}`
+      : "";
+    setText("#batch-summary", summary);
+    const pause = $("#batch-pause");
+    if (pause) pause.textContent = snapshot.paused ? "继续队列" : "暂停队列";
+    const merge = $("#batch-merge");
+    if (merge) merge.disabled = !jobs.some((job) => job.status === "done");
+    if (!jobs.length) {
+      box.innerHTML = '<div class="muted">还没有批量任务。一次选择多个流量包后会自动开始排队。</div>';
+      return;
+    }
+    const rows = orderedBatchJobs(jobs).map((job) => {
+      const done = TERMINAL.has(job.status);
+      const pct = Math.max(0, Math.min(100, Number(job.progress) || 0));
+      const badge = job.status === "done" ? "ok"
+        : job.status === "error" ? "bad"
+          : job.status === "running" ? "running" : "";
+      const report = done && job.status === "done"
+        ? `<a class="ghost small" href="${esc(reportUrl(job.id))}" download>报告</a>`
+        : "";
+      const cancel = done ? ""
+        : `<button class="ghost small danger-text" data-batch="cancel" data-id="${esc(job.id)}">取消</button>`;
+      const draggable = job.status === "queued";
+      const grip = draggable
+        ? '<span class="batch-grip" title="拖拽调整排队顺序">⋮⋮</span>' : "";
+      return `
+        <tr data-id="${esc(job.id)}" draggable="${draggable ? "true" : "false"}"
+          class="${draggable ? "batch-queued" : ""}">
+          <td class="batch-grip-cell">${grip}</td>
+          <td><span class="badge ${badge}">${esc(statusLabel(job.status))}</span></td>
+          <td class="batch-name">${esc(job.pcap_name || job.pcap || "未知流量包")}</td>
+          <td>
+            <div class="batch-progress">
+              <div class="batch-bar"><div style="width:${pct}%"></div></div>
+              <span class="muted small">${pct}%${job.current ? ` · ${esc(job.current)}` : ""}</span>
+            </div>
+          </td>
+          <td>
+            <div class="batch-actions">
+              <button class="ghost small" data-batch="view" data-id="${esc(job.id)}">日志</button>
+              ${report}${cancel}
+            </div>
+          </td>
+        </tr>`;
+    }).join("");
+    box.innerHTML = `
+      <table class="batch-table">
+        <thead><tr><th></th><th>状态</th><th>流量包</th><th>进度</th><th>操作</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  async function batchControl(action, body = {}) {
+    try {
+      const data = await api(`/api/batch/${action}`, {
+        method: "POST", body,
+      });
+      if (data.summary) state.batch.summary = data.summary;
+      renderBatch();
+      if (data.summary) state.batch.active = data.summary.active > 0;
+      if (state.batch.active) pollBatch();
+      return data;
+    } catch (error) {
+      toast(error.message, "error", 7000);
+      return null;
+    }
+  }
+
+  async function toggleBatchPause() {
+    const paused = !!(state.batch.summary && state.batch.summary.paused);
+    const data = await batchControl(paused ? "resume" : "pause");
+    if (data) toast(paused ? "队列已继续" : "队列已暂停", "good", 1800);
+  }
+
+  async function reorderBatch(ids) {
+    const data = await batchControl("reorder", { ids });
+    if (data) toast("排队顺序已更新", "good", 1600);
+  }
+
+  async function mergeBatchReport() {
+    const ids = (state.batch.jobs || [])
+      .filter((job) => job.status === "done").map((job) => job.id);
+    if (!ids.length) { toast("还没有已完成的任务可合并", "warn"); return; }
+    const values = await openModal({
+      title: `合并 ${ids.length} 个任务的报告`,
+      fields: [{
+        name: "format", label: "格式", type: "select", value: "html",
+        options: [
+          { value: "html", label: "HTML（可直接打印为 PDF）" },
+          { value: "markdown", label: "Markdown" },
+        ],
+      }],
+      okText: "下载",
+    });
+    if (!values) return;
+    const url = `/api/batch/report?jobs=${encodeURIComponent(ids.join(","))}` +
+      `&format=${encodeURIComponent(values.format || "html")}` +
+      `&token=${encodeURIComponent(TOKEN)}`;
+    window.location.href = url;
+    toast(`已开始下载 ${ids.length} 个任务的合并报告`, "good", 2400);
+  }
+
+  function viewBatchJob(jobId) {
+    const job = (state.batch.jobs || []).find((item) => item.id === jobId);
+    if (!job) { toast("找不到该批量任务", "warn"); return; }
+    setPcap(job.pcap, job.pcap_name);
+    attachJob(job, `批量任务 · ${statusLabel(job.status)}`);
+  }
+
+  async function cancelBatchJob(jobId) {
+    try {
+      await api(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+        method: "POST", body: {},
+      });
+      toast("已发送取消请求", "warn", 2200);
+      pollBatch();
+    } catch (error) {
+      toast(error.message, "error", 7000);
+    }
+  }
+
+  function clearBatch() {
+    const before = (state.batch.jobs || []).length;
+    state.batch.jobs = (state.batch.jobs || [])
+      .filter((job) => !TERMINAL.has(job.status));
+    state.batch.ids = state.batch.jobs.map((job) => job.id);
+    renderBatch();
+    if (before !== state.batch.jobs.length) toast("已清空完成的任务", "good", 1800);
+  }
+
+  /* ------------------------------------------------------ visualization */
+  function parseHierarchy(text) {
+    const skip = new Set(["frame", "eth", "ip", "ipv6", "tcp", "udp"]);
+    const items = [];
+    String(text || "").split("\n").forEach((line) => {
+      const match = line.match(/^\s*([\w.-]+)\s+frames:(\d+)\s+bytes:(\d+)\s*$/);
+      if (!match || skip.has(match[1])) return;
+      items.push({
+        label: match[1], frames: Number(match[2]) || 0,
+        bytes: Number(match[3]) || 0,
+      });
+    });
+    return items.sort((a, b) => b.bytes - a.bytes).slice(0, 10);
+  }
+
+  function parseConversations(text) {
+    const items = [];
+    String(text || "").split("\n").forEach((line) => {
+      if (!line.includes("<->")) return;
+      const [left, rest] = line.split("<->");
+      const match = rest.match(
+        /([\d,]+)\s+([\d,]+) bytes\s+([\d,]+)\s+([\d,]+) bytes\s+([\d,]+)\s+([\d,]+) bytes/);
+      if (!match) return;
+      const peer = rest.trim().split(/\s+/)[0] || "?";
+      items.push({
+        label: `${left.trim()} ↔ ${peer}`,
+        frames: Number(match[5].replace(/,/g, "")) || 0,
+        bytes: Number(match[6].replace(/,/g, "")) || 0,
+      });
+    });
+    return items.sort((a, b) => b.bytes - a.bytes).slice(0, 8);
+  }
+
+  function renderBars(selector, items, metric) {
+    const box = $(selector);
+    if (!box) return;
+    if (!items || !items.length) {
+      box.classList.add("muted");
+      box.textContent = "没有可用于图表的数据";
+      return;
+    }
+    const value = (item) => Math.max(0, Number(item[metric]) || 0);
+    const max = Math.max(...items.map(value), 1);
+    box.classList.remove("muted");
+    const clickable = selector === "#viz-protocols";
+    box.innerHTML = items.map((item) => {
+      const width = Math.max(1, Math.round(value(item) / max * 100));
+      const label = metric === "frames"
+        ? `${item.frames} 帧` : fmtSize(item.bytes);
+      return `
+        <div class="viz-bar-row${clickable ? " drillable" : ""}"
+          title="${esc(item.label)} · ${esc(label)}${clickable ? " · 点击下钻" : ""}"
+          ${clickable ? `data-protocol="${esc(item.label)}" role="button" tabindex="0"` : ""}>
+          <span class="viz-bar-label">${esc(item.label)}</span>
+          <span class="viz-bar-track"><span style="width:${width}%"></span></span>
+          <span class="viz-bar-value">${esc(label)}</span>
+        </div>`;
+    }).join("");
+  }
+
+  function timelineVisible() {
+    const points = (state.viz.timeline && state.viz.timeline.points) || [];
+    if (!state.viz.zoom || !points.length) return { points, start: 0, end: points.length - 1 };
+    const start = Math.max(0, Math.min(state.viz.zoom[0], points.length - 1));
+    const end = Math.max(start, Math.min(state.viz.zoom[1], points.length - 1));
+    return { points: points.slice(start, end + 1), start, end };
+  }
+
+  function renderTimeline() {
+    const box = $("#viz-timeline");
+    if (!box) return;
+    const data = state.viz.timeline;
+    const all = (data && data.points) || [];
+    if (!all.length) {
+      box.classList.add("muted");
+      box.textContent = (data && data.text) || "没有时间线数据";
+      state.viz.svg = "";
+      return;
+    }
+    const { points, start, end } = timelineVisible();
+    const metric = val("viz-metric") === "frames" ? "frames" : "bytes";
+    const max = Math.max(...points.map((point) => Number(point[metric]) || 0), 1);
+    box.classList.remove("muted");
+    const width = 1000, height = 260, left = 42, right = 12, top = 12, bottom = 34;
+    const plotW = width - left - right, plotH = height - top - bottom;
+    const slot = plotW / Math.max(points.length, 1);
+    const gap = Math.max(0.5, slot * 0.12);
+    const bars = points.map((point, index) => {
+      const amount = Number(point[metric]) || 0;
+      const barH = amount ? Math.max(2, Math.round(amount / max * plotH)) : 1;
+      const x = left + index * slot + gap / 2;
+      const y = top + plotH - barH;
+      const label = `${(point.time - (data.start || 0)).toFixed(2)}s · ${point.frames} 帧 · ${fmtSize(point.bytes)}`;
+      return `<rect class="tl-bar" x="${x.toFixed(2)}" y="${y.toFixed(2)}"
+        width="${Math.max(1, slot - gap).toFixed(2)}" height="${barH}"
+        data-index="${start + index}" data-start="${point.time}"
+        data-end="${point.time + ((data.duration || 0) / Math.max(all.length, 1))}">
+        <title>${esc(label)}</title></rect>`;
+    }).join("");
+    const span = data.duration || 0;
+    const lowTime = points.length ? points[0].time - (data.start || 0) : 0;
+    const highTime = points.length ? points[points.length - 1].time - (data.start || 0) : span;
+    const grid = [0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+      const x = left + plotW * ratio;
+      const stamp = lowTime + (highTime - lowTime) * ratio;
+      return `<line class="tl-grid" x1="${x}" y1="${top}" x2="${x}" y2="${top + plotH}"></line>
+        <text class="tl-label" x="${x}" y="${height - 10}" text-anchor="middle">${stamp.toFixed(1)}s</text>`;
+    }).join("");
+    const svg = `<svg id="viz-timeline-svg" viewBox="0 0 ${width} ${height}"
+      role="img" aria-label="流量时间线" xmlns="http://www.w3.org/2000/svg">
+      <rect class="tl-bg" x="0" y="0" width="${width}" height="${height}"></rect>
+      ${grid}
+      <line class="tl-axis" x1="${left}" y1="${top + plotH}" x2="${left + plotW}" y2="${top + plotH}"></line>
+      ${bars}
+      <rect id="tl-select" class="tl-select hidden" x="0" y="${top}" width="0" height="${plotH}"></rect>
+    </svg>
+    <div class="muted small">${esc(data.text || "")} · 当前显示 ${points.length}/${all.length} 个时间桶（滚轮缩放，拖拽框选，双击重置）</div>`;
+    box.innerHTML = svg;
+    state.viz.svg = box.querySelector("svg").outerHTML;
+    bindTimeline(box.querySelector("svg"), data, all);
+  }
+
+  function bindTimeline(svg, data, all) {
+    if (!svg) return;
+    const left = 42, right = 12, width = 1000;
+    const plotW = width - left - right;
+    let drag = null;
+    const indexAt = (event) => {
+      const rect = svg.getBoundingClientRect();
+      const x = (event.clientX - rect.left) / rect.width * width;
+      const ratio = Math.max(0, Math.min(1, (x - left) / plotW));
+      return Math.round(ratio * (all.length - 1));
+    };
+    svg.addEventListener("wheel", (event) => {
+      event.preventDefault();
+      const center = indexAt(event);
+      const current = state.viz.zoom || [0, all.length - 1];
+      const span = Math.max(2, current[1] - current[0]);
+      const factor = event.deltaY < 0 ? 0.7 : 1.4;
+      const next = Math.max(2, Math.round(span * factor));
+      const low = Math.max(0, Math.min(center - Math.round(next / 2),
+        Math.max(0, all.length - 1 - next)));
+      state.viz.zoom = [low, Math.min(all.length - 1, low + next)];
+      renderTimeline();
+    }, { passive: false });
+    svg.addEventListener("mousedown", (event) => {
+      if (event.button !== 0) return;
+      drag = { start: indexAt(event), current: indexAt(event) };
+      const box = svg.querySelector("#tl-select");
+      box.classList.remove("hidden");
+    });
+    svg.addEventListener("mousemove", (event) => {
+      if (!drag) return;
+      drag.current = indexAt(event);
+      const low = Math.min(drag.start, drag.current);
+      const high = Math.max(drag.start, drag.current);
+      if (high - low < 1) return;
+      const slot = plotW / Math.max(all.length, 1);
+      const box = svg.querySelector("#tl-select");
+      box.setAttribute("x", (left + low * slot).toFixed(2));
+      box.setAttribute("width", (Math.max(1, (high - low + 1) * slot)).toFixed(2));
+    });
+    svg.addEventListener("mouseup", () => {
+      if (!drag) return;
+      const low = Math.min(drag.start, drag.current);
+      const high = Math.max(drag.start, drag.current);
+      drag = null;
+      if (high - low >= 2) {
+        state.viz.zoom = [low, high];
+        renderTimeline();
+      } else {
+        const box = svg.querySelector("#tl-select");
+        if (box) box.classList.add("hidden");
+      }
+    });
+    svg.addEventListener("dblclick", () => {
+      state.viz.zoom = null;
+      renderTimeline();
+    });
+    svg.addEventListener("click", (event) => {
+      const bar = event.target.closest(".tl-bar");
+      if (!bar) return;
+      openTimelineBucket(Number(bar.dataset.start), Number(bar.dataset.end));
+    });
+  }
+
+  async function openTimelineBucket(start, end) {
+    if (!state.pcap) return;
+    try {
+      const data = await api("/api/action", {
+        method: "POST",
+        body: {
+          action: "stats", sub: "timeline_packets", pcap: state.pcap,
+          start, end, limit: 200,
+        },
+      });
+      const lines = (data.packets || []).map((item) =>
+        `#${item.frame}  ${item.time}s  ${item.protocol || ""}  ` +
+        `${item.src || ""} → ${item.dst || ""}  ${item.info || ""}`);
+      await openModal({
+        title: data.text || "时间线数据包",
+        text: lines.join("\n") || "（无数据包）", hideCancel: true,
+        okText: "关闭",
+      });
+    } catch (error) {
+      toast(error.message, "error", 7000);
+    }
+  }
+
+  async function openProtocolDetail(protocol) {
+    if (!state.pcap) { toast("请先选择流量包", "warn"); return; }
+    try {
+      const data = await api("/api/action", {
+        method: "POST",
+        body: {
+          action: "stats", sub: "protocol", pcap: state.pcap,
+          protocol, limit: 300,
+        },
+      });
+      const lines = (data.packets || []).map((item) =>
+        `#${item.frame}  ${item.time}s  ${item.protocol || ""}  ` +
+        `${item.src || ""} → ${item.dst || ""}  ${item.info || ""}`);
+      await openModal({
+        title: `${protocol} 协议下钻 · ${lines.length} 个数据包`,
+        text: lines.join("\n") || "（无数据包）", hideCancel: true,
+        okText: "关闭",
+      });
+    } catch (error) {
+      toast(error.message, "error", 7000);
+    }
+  }
+
+  function renderTopology() {
+    const box = $("#viz-topology");
+    if (!box) return;
+    const data = state.viz.topology;
+    const nodes = (data && data.nodes) || [];
+    const edges = (data && data.edges) || [];
+    if (!nodes.length) {
+      box.classList.add("muted");
+      box.textContent = (data && data.text) || "没有可用的会话拓扑";
+      return;
+    }
+    box.classList.remove("muted");
+    const width = 1000, height = 420, cx = width / 2, cy = height / 2;
+    const maxBytes = Math.max(...nodes.map((node) => Number(node.bytes) || 0), 1);
+    const positions = {};
+    nodes.forEach((node, index) => {
+      const ratio = index / Math.max(nodes.length, 1);
+      const ring = index < 8 ? 105 : 185;
+      const angle = ratio * Math.PI * 2 - Math.PI / 2;
+      positions[node.id] = {
+        x: cx + Math.cos(angle) * ring,
+        y: cy + Math.sin(angle) * ring,
+        radius: 5 + Math.sqrt((Number(node.bytes) || 0) / maxBytes) * 17,
+      };
+    });
+    const palette = ["#4ea1ff", "#7ad97a", "#ffd166", "#ff7b72", "#c792ea",
+      "#67d8ef", "#f78c6c", "#a3e635"];
+    const nodeColor = (node) => {
+      const name = (node.protocols || [])[0] || node.id;
+      let hash = 0;
+      for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) | 0;
+      return palette[Math.abs(hash) % palette.length];
+    };
+    const edgeSvg = edges.map((edge) => {
+      const a = positions[edge.source], b = positions[edge.target];
+      if (!a || !b) return "";
+      const weight = 1 + Math.min(7, Math.sqrt((Number(edge.bytes) || 0) /
+        Math.max(data.max_bytes || maxBytes, 1)) * 9);
+      return `<line class="topo-edge" x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}"
+        x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}"
+        stroke-width="${weight.toFixed(2)}"><title>${esc(edge.protocol)} · ${edge.frames} 帧 · ${fmtSize(edge.bytes)} · 帧 ${esc(edge.first_frame)}-${esc(edge.last_frame)}</title></line>`;
+    }).join("");
+    const nodeSvg = nodes.map((node) => {
+      const pos = positions[node.id];
+      const label = node.port ? `${node.ip}:${node.port}` : node.ip;
+      return `<g class="topo-node" data-node="${esc(node.id)}">
+        <circle cx="${pos.x.toFixed(1)}" cy="${pos.y.toFixed(1)}" r="${pos.radius.toFixed(1)}"
+          fill="${nodeColor(node)}"><title>${esc(label)} · ${node.frames} 帧 · ${fmtSize(node.bytes)} · ${esc((node.protocols || []).join(", "))}</title></circle>
+        <text x="${pos.x.toFixed(1)}" y="${(pos.y + pos.radius + 13).toFixed(1)}"
+          text-anchor="middle">${esc(label.length > 24 ? label.slice(0, 23) + "…" : label)}</text>
+      </g>`;
+    }).join("");
+    box.innerHTML = `<svg id="viz-topology-svg" viewBox="0 0 ${width} ${height}"
+      role="img" aria-label="会话拓扑" xmlns="http://www.w3.org/2000/svg">
+      <rect class="tl-bg" x="0" y="0" width="${width}" height="${height}"></rect>
+      ${edgeSvg}${nodeSvg}</svg>
+      <div class="muted small">${esc(data.text || "")}</div>`;
+  }
+
+  async function loadViz() {
+    if (!state.pcap) { toast("请先选择流量包", "warn"); return; }
+    const buckets = Number(val("viz-buckets")) || 60;
+    setText("#viz-summary", "正在统计…");
+    const calls = [
+      { sub: "timeline", buckets },
+      { sub: "hierarchy" },
+      { sub: "ip" },
+      { sub: "topology" },
+    ].map((body) => api("/api/action", {
+      method: "POST", body: { action: "stats", pcap: state.pcap, ...body },
+    }).catch((error) => ({ ok: false, text: error.message })));
+    const [timeline, hierarchy, talkers, topology] = await Promise.all(calls);
+    state.viz.timeline = timeline.ok ? timeline : null;
+    state.viz.hierarchy = hierarchy.ok ? parseHierarchy(hierarchy.text) : null;
+    state.viz.talkers = talkers.ok ? parseConversations(talkers.text) : null;
+    state.viz.topology = topology.ok ? topology : null;
+    state.viz.zoom = null;
+    setText("#viz-summary", timeline.ok
+      ? (timeline.text || "") : (timeline.text || "统计失败"));
+    renderViz();
+  }
+
+  function renderViz() {
+    const metric = val("viz-metric") === "frames" ? "frames" : "bytes";
+    renderTimeline();
+    renderTopology();
+    renderBars("#viz-protocols", state.viz.hierarchy, metric);
+    renderBars("#viz-talkers", state.viz.talkers, metric);
+  }
+
+  function downloadSvg() {
+    if (!state.viz.svg) { toast("请先刷新图表", "warn"); return; }
+    downloadText(`fnet-timeline-${Date.now()}.svg`, state.viz.svg);
+  }
+
+  async function downloadPng() {
+    if (!state.viz.svg) { toast("请先刷新图表", "warn"); return; }
+    try {
+      const svg = state.viz.svg.replace("<svg ", '<svg style="background:#12161c" ');
+      const url = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+      const image = new Image();
+      await new Promise((resolve, reject) => {
+        image.onload = resolve;
+        image.onerror = () => reject(new Error("SVG 渲染失败"));
+        image.src = url;
+      });
+      const canvas = document.createElement("canvas");
+      canvas.width = 1600;
+      canvas.height = 416;
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#12161c";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+      const link = document.createElement("a");
+      link.href = canvas.toDataURL("image/png");
+      link.download = `fnet-timeline-${Date.now()}.png`;
+      link.click();
+      toast("PNG 已导出", "good", 1800);
+    } catch (error) {
+      toast(`PNG 导出失败：${error.message}`, "error", 7000);
+    }
+  }
+
+  async function uploadTlsKey(file) {
+    if (!file) return;
+    const kind = state.tlsKeyKind === "key" ? "key" : "keylog";
+    const form = new FormData();
+    form.append("file", file, file.name);
+    try {
+      const data = await api("/api/upload", {
+        method: "POST", body: form, headers: { "X-Kind": kind },
+      });
+      toast(data.text || "TLS 密钥已上传", "good", 6000);
+      await refreshMeta();
+    } catch (error) {
+      toast(error.message, "error", 8000);
+    }
+  }
+
+  async function startJob(features, params, label) {
+    if (!state.pcap) { toast("请先选择流量包", "warn"); return; }
+    if (!features.length) { toast("请至少选择一个分析功能", "warn"); return; }
+    try {
+      const data = await api("/api/analyze", {
+        method: "POST",
+        body: { pcap: state.pcap, features, params },
+      });
+      attachJob(data.job, label);
+      rememberFeatures(features);
+    } catch (error) {
+      toast(error.message, "error", 8000);
+    }
+  }
+
+  function attachJob(job, label) {
+    if (!job) return;
+    state.jobId = job.id;
+    state.cursor = 0;
+    state.logs = [];
+    state.artifacts = [];
+    $("#log").innerHTML = "";
+    $("#artifacts").innerHTML = "";
+    setText("#artifact-count", "0");
+    resetFindings();
+    const zip = $("#download-zip");
+    zip.classList.add("disabled");
+    zip.removeAttribute("href");
+    $("#start-btn").disabled = true;
+    $("#cancel-btn").disabled = false;
+    setText("#job-state", label || "分析中");
+    $("#job-state").className = "badge running";
+    setProgress(0);
+    switchTab("log");
+    pollJob(job.id);
+  }
+
+  function setProgress(value) {
+    const pct = Math.max(0, Math.min(100, Number(value) || 0));
+    $("#progress-bar").style.width = `${pct}%`;
+    setText("#progress-text", `${Math.round(pct)}%`);
+  }
+
+  async function pollJob(jobId) {
+    if (state.jobId !== jobId) return;
+    try {
+      const data = await api(`/api/jobs/${jobId}?cursor=${state.cursor}`);
+      if (state.jobId !== jobId) return;
+      appendLogs(data.logs);
+      state.cursor = data.cursor || state.cursor;
+      updateJob(data.job, data.artifacts);
+      if (TERMINAL.has(data.job.status)) {
+        $("#cancel-btn").disabled = true;
+        $("#start-btn").disabled = selectedFeatures().length === 0 || !state.pcap;
+        if (data.job.status === "done") {
+          toast(`分析完成：${data.job.feature_titles.length} 个功能`, "good");
+        } else if (data.job.status === "cancelled") {
+          toast("分析已取消", "warn");
+        } else {
+          toast(`分析结束（${data.job.status}）${data.job.error ? "：" + data.job.error : ""}`,
+            "error", 8000);
+        }
+        loadHistory().catch(() => {});
+        loadFindings(jobId, { quiet: true });
+        return;
+      }
+      state.pollTimer = setTimeout(() => pollJob(jobId), 450);
+    } catch (error) {
+      toast(`获取任务状态失败：${error.message}`, "error", 7000);
+      state.pollTimer = setTimeout(() => pollJob(jobId), 1200);
+    }
+  }
+
+  function updateJob(job, artifacts) {
+    setProgress(job.progress);
+    setText("#job-state", job.status === "running"
+      ? (job.current ? `运行中 · ${job.current}` : "运行中")
+      : job.status === "done" ? "完成"
+        : job.status === "cancelled" ? "已取消"
+          : job.status === "error" ? "错误" : job.status);
+    $("#job-state").className = `badge ${
+      job.status === "done" ? "ok" : job.status === "running" ? "running" :
+        job.status === "error" ? "bad" : ""}`;
+    if (job.feature_titles) {
+      setText("#file-meta", `${job.pcap} · ${job.feature_titles.length} 个功能 · 任务 ${job.id.slice(0, 6)}`);
+    }
+    if (typeof job.findings_count === "number" && !state.findingsJob) {
+      setText("#findings-count", String(job.findings_count));
+    }
+    if (artifacts && artifacts.length) renderArtifacts(job, artifacts);
+  }
+
+  async function cancelJob() {
+    if (!state.jobId) return;
+    try {
+      await api(`/api/jobs/${state.jobId}/cancel`, { method: "POST", body: {} });
+      toast("已发送取消请求", "warn");
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+
+  /* ----------------------------------------------------------- artifacts */
+  function renderArtifacts(job, artifacts) {
+    state.artifacts = artifacts || [];
+    setText("#artifact-count", String(state.artifacts.length));
+    const box = $("#artifacts");
+    if (!state.artifacts.length) {
+      box.innerHTML = '<div class="muted">当前任务还没有产出文件。</div>';
+      return;
+    }
+    box.innerHTML = "";
+    state.artifacts.forEach((artifact) => {
+      const row = document.createElement("div");
+      row.className = "artifact";
+      const url = `/api/download?job=${encodeURIComponent(job.id)}&path=${
+        encodeURIComponent(artifact.name)}&token=${encodeURIComponent(TOKEN)}`;
+      row.innerHTML = `<span class="name">${esc(artifact.name)}</span>
+        <span class="size">${fmtSize(artifact.size)}</span>
+        <a class="dl" href="${url}" download>下载</a>`;
+      box.appendChild(row);
+    });
+    const zip = $("#download-zip");
+    zip.href = `/api/download?job=${encodeURIComponent(job.id)}&token=${encodeURIComponent(TOKEN)}`;
+    zip.classList.remove("disabled");
+  }
+
+  /* ------------------------------------------------------------ findings */
+  const LEVEL_NAMES = {
+    debug: "调试", info: "信息", good: "成功", warn: "警告", error: "错误",
+  };
+  const FINDING_COLUMNS = [
+    ["kind", "类别"], ["level", "级别"], ["frame", "帧"], ["feature", "功能"],
+    ["summary", "摘要"], ["detail", "详情"],
+  ];
+
+  function findingValue(item, key) {
+    if (key === "kind") return state.findingsKinds[item.kind] || item.kind || "";
+    if (key === "level") return LEVEL_NAMES[item.level] || item.level || "";
+    return String(item[key] ?? "");
+  }
+
+  function findingMatches(item) {
+    const kind = val("findings-kind") || "all";
+    if (kind !== "all" && item.kind !== kind) return false;
+    const level = val("findings-level") || "all";
+    if (level !== "all" && item.level !== level) return false;
+    const query = val("findings-search").toLowerCase();
+    if (!query) return true;
+    return FINDING_COLUMNS.some(([key]) =>
+      findingValue(item, key).toLowerCase().includes(query));
+  }
+
+  function sortedFindings() {
+    const { key, dir } = state.findingsSort || { key: "seq", dir: 1 };
+    return [...state.findings].sort((left, right) => {
+      if (key === "seq" || key === "frame") {
+        return ((Number(left[key]) || 0) - (Number(right[key]) || 0)) * dir;
+      }
+      const a = findingValue(left, key).toLowerCase();
+      const b = findingValue(right, key).toLowerCase();
+      return (a < b ? -1 : a > b ? 1 : 0) * dir;
+    });
+  }
+
+  function clip(text, limit = 140) {
+    const value = String(text ?? "").replace(/\s+/g, " ").trim();
+    return value.length > limit ? `${value.slice(0, limit)}…` : value;
+  }
+
+  function visibleFindingColumns() {
+    return FINDING_COLUMNS.filter(([key]) => !state.findingsHidden.has(key));
+  }
+
+  function findingCell(item, key) {
+    if (key === "frame") {
+      const frame = Number(item.frame) || 0;
+      return frame
+        ? `<button type="button" class="frame-link" data-frame="${frame}" title="查看数据包 ${frame}">${esc(frame)}</button>`
+        : "";
+    }
+    if (key === "level") {
+      const level = LEVEL_NAMES[item.level] ? item.level : "info";
+      return `<span class="finding-level ${level}">${esc(findingValue(item, "level"))}</span>`;
+    }
+    if (key === "summary") {
+      return `<span class="finding-summary">${highlightFlags(esc(clip(item.summary, 180)))}</span>`;
+    }
+    if (key === "detail") {
+      return `<span class="mono muted finding-detail">${esc(clip(item.detail, 160))}</span>`;
+    }
+    if (key === "kind") {
+      return `<span class="finding-kind">${esc(clip(findingValue(item, key), 80))}</span>`;
+    }
+    return esc(clip(findingValue(item, key), 80));
+  }
+
+  function pageSlice(items) {
+    const size = Math.max(1, Number(state.findingsPageSize) || 100);
+    const pages = Math.max(1, Math.ceil(items.length / size));
+    state.findingsPage = Math.min(Math.max(1, state.findingsPage), pages);
+    const start = (state.findingsPage - 1) * size;
+    return { items: items.slice(start, start + size), pages, start, size };
+  }
+
+  function renderFindingsColumns() {
+    const panel = $("#findings-columns");
+    if (!panel) return;
+    panel.innerHTML = FINDING_COLUMNS.map(([key, label]) => `
+      <label class="inline"><input type="checkbox" data-column="${esc(key)}"
+        ${state.findingsHidden.has(key) ? "" : "checked"}> ${esc(label)}</label>`).join("");
+  }
+
+  function renderFindingsPager(page) {
+    const box = $("#findings-pager");
+    if (!box) return;
+    if (!state.findingsVisible.length) { box.innerHTML = ""; return; }
+    box.innerHTML = `
+      <button class="ghost small" data-page="1" ${page.pages <= 1 || state.findingsPage === 1 ? "disabled" : ""}>首页</button>
+      <button class="ghost small" data-page="${state.findingsPage - 1}" ${state.findingsPage <= 1 ? "disabled" : ""}>上一页</button>
+      <span class="muted small">第 ${state.findingsPage} / ${page.pages} 页 · 本页 ${page.items.length} 条</span>
+      <button class="ghost small" data-page="${state.findingsPage + 1}" ${state.findingsPage >= page.pages ? "disabled" : ""}>下一页</button>
+      <button class="ghost small" data-page="${page.pages}" ${state.findingsPage >= page.pages ? "disabled" : ""}>末页</button>`;
+  }
+
+  function renderFindings() {
+    const box = $("#findings");
+    if (!box) return;
+    state.findingsVisible = sortedFindings().filter(findingMatches);
+    const total = state.findings.length;
+    const page = pageSlice(state.findingsVisible);
+    setText("#findings-visible",
+      total ? `匹配 ${state.findingsVisible.length} / ${total} 条 · 本页 ${page.items.length} 条` : "");
+    let summary = "";
+    if (state.findingsDerived) summary = "（旧任务：结果由日志推断）";
+    else if (total) {
+      const kinds = Object.entries(state.findings.reduce((acc, item) => {
+        acc[item.kind] = (acc[item.kind] || 0) + 1;
+        return acc;
+      }, {})).map(([key, count]) =>
+        `${state.findingsKinds[key] || key}×${count}`).join(" · ");
+      summary = kinds;
+    }
+    setText("#findings-summary", summary);
+    if (state.findingsTruncated) {
+      setText("#findings-visible",
+        `匹配 ${state.findingsVisible.length} / ${total} 条（已截断，可导出 CSV 查看全部）`);
+    }
+    renderFindingsColumns();
+    if (!total) {
+      box.innerHTML = state.jobId
+        ? '<div class="muted">当前任务没有结构化结果。启用 HTTP 提取、NTLM、关键字或 Webshell 等功能后会显示在这里。</div>'
+        : '<div class="muted">任务结束后，凭据、哈希、flag、导出文件等会汇总在这里。</div>';
+      renderFindingsPager(page);
+      return;
+    }
+    if (!state.findingsVisible.length) {
+      box.innerHTML = '<div class="muted">没有匹配的结果，试试调整关键字或筛选条件。</div>';
+      renderFindingsPager(page);
+      return;
+    }
+    const sort = state.findingsSort || { key: "seq", dir: 1 };
+    const columns = visibleFindingColumns();
+    const pageSelected = page.items.every((item) => state.findingsSelected.has(String(item.seq)));
+    const head = columns.map(([key, label]) => {
+      const active = sort.key === key;
+      const mark = active ? (sort.dir > 0 ? " ▲" : " ▼") : "";
+      return `<th data-sort="${key}" class="${active ? "sorted" : ""}"
+        title="点击排序">${esc(label)}${mark}</th>`;
+    }).join("");
+    const body = page.items.map((item) => {
+      const level = LEVEL_NAMES[item.level] ? item.level : "info";
+      const seq = String(item.seq);
+      const cells = columns.map(([key]) => `<td class="${key === "frame" ? "mono" : ""}">${findingCell(item, key)}</td>`).join("");
+      return `<tr data-seq="${esc(seq)}" tabindex="0" class="lvl-${level}${state.findingsSelected.has(seq) ? " selected" : ""}">
+        <td class="select-cell"><input type="checkbox" class="finding-select" data-seq="${esc(seq)}"
+          ${state.findingsSelected.has(seq) ? "checked" : ""} aria-label="选择结果 ${esc(seq)}"></td>
+        ${cells}</tr>`;
+    }).join("");
+    box.innerHTML = `<table class="findings-table">
+      <thead><tr><th class="select-cell"><input type="checkbox" id="findings-select-page"
+        ${pageSelected ? "checked" : ""} aria-label="选择本页"></th>${head}</tr></thead>
+      <tbody>${body}</tbody></table>`;
+    renderFindingsPager(page);
+  }
+
+  function highlightFlags(escaped) {
+    return String(escaped).replace(/flag\{[^}\s]{1,200}\}/gi,
+      (match) => `<mark>${match}</mark>`);
+  }
+
+  function showFinding(seq) {
+    const item = state.findings.find((entry) => String(entry.seq) === String(seq));
+    if (!item) return;
+    const lines = [
+      `类别: ${findingValue(item, "kind")}`,
+      `级别: ${findingValue(item, "level")}`,
+      `功能: ${item.feature || "—"}`,
+      `帧: ${item.frame || "—"}    时间: ${item.time || "—"}`,
+      "",
+      item.summary || "",
+    ];
+    if (item.detail) lines.push("", item.detail);
+    openModal({
+      title: `结果详情 · ${findingValue(item, "kind")}`,
+      text: lines.join("\n"), hideCancel: true, okText: "关闭",
+    }).catch(() => {});
+  }
+
+  /* ------------------------------------------------------------ packets */
+  const packetState = { job: null, frame: 0, wireshark: false, range: [1, 1] };
+
+  function packetJob() {
+    return state.jobId || state.findingsJob || "";
+  }
+
+  function closePacket() {
+    $("#packet-modal").classList.add("hidden");
+  }
+
+  async function openPacket(frame) {
+    const job = packetJob();
+    const number = Number(frame);
+    if (!job) { toast("请先运行或选择一个分析任务", "warn"); return; }
+    if (!number) return;
+    try {
+      const data = await api(
+        `/api/packet?job=${encodeURIComponent(job)}&frame=${number}&context=2`);
+      packetState.job = job;
+      packetState.frame = number;
+      packetState.range = data.range || [number, number];
+      packetState.wireshark = !!(data.tools && data.tools.wireshark);
+      const packet = data.packet || {};
+      setText("#packet-title",
+        `数据包 · 帧 ${number}${packet.protocol ? ` · ${packet.protocol}` : ""}`);
+      const rows = (data.neighbors || []).map((item) => {
+        const active = String(item.frame) === String(number) ? " class=\"active\"" : "";
+        return `<tr${active}><td class="mono">${esc(item.frame)}</td>` +
+          `<td class="mono">${esc(item.time)}</td><td>${esc(item.protocol)}</td>` +
+          `<td>${esc(item.info)}</td><td class="mono">${esc(item.length)}</td></tr>`;
+      }).join("");
+      $("#packet-body").innerHTML = `
+        <div class="packet-summary"><strong>${esc(packet.protocol || "")}</strong>
+          ${esc(packet.info || "")}</div>
+        <table class="packet-neighbors">
+          <thead><tr><th>帧</th><th>时间</th><th>协议</th><th>摘要</th><th>长度</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="5" class="muted">没有上下文帧</td></tr>'}</tbody>
+        </table>
+        <pre class="packet-detail">${esc(data.detail || "（没有详细解码输出）")}</pre>`;
+      const wireshark = $("#packet-wireshark");
+      wireshark.disabled = !packetState.wireshark;
+      wireshark.title = packetState.wireshark ? "" : "未检测到 Wireshark";
+      $("#packet-modal").classList.remove("hidden");
+    } catch (error) {
+      toast(error.message, "error", 7000);
+    }
+  }
+
+  async function downloadPacketClip() {
+    if (!packetState.job || !packetState.frame) return;
+    const url = `/api/packet?job=${encodeURIComponent(packetState.job)}` +
+      `&frame=${packetState.frame}&context=2&format=pcap` +
+      `&token=${encodeURIComponent(TOKEN)}`;
+    try {
+      const response = await fetch(url);
+      const type = response.headers.get("content-type") || "";
+      if (!response.ok) {
+        let message = `HTTP ${response.status}`;
+        if (type.includes("application/json")) {
+          const data = await response.json();
+          message = data.error || message;
+        }
+        throw new Error(message);
+      }
+      const blob = await response.blob();
+      const href = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = href;
+      link.download = `fnet-frame-${packetState.frame}.pcapng`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(href), 4000);
+      toast(`已导出帧 ${packetState.range[0]}-${packetState.range[1]} 的抓包片段`, "good");
+    } catch (error) {
+      toast(error.message, "error", 7000);
+    }
+  }
+
+  async function openInWireshark() {
+    if (!packetState.job || !packetState.frame) return;
+    try {
+      const data = await api("/api/action", {
+        method: "POST",
+        body: {
+          action: "open_wireshark", job: packetState.job,
+          frame: packetState.frame,
+        },
+      });
+      toast(data.text || "已交给 Wireshark 打开", "good");
+    } catch (error) {
+      toast(error.message, "error", 7000);
+    }
+  }
+
+  function bindPacket() {
+    $("#packet-close").addEventListener("click", closePacket);
+    $("#packet-ok").addEventListener("click", closePacket);
+    $("#packet-clip").addEventListener("click", downloadPacketClip);
+    $("#packet-wireshark").addEventListener("click", openInWireshark);
+    $("#packet-modal").addEventListener("click", (event) => {
+      if (event.target === $("#packet-modal")) closePacket();
+    });
+  }
+
+  async function loadFindings(jobId, options = {}) {
+    const id = jobId || state.jobId;
+    if (!id) return;
+    try {
+      const data = await api(`/api/findings?job=${encodeURIComponent(id)}`);
+      if (state.jobId !== id) return;
+      state.findingsJob = id;
+      state.findings = data.findings || [];
+      state.findingsDerived = !!data.derived;
+      state.findingsTruncated = !!data.truncated;
+      state.findingsPage = 1;
+      state.findingsSelected = new Set();
+      setText("#findings-count", String(data.total ?? state.findings.length));
+      const csv = $("#findings-csv");
+      csv.href = `/api/findings?job=${encodeURIComponent(id)}&format=csv&token=${
+        encodeURIComponent(TOKEN)}`;
+      csv.classList.remove("disabled");
+      renderFindings();
+    } catch (error) {
+      if (!options.quiet) toast(`获取分析结果失败：${error.message}`, "error", 7000);
+    }
+  }
+
+  function resetFindings() {
+    state.findings = [];
+    state.findingsVisible = [];
+    state.findingsJob = null;
+    state.findingsDerived = false;
+    state.findingsTruncated = false;
+    state.findingsSort = { key: "seq", dir: 1 };
+    state.findingsPage = 1;
+    state.findingsSelected = new Set();
+    setText("#findings-count", "0");
+    setText("#findings-visible", "");
+    setText("#findings-summary", "");
+    const csv = $("#findings-csv");
+    if (csv) {
+      csv.classList.add("disabled");
+      csv.href = "#";
+    }
+    const box = $("#findings");
+    if (box) {
+      box.innerHTML = '<div class="muted">任务结束后，凭据、哈希、flag、导出文件等会汇总在这里。</div>';
+    }
+  }
+
+  function restoreFindingsColumns() {
+    try {
+      const saved = JSON.parse(localStorage.getItem("fnet.findings.columns") || "[]");
+      state.findingsHidden = new Set(Array.isArray(saved) ? saved : []);
+    } catch (error) {
+      state.findingsHidden = new Set();
+    }
+  }
+
+  function saveFindingsColumns() {
+    try {
+      localStorage.setItem("fnet.findings.columns",
+        JSON.stringify(Array.from(state.findingsHidden)));
+    } catch (error) {}
+    renderFindings();
+  }
+
+  function selectedFindingItems() {
+    return state.findings.filter((item) =>
+      state.findingsSelected.has(String(item.seq)));
+  }
+
+  async function copyFindings(mode = "page") {
+    const items = mode === "selected"
+      ? selectedFindingItems()
+      : pageSlice(state.findingsVisible).items;
+    if (!items.length) {
+      toast(mode === "selected" ? "请先勾选要复制的结果" : "当前没有可复制的结果", "warn");
+      return;
+    }
+    const columns = visibleFindingColumns();
+    const rows = [columns.map(([, label]) => label)];
+    items.forEach((item) => {
+      rows.push(columns.map(([key]) => findingValue(item, key)));
+    });
+    const text = rows.map((row) =>
+      row.map((cell) => String(cell).replace(/\t/g, " ").replace(/\n/g, " ")).join("\t"))
+      .join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      toast(`已复制 ${items.length} 条结果`, "good", 1800);
+    } catch (error) {
+      toast("复制失败，请改用“导出 CSV”", "warn");
+    }
+  }
+
+  /* --------------------------------------------------------------- menus */
+  function bindMenus() {
+    $$(".menu-btn").forEach((button) => {
+      button.addEventListener("click", (event) => {
+        event.stopPropagation();
+        const menu = button.parentElement;
+        const open = menu.classList.contains("open");
+        $$(".menu.open").forEach((item) => item.classList.remove("open"));
+        if (!open) menu.classList.add("open");
+      });
+    });
+    document.addEventListener("click", () => {
+      $$(".menu.open").forEach((item) => item.classList.remove("open"));
+    });
+    $$(".dropdown").forEach((dropdown) => {
+      dropdown.addEventListener("click", (event) => event.stopPropagation());
+    });
+  }
+
+  function bindEvents() {
+    bindMenus();
+    $("#theme-select").addEventListener("change", (event) => {
+      applyTheme(event.target.value, true);
+      toast(`主题已切换：${event.target.selectedOptions[0].textContent}`, "info", 1800);
+    });
+
+    $("#file-input").addEventListener("change", (event) => {
+      uploadFiles(event.target.files);
+      event.target.value = "";
+    });
+    $("#drop-zone").addEventListener("click", () => $("#file-input").click());
+    $("#drop-zone").addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") $("#file-input").click();
+    });
+    ["dragenter", "dragover"].forEach((name) => {
+      $("#drop-zone").addEventListener(name, (event) => {
+        event.preventDefault();
+        $("#drop-zone").classList.add("drag");
+      });
+    });
+    ["dragleave", "drop"].forEach((name) => {
+      $("#drop-zone").addEventListener(name, (event) => {
+        event.preventDefault();
+        $("#drop-zone").classList.remove("drag");
+      });
+    });
+    $("#drop-zone").addEventListener("drop", (event) => {
+      const files = Array.from(event.dataTransfer.files || []);
+      if (files.length) uploadFiles(files);
+    });
+
+    $("#use-path").addEventListener("click", () => {
+      const path = val("pcap-path");
+      if (!path) { toast("请输入服务器本地路径", "warn"); return; }
+      setPcap(path);
+      toast("已使用本地路径", "good", 1600);
+    });
+    $("#pcap-path").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") $("#use-path").click();
+    });
+
+    $("#toggle-all").addEventListener("click", () => {
+      const boxes = $$("#features input[type=checkbox]");
+      const all = boxes.every((box) => box.checked);
+      boxes.forEach((box) => { box.checked = !all; });
+      refreshSelected();
+      renderRecentFeatures();
+    });
+    $("#feature-search").addEventListener("input", () => {
+      setVal("global-search", val("feature-search"));
+      filterFeatures();
+    });
+    $("#feature-search-clear").addEventListener("click", () => {
+      setVal("feature-search", "");
+      setVal("global-search", "");
+      filterFeatures();
+      $("#feature-search").focus();
+    });
+    const globalSearch = $("#global-search");
+    if (globalSearch) {
+      globalSearch.addEventListener("input", () => {
+        setVal("feature-search", globalSearch.value);
+        filterFeatures();
+      });
+      globalSearch.addEventListener("keydown", (event) => {
+        if (event.key !== "Escape") return;
+        globalSearch.value = "";
+        setVal("feature-search", "");
+        filterFeatures();
+        globalSearch.blur();
+      });
+    }
+    document.addEventListener("keydown", (event) => {
+      const tag = (event.target && event.target.tagName || "").toLowerCase();
+      if (event.key === "/" && !event.ctrlKey && !event.metaKey
+          && !["input", "textarea", "select"].includes(tag)) {
+        event.preventDefault();
+        const target = globalSearch || $("#feature-search");
+        target.focus();
+        target.select?.();
+      }
+    });
+    $("#history-refresh").addEventListener("click", () => {
+      loadHistory().then(() => toast("任务历史已刷新", "good", 1400))
+        .catch((error) => toast(error.message, "error", 7000));
+    });
+    $("#history").addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-history]");
+      if (!button) return;
+      const id = button.dataset.id;
+      const action = button.dataset.history;
+      const task = action === "view" ? viewHistory(id)
+        : action === "rerun" ? rerunHistory(id)
+          : action === "delete" ? deleteHistory(id) : Promise.resolve();
+      task.catch((error) => toast(error.message, "error", 8000));
+    });
+    $("#start-btn").addEventListener("click", () => {
+      startJob(selectedFeatures(), collectParams());
+    });
+    $("#cancel-btn").addEventListener("click", cancelJob);
+    $("#sidebar-toggle").addEventListener("click", () => {
+      $("#sidebar").classList.toggle("collapsed");
+    });
+
+    $("#batch-refresh").addEventListener("click", () => {
+      pollBatch();
+      toast("批量队列已刷新", "good", 1400);
+    });
+    $("#batch-clear").addEventListener("click", clearBatch);
+    $("#batch-pause").addEventListener("click", toggleBatchPause);
+    $("#batch-merge").addEventListener("click", () => {
+      mergeBatchReport().catch((error) => toast(error.message, "error", 7000));
+    });
+    $("#batch-concurrency").addEventListener("change", (event) => {
+      batchControl("concurrency", { concurrency: Number(event.target.value) || 1 });
+    });
+    $("#batch").addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-batch]");
+      if (!button) return;
+      const id = button.dataset.id;
+      const task = button.dataset.batch === "view" ? Promise.resolve(viewBatchJob(id))
+        : button.dataset.batch === "cancel" ? cancelBatchJob(id) : Promise.resolve();
+      task.catch((error) => toast(error.message, "error", 7000));
+    });
+    $("#batch").addEventListener("dragstart", (event) => {
+      const row = event.target.closest("tr[draggable=true]");
+      if (!row) return;
+      state.batch.drag = row.dataset.id;
+      try {
+        if (event.dataTransfer) {
+          event.dataTransfer.effectAllowed = "move";
+          event.dataTransfer.setData("text/plain", row.dataset.id);
+        }
+      } catch (error) { /* older browsers reject custom drag data */ }
+      row.classList.add("dragging");
+    });
+    $("#batch").addEventListener("dragend", () => {
+      state.batch.drag = null;
+      $$("#batch tr.dragging, #batch tr.drag-over").forEach((row) =>
+        row.classList.remove("dragging", "drag-over"));
+    });
+    $("#batch").addEventListener("dragover", (event) => {
+      const row = event.target.closest("tr[draggable=true]");
+      if (!row || !state.batch.drag || row.dataset.id === state.batch.drag) return;
+      event.preventDefault();
+      $$("#batch tr.drag-over").forEach((item) => item.classList.remove("drag-over"));
+      row.classList.add("drag-over");
+    });
+    $("#batch").addEventListener("drop", (event) => {
+      const row = event.target.closest("tr[draggable=true]");
+      if (!row || !state.batch.drag) return;
+      event.preventDefault();
+      const order = (state.batch.summary && state.batch.summary.pending) || [];
+      const ids = [...order];
+      const from = ids.indexOf(state.batch.drag);
+      const to = ids.indexOf(row.dataset.id);
+      if (from >= 0 && to >= 0) {
+        ids.splice(from, 1);
+        ids.splice(to, 0, state.batch.drag);
+        reorderBatch(ids).catch((error) => toast(error.message, "error", 7000));
+      } else {
+        toast("只能调整排队中的任务顺序", "warn");
+      }
+    });
+    $("#tls-key-input").addEventListener("change", (event) => {
+      uploadTlsKey(event.target.files[0]);
+      event.target.value = "";
+    });
+    $("#viz-refresh").addEventListener("click", () => {
+      loadViz().catch((error) => toast(error.message, "error", 7000));
+    });
+    $("#viz-buckets").addEventListener("change", () => {
+      loadViz().catch((error) => toast(error.message, "error", 7000));
+    });
+    $("#viz-metric").addEventListener("change", renderViz);
+    $("#viz-zoom-reset").addEventListener("click", () => {
+      state.viz.zoom = null;
+      renderTimeline();
+    });
+    $("#viz-export-svg").addEventListener("click", downloadSvg);
+    $("#viz-export-png").addEventListener("click", () => {
+      downloadPng().catch((error) => toast(error.message, "error", 7000));
+    });
+    $("#viz-protocols").addEventListener("click", (event) => {
+      const row = event.target.closest("[data-protocol]");
+      if (row) openProtocolDetail(row.dataset.protocol);
+    });
+    $("#viz-protocols").addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      const row = event.target.closest("[data-protocol]");
+      if (!row) return;
+      event.preventDefault();
+      openProtocolDetail(row.dataset.protocol);
+    });
+
+    $("#log-search").addEventListener("input", debounce(reRenderLog, 180));
+    $("#log-filter").addEventListener("change", reRenderLog);
+    $("#log-level").addEventListener("change", reRenderLog);
+    $("#log").addEventListener("click", (event) => {
+      const link = event.target.closest(".frame-link");
+      if (link) openPacket(link.dataset.frame);
+    });
+    $("#clear-log").addEventListener("click", () => {
+      state.logs = [];
+      $("#log").innerHTML = '<div class="log-empty">日志已清空。</div>';
+    });
+    $("#download-log").addEventListener("click", () => {
+      const text = state.logs.map((record) =>
+        `${record.time || ""} ${record.tag || ""} ${record.text}`).join("\n");
+      downloadText(`fnet-log-${Date.now()}.txt`, text || "（无日志）");
+    });
+
+    $$(".tab").forEach((tab) => {
+      tab.addEventListener("click", () => {
+        switchTab(tab.dataset.tab);
+        if (tab.dataset.tab === "history") {
+          loadHistory().catch((error) => toast(error.message, "error", 7000));
+        }
+        if (tab.dataset.tab === "findings") {
+          loadFindings(state.jobId, { quiet: true });
+        }
+        if (tab.dataset.tab === "batch") {
+          pollBatch();
+        }
+        if (tab.dataset.tab === "viz") {
+          loadViz().catch((error) => toast(error.message, "error", 7000));
+        }
+      });
+    });
+
+    $("#findings-search").addEventListener("input", debounce(() => {
+      state.findingsPage = 1;
+      renderFindings();
+    }, 120));
+    $("#findings-kind").addEventListener("change", () => {
+      state.findingsPage = 1;
+      renderFindings();
+    });
+    $("#findings-level").addEventListener("change", () => {
+      state.findingsPage = 1;
+      renderFindings();
+    });
+    $("#findings-page-size").addEventListener("change", (event) => {
+      state.findingsPageSize = Number(event.target.value) || 100;
+      state.findingsPage = 1;
+      renderFindings();
+    });
+    $("#findings-refresh").addEventListener("click", () => {
+      if (!state.jobId) { toast("还没有分析任务", "warn"); return; }
+      loadFindings(state.jobId)
+        .then(() => toast("分析结果已刷新", "good", 1400))
+        .catch((error) => toast(error.message, "error", 7000));
+    });
+    $("#findings-copy").addEventListener("click", () => copyFindings("page"));
+    $("#findings-copy-selected").addEventListener("click",
+      () => copyFindings("selected"));
+    $("#findings-columns-btn").addEventListener("click", () => {
+      $("#findings-columns").classList.toggle("hidden");
+    });
+    $("#findings-columns").addEventListener("change", (event) => {
+      const box = event.target.closest("input[data-column]");
+      if (!box) return;
+      if (box.checked) state.findingsHidden.delete(box.dataset.column);
+      else state.findingsHidden.add(box.dataset.column);
+      saveFindingsColumns();
+    });
+    $("#findings-jump").addEventListener("click", () => {
+      const frame = Number(val("findings-frame-jump"));
+      if (!frame) { toast("请输入帧号", "warn"); return; }
+      openPacket(frame);
+    });
+    $("#findings-frame-jump").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") $("#findings-jump").click();
+    });
+    $("#findings-pager").addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-page]");
+      if (!button || button.disabled) return;
+      state.findingsPage = Number(button.dataset.page) || 1;
+      renderFindings();
+    });
+    $("#findings").addEventListener("click", (event) => {
+      const frame = event.target.closest(".frame-link");
+      if (frame) {
+        event.stopPropagation();
+        openPacket(frame.dataset.frame);
+        return;
+      }
+      const select = event.target.closest(".finding-select");
+      if (select) {
+        const seq = String(select.dataset.seq);
+        if (select.checked) state.findingsSelected.add(seq);
+        else state.findingsSelected.delete(seq);
+        select.closest("tr").classList.toggle("selected", select.checked);
+        return;
+      }
+      const selectPage = event.target.closest("#findings-select-page");
+      if (selectPage) {
+        pageSlice(state.findingsVisible).items.forEach((item) => {
+          if (selectPage.checked) state.findingsSelected.add(String(item.seq));
+          else state.findingsSelected.delete(String(item.seq));
+        });
+        renderFindings();
+        return;
+      }
+      const header = event.target.closest("th[data-sort]");
+      if (header) {
+        const key = header.dataset.sort;
+        const sort = state.findingsSort || { key: "seq", dir: 1 };
+        state.findingsSort = sort.key === key
+          ? { key, dir: -sort.dir } : { key, dir: 1 };
+        state.findingsPage = 1;
+        renderFindings();
+        return;
+      }
+      const row = event.target.closest("tr[data-seq]");
+      if (row) showFinding(row.dataset.seq);
+    });
+    $("#findings").addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      if (event.target.closest(".frame-link")) return;
+      const row = event.target.closest("tr[data-seq]");
+      if (!row) return;
+      event.preventDefault();
+      showFinding(row.dataset.seq);
+    });
+
+    $("#decode-btn").addEventListener("click", runDecode);
+    $("#copy-decode").addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(state.decodeText || "");
+        toast("解码结果已复制", "good", 1600);
+      } catch (error) {
+        toast("复制失败，请手动选择文本", "warn");
+      }
+    });
+
+    // Settings persistence.
+    ["webshell_mode", "webshell_password", "webshell_filter", "shiro_mode",
+      "shiro_remember", "shiro_key", "shiro_enctype", "winrm_auth",
+      "winrm_ntlm", "winrm_password", "winrm_port", "sql_regex",
+      "sql_success", "sql_compare", "sql_time_threshold", "sql_char",
+      "sql_reverse", "sql_log", "keywords", "auto_regex", "post_only",
+      "decode_aux", "wordlist"].forEach((id) => {
+      const el = $("#" + id);
+      if (!el) return;
+      el.addEventListener("change", saveLocalSettings);
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "enter") {
+        event.preventDefault();
+        $("#start-btn").click();
+      }
+      if (event.key === "Escape") { closeModal(); closePacket(); }
+    });
+
+    $$(".dropdown button[data-action]").forEach((button) => {
+      button.addEventListener("click", () => {
+        handleAction(button.dataset.action, button.dataset);
+        $$(".menu.open").forEach((item) => item.classList.remove("open"));
+      });
+    });
+    $$(".dropdown button[data-setting]").forEach((button) => {
+      button.addEventListener("click", () => openSettingDialog(button.dataset.setting));
+    });
+    $$(".dropdown button[data-plugin]").forEach((button) => {
+      button.addEventListener("click", () => runPlugin(button.dataset.plugin));
+    });
+  }
+
+  function debounce(fn, delay) {
+    let timer = null;
+    return (...args) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => fn(...args), delay);
+    };
+  }
+
+  function switchTab(name) {
+    $$(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === name));
+    $$(".tab-panel").forEach((panel) =>
+      panel.classList.toggle("active", panel.id === `tab-${name}`));
+  }
+
+  /* ------------------------------------------------------------- actions */
+  async function handleAction(action, dataset = {}) {
+    try {
+      if (action === "pick-file") { $("#file-input").click(); return; }
+      if (action === "shutdown") {
+        if (!confirm("确定要停止 Fnet WebUI 服务吗？")) return;
+        await api("/api/shutdown", { method: "POST", body: {} });
+        document.body.innerHTML =
+          '<div style="padding:40px;font-family:system-ui;color:#ccc;background:#1e2228;min-height:100vh">' +
+          '<h2>Fnet 服务已停止</h2><p>可以关闭此页面，或在终端重新运行 <code>fnet</code>。</p></div>';
+        return;
+      }
+      if (action === "about") { switchTab("about"); return; }
+      if (action === "open-source") { switchTab("about"); return; }
+      if (action === "github" || action === "open-url") {
+        const url = dataset.url || "https://github.com/fyfhcgch/Fnet";
+        await api("/api/action", { method: "POST", body: { action: "open_url", url } });
+        toast("已在浏览器中打开项目仓库", "good");
+        return;
+      }
+      if (action === "report-view") {
+        if (!state.jobId) { toast("还没有分析任务", "warn"); return; }
+        window.open(reportUrl(state.jobId, "html", true), "_blank", "noopener");
+        return;
+      }
+      if (action === "report-export") {
+        if (!state.jobId) { toast("还没有分析任务", "warn"); return; }
+        const catalog = reportCatalog();
+        if (!catalog.length) { toast("当前版本没有可导出的报告章节", "warn"); return; }
+        const values = await openModal({
+          title: "导出分析报告",
+          fields: [
+            {
+              name: "format", label: "格式", type: "select", value: "html",
+              options: [
+                { value: "html", label: "HTML（可直接打印为 PDF）" },
+                { value: "markdown", label: "Markdown" },
+              ],
+            },
+            {
+              name: "sections", label: "包含章节", type: "checkboxes",
+              value: state.reportSections,
+              options: catalog.map((item) => ({ value: item.key, label: item.title })),
+            },
+          ],
+          okText: "导出",
+        });
+        if (!values) return;
+        const sections = Array.isArray(values.sections) ? values.sections : [];
+        if (!sections.length) { toast("请至少选择一个报告章节", "warn"); return; }
+        saveReportSections(sections);
+        window.location.href = reportUrl(state.jobId, values.format || "html");
+        toast("报告已开始下载", "good", 2400);
+        return;
+      }
+      if (action === "download-report") {
+        if (!state.jobId) { toast("还没有分析任务", "warn"); return; }
+        const url = `/api/download?job=${encodeURIComponent(state.jobId)}&path=report.txt&token=${encodeURIComponent(TOKEN)}`;
+        window.location.href = url;
+        return;
+      }
+      if (action === "save_config") {
+        const data = await api("/api/action", { method: "POST", body: { action } });
+        toast(data.text || "配置已保存", "good");
+        return;
+      }
+      if (action === "reload_config") {
+        const data = await api("/api/action", { method: "POST", body: { action } });
+        toast(data.text || "配置已重载", "good");
+        state.meta.config = data.config || state.meta.config;
+        return;
+      }
+      if (action === "open_log") {
+        const data = await api("/api/action", { method: "POST", body: { action } });
+        toast(data.text || "已打开日志目录", "info");
+        return;
+      }
+      if (action === "plugin_add") {
+        const values = await openModal({
+          title: "添加自定义工具",
+          fields: [
+            { name: "name", label: "工具名称", placeholder: "例如 mytool" },
+            { name: "command", label: "命令", placeholder: "例如 /usr/bin/mytool --arg" },
+          ],
+        });
+        if (!values) return;
+        const data = await api("/api/action", {
+          method: "POST",
+          body: { action: "plugin_add", ...values },
+        });
+        toast(data.text || "已添加工具", "good");
+        await refreshMeta();
+        return;
+      }
+      if (action === "plugin_manage") {
+        const userTools = (state.plugins || []).filter((item) => item.source === "user");
+        if (!userTools.length) { toast("还没有自定义工具", "info"); return; }
+        const values = await openModal({
+          title: "管理自定义工具",
+          fields: [{
+            name: "name", label: "选择要移除的工具", type: "select",
+            options: userTools.map((item) => ({ value: item.key, label: `${item.name} — ${item.target}` })),
+          }],
+          okText: "移除",
+        });
+        if (!values) return;
+        const data = await api("/api/action", {
+          method: "POST", body: { action: "plugin_remove", name: values.name },
+        });
+        toast(data.ok ? "已移除" : "未找到工具", data.ok ? "good" : "warn");
+        await refreshMeta();
+        return;
+      }
+      if (action === "update_check") {
+        const data = await api("/api/action", { method: "POST", body: { action } });
+        await openModal({ title: "检查更新", text: data.text, hideCancel: true });
+        return;
+      }
+      if (action === "run_webshell") {
+        await startJob(["webshell.decrypt"], collectParams(), "Webshell 解密");
+        return;
+      }
+      if (action === "http_login") {
+        if (!state.pcap) { toast("请先选择流量包", "warn"); return; }
+        const data = await api("/api/action", {
+          method: "POST", body: { action, pcap: state.pcap },
+        });
+        attachJob(data.job, "HTTP 登录识别");
+        return;
+      }
+      if (action === "protocol_credentials" || action === "protocol_smb2") {
+        const handler = action === "protocol_smb2"
+          ? "protocols.smb2" : "protocols.credentials";
+        const label = action === "protocol_smb2"
+          ? "SMB2 文件与 NTLM 认证" : "多协议凭据提取";
+        await startJob([handler], collectParams(), label);
+        return;
+      }
+      if (action === "protocol_detect") {
+        await startJob(["protocols.detect"], collectParams(), "协议自动识别");
+        return;
+      }
+      if (action === "flag_deep") {
+        await startJob(["text_scan.deep"], collectParams(), "深度 flag 扫描");
+        return;
+      }
+      if (action === "forensics_correlate") {
+        await startJob(["forensics.correlate"], collectParams(), "跨协议凭据关联");
+        return;
+      }
+      if (action === "forensics_timeline") {
+        await startJob(["forensics.timeline"], collectParams(), "认证时间线");
+        return;
+      }
+      if (action === "upload-tls-keylog" || action === "upload-tls-key") {
+        state.tlsKeyKind = action === "upload-tls-key" ? "key" : "keylog";
+        $("#tls-key-input").accept = state.tlsKeyKind === "key"
+          ? ".key,.pem,.crt,.txt" : ".log,.txt,.key,.pem";
+        $("#tls-key-input").click();
+        return;
+      }
+      if (["export_objects", "carve", "repair", "etl"].includes(action)) {
+        if (!state.pcap) { toast("请先选择流量包", "warn"); return; }
+        toast("正在执行，请稍候…", "info");
+        const body = { action, pcap: state.pcap };
+        if (action === "etl") body.pcap = state.pcap;
+        const data = await api("/api/action", { method: "POST", body });
+        appendSystem(data.text || "操作完成", data.ok ? "good" : "error");
+        switchTab("log");
+        toast(data.ok ? "操作完成" : "操作失败", data.ok ? "good" : "error");
+        return;
+      }
+      if (action === "stats") {
+        if (!state.pcap) { toast("请先选择流量包", "warn"); return; }
+        toast("正在统计…", "info");
+        const data = await api("/api/action", {
+          method: "POST", body: { action: "stats", sub: dataset.sub, pcap: state.pcap },
+        });
+        appendSystem(data.text || "统计完成", data.ok ? "good" : "error");
+        switchTab("log");
+        return;
+      }
+      toast(`未知操作：${action}`, "warn");
+    } catch (error) {
+      toast(error.message, "error", 8000);
+    }
+  }
+
+  async function refreshMeta() {
+    const meta = await api("/api/meta");
+    state.meta.plugins = meta.plugins;
+    state.plugins = meta.plugins;
+    state.meta.tools = meta.tools;
+    renderTools(meta.tools);
+  }
+
+  async function runPlugin(key) {
+    try {
+      if (!state.pcap && !["cyberchef"].includes(key)) {
+        toast("请先选择流量包", "warn");
+        return;
+      }
+      toast(`正在运行 ${key}…`, "info");
+      const data = await api("/api/action", {
+        method: "POST",
+        body: { action: "plugin_run", key, target: state.pcap },
+      });
+      appendSystem(data.text || "工具执行完成", "good");
+      switchTab("log");
+      if (key === "cyberchef") toast("已在浏览器中打开 CyberChef", "good");
+    } catch (error) {
+      toast(error.message, "error", 7000);
+    }
+  }
+
+  /* ------------------------------------------------------------ settings */
+  const SETTING_META = {
+    tls_keylog: { section: "paths", label: "TLS keylog 文件路径", placeholder: "/path/to/sslkeylog.log" },
+    cobaltstrike_keys: { section: "paths", label: "Cobalt Strike beacon keys / minidump 路径", placeholder: "/path/to/.cobaltstrike.beacon_keys" },
+    rdp_private_key: { section: "paths", label: "RDP 私钥或 Key log 路径", placeholder: "/path/to/rdp.key" },
+    antsword_rsa_public_key: { section: "paths", label: "AntSword RSA 公钥路径", placeholder: "/path/to/public.pem" },
+    passwddir: { section: "config", label: "暴力破解字典路径", placeholder: "/usr/share/wordlists/rockyou.txt" },
+    javapath: { section: "config", label: "Java 可执行文件路径", placeholder: "/usr/bin/java" },
+    tshark: { section: "config", label: "tshark 路径", placeholder: "/usr/bin/tshark" },
+  };
+
+  async function openSettingDialog(key) {
+    const meta = SETTING_META[key];
+    if (!meta) return;
+    const snapshot = state.meta.config || {};
+    const current = (snapshot[meta.section] || {})[key] || "";
+    const values = await openModal({
+      title: meta.label,
+      fields: [{ name: "value", label: meta.label, value: current, placeholder: meta.placeholder }],
+    });
+    if (!values) return;
+    await saveConfig(meta.section, { [key]: values.value });
+    state.meta.config[meta.section] = state.meta.config[meta.section] || {};
+    state.meta.config[meta.section][key] = values.value;
+    toast("设置已保存", "good");
+    if (key === "tshark") await refreshMeta();
+  }
+
+  async function saveConfig(section, values) {
+    const data = await api("/api/config", {
+      method: "POST", body: { section, values },
+    });
+    if (data.config) state.meta.config = data.config;
+  }
+
+  /* --------------------------------------------------------------- modal */
+  let modalResolve = null;
+
+  function openModal({ title, fields = [], text = "", okText = "确定", hideCancel = false }) {
+    const modal = $("#modal");
+    setText("#modal-title", title);
+    const body = $("#modal-body");
+    body.innerHTML = "";
+    if (text) {
+      const pre = document.createElement("pre");
+      pre.textContent = text;
+      body.appendChild(pre);
+    }
+    fields.forEach((field) => {
+      const wrap = document.createElement("div");
+      wrap.className = "field";
+      const label = document.createElement("label");
+      label.textContent = field.label || field.name;
+      wrap.appendChild(label);
+      if (field.type === "checkboxes") {
+        const group = document.createElement("div");
+        group.className = "check-list";
+        group.id = `modal-field-${field.name}`;
+        const selected = new Set(Array.isArray(field.value) ? field.value : []);
+        (field.options || []).forEach((option) => {
+          const item = document.createElement("label");
+          item.className = "inline";
+          const box = document.createElement("input");
+          box.type = "checkbox";
+          box.value = option.value;
+          box.checked = selected.has(option.value);
+          item.appendChild(box);
+          item.appendChild(document.createTextNode(` ${option.label}`));
+          group.appendChild(item);
+        });
+        wrap.appendChild(group);
+        body.appendChild(wrap);
+        return;
+      }
+      let input;
+      if (field.type === "select") {
+        input = document.createElement("select");
+        (field.options || []).forEach((option) => {
+          const node = document.createElement("option");
+          node.value = option.value;
+          node.textContent = option.label;
+          input.appendChild(node);
+        });
+      } else if (field.type === "textarea") {
+        input = document.createElement("textarea");
+        input.rows = 6;
+      } else {
+        input = document.createElement("input");
+        input.type = field.type || "text";
+      }
+      input.id = `modal-field-${field.name}`;
+      input.value = field.value ?? "";
+      if (field.placeholder) input.placeholder = field.placeholder;
+      if (field.readonly) input.readOnly = true;
+      wrap.appendChild(input);
+      body.appendChild(wrap);
+    });
+    modal.classList.remove("hidden");
+    $("#modal-cancel").style.display = hideCancel ? "none" : "";
+    $("#modal-ok").textContent = okText;
+    $("#modal-ok").focus();
+    return new Promise((resolve) => { modalResolve = resolve; });
+  }
+
+  function closeModal(result = null) {
+    $("#modal").classList.add("hidden");
+    const resolve = modalResolve;
+    modalResolve = null;
+    if (resolve) resolve(result);
+  }
+
+  function bindModal() {
+    $("#modal-close").addEventListener("click", () => closeModal(null));
+    $("#modal-cancel").addEventListener("click", () => closeModal(null));
+    $("#modal-ok").addEventListener("click", () => {
+      const values = {};
+      $$("#modal-body [id^=modal-field-]").forEach((input) => {
+        const name = input.id.replace("modal-field-", "");
+        if (input.classList.contains("check-list")) {
+          values[name] = $$("input[type=checkbox]:checked", input).map((box) => box.value);
+        } else if (input.type === "checkbox") {
+          values[name] = input.checked;
+        } else {
+          values[name] = input.value;
+        }
+      });
+      closeModal(values);
+    });
+    $("#modal").addEventListener("click", (event) => {
+      if (event.target === $("#modal")) closeModal(null);
+    });
+  }
+
+  /* ---------------------------------------------------------- text tools */
+  async function runDecode() {
+    const text = $("#decode-input").value;
+    if (!text.trim()) { toast("请先粘贴文本", "warn"); return; }
+    try {
+      const data = await api("/api/decode", { method: "POST", body: { text } });
+      const box = $("#decode-output");
+      box.classList.remove("muted");
+      if (!data.candidates || !data.candidates.length) {
+        box.innerHTML = '<div class="muted">没有找到可读的解码结果。</div>';
+        state.decodeText = "";
+        return;
+      }
+      state.decodeText = data.candidates.map((item) =>
+        `[${item.label}]\n${item.value}`).join("\n\n");
+      const flags = (data.flags || []).map((flag) =>
+        `<span class="flag-chip">${esc(flag)}</span>`).join("");
+      box.innerHTML = (flags ? `<div>${flags}</div>` : "") +
+        data.candidates.map((item) => `
+          <div class="decode-item">
+            <div class="decode-label">${esc(item.label)}</div>
+            <div class="decode-value">${esc(item.value)}</div>
+          </div>`).join("");
+    } catch (error) {
+      toast(error.message, "error", 7000);
+    }
+  }
+
+  function downloadText(filename, text) {
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = filename;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 2000);
+  }
+
+  /* ---------------------------------------------------------- local state */
+  const LOCAL_IDS = ["webshell_mode", "webshell_password", "webshell_filter",
+    "shiro_mode", "shiro_remember", "shiro_key", "shiro_enctype", "winrm_auth",
+    "winrm_ntlm", "winrm_password", "winrm_port", "sql_regex", "sql_success",
+    "sql_compare", "sql_time_threshold", "sql_char", "sql_reverse", "sql_log",
+    "keywords", "auto_regex", "post_only", "decode_aux", "wordlist"];
+
+  function saveLocalSettings() {
+    const data = {};
+    LOCAL_IDS.forEach((id) => {
+      const el = $("#" + id);
+      if (!el) return;
+      data[id] = el.type === "checkbox" ? el.checked : el.value;
+    });
+    try { localStorage.setItem("fnet.settings", JSON.stringify(data)); } catch (error) {}
+  }
+
+  function restoreLocalSettings() {
+    let data = {};
+    try { data = JSON.parse(localStorage.getItem("fnet.settings") || "{}"); } catch (error) {}
+    LOCAL_IDS.forEach((id) => {
+      if (!(id in data)) return;
+      const el = $("#" + id);
+      if (!el) return;
+      if (el.type === "checkbox") el.checked = !!data[id];
+      else el.value = data[id];
+    });
+  }
+
+  document.addEventListener("DOMContentLoaded", () => {
+    bindModal();
+    bindPacket();
+    init().catch((error) => {
+      document.body.innerHTML = `<div style="padding:40px;font-family:system-ui;color:#eee;background:#1e2228;min-height:100vh">
+        <h2>Fnet 启动失败</h2><pre style="white-space:pre-wrap">${esc(error.message)}</pre>
+        <p>请确认服务仍在运行，然后刷新页面。</p></div>`;
+    });
+  });
+})();

@@ -1,0 +1,15 @@
+# Fnet core has no third-party Python dependencies: it uses the standard
+# library plus the system `tshark` executable.
+#
+# Required system tool:
+#   tshark            Debian/Ubuntu: sudo apt install tshark
+#                     Fedora:        sudo dnf install wireshark-cli
+#                     macOS:         brew install wireshark
+#
+# Optional Python extras (install only if you need them):
+#   scapy>=2.5        generate the synthetic captures in tests/data
+#   cryptography>=41  accelerated RSA / certificate helpers
+#   pyrdp-mitm>=1.0   RDP session decryption / replay
+#
+# Install them all with:
+#   python3 -m pip install -e '.[samples,crypto,rdp]'

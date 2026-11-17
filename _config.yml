@@ -1,0 +1,38 @@
+title: Fnet
+description: 面向 CTF 与流量取证的开源流量分析工具箱
+lang: zh-CN
+url: https://fyfhcgch.github.io
+baseurl: /Fnet
+theme: minima
+
+# GitHub Pages 内置插件：把文档里的相对 .md 链接改写成 .html，并生成站点地图
+plugins:
+  - jekyll-relative-links
+  - jekyll-sitemap
+
+relative_links:
+  enabled: true
+  collections: false
+
+header_pages:
+  - manual/index.md
+  - manual/install.md
+  - manual/webui.md
+  - manual/features.md
+  - manual/cli.md
+  - manual/faq.md
+
+# 站点只发布手册与文档，源码、测试与仓库治理文件不参与构建
+exclude:
+  - fnet
+  - tests
+  - scripts
+  - packaging
+  - pyproject.toml
+  - AGENTS.md
+  - TODO.md
+  - README.md
+  - CONTRIBUTING.md
+  - CODE_OF_CONDUCT.md
+  - LICENSE
+  - .github
