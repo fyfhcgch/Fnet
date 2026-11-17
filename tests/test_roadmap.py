@@ -372,6 +372,13 @@ class CliRoadmapTest(unittest.TestCase):
                  if item.get("kind") == "rule"]
         self.assertTrue(rules, payload["findings"][:5])
 
+    def _job_report(self, job_id: str, limit: int = 3000) -> str:
+        path = self.home / "cache" / "jobs" / job_id / "report.txt"
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")[-limit:]
+        except OSError:
+            return "<no report>"
+
     def test_shards_preserve_frame_numbers(self):
         one = self.run_cli("-C", str(DATA / "http_ntlm.pcap"),
                            "--features", "checkBox_10", "--json")
@@ -384,7 +391,12 @@ class CliRoadmapTest(unittest.TestCase):
         shared = json.loads(four.stdout)
         self.assertEqual(shared["job"]["shards"], 4)
         self.assertEqual(shared["job"]["status"], "done")
-        self.assertEqual(shared["count"], single["count"])
+        detail = (
+            f"sharded count={shared['count']} single count={single['count']}"
+            f"\n--- sharded report ---\n{self._job_report(shared['job']['id'])}"
+            f"\n--- sharded stderr ---\n{four.stderr[-1500:]}"
+        )
+        self.assertEqual(shared["count"], single["count"], detail)
         frames_one = {item.get("frame") for item in single["findings"]
                       if item.get("frame")}
         frames_four = {item.get("frame") for item in shared["findings"]
@@ -394,22 +406,33 @@ class CliRoadmapTest(unittest.TestCase):
         self.assertEqual(frames_four, frames_one)
 
     def test_resume_cli_after_pause(self):
+        # Poll the on-disk job.json, not the in-memory status: the worker
+        # thread persists the paused state asynchronously and the helper
+        # process exits (killing the thread) once this loop is satisfied.
         script = (
-            "import os, time\n"
+            "import json, os, time\n"
             "from pathlib import Path\n"
             "from fnet.app import build\n"
             "from fnet.config import Config\n"
-            "rt = build(Config(Path(os.environ['FNET_HOME']) / 'config.ini'))\n"
+            "home = Path(os.environ['FNET_HOME'])\n"
+            "rt = build(Config(home / 'config.ini'))\n"
             "job = rt.jobs.create(\n"
             "    str(Path('tests/data/http_ntlm.pcap').resolve()),\n"
             "    ['checkBox_10'], {})\n"
             "job.pause_event.set()\n"
             "rt.jobs.start(job)\n"
+            "snapshot = home / 'cache' / 'jobs' / job.id / 'job.json'\n"
             "deadline = time.time() + 60\n"
-            "while time.time() < deadline and job.status not in (\n"
-            "        'paused', 'done', 'error', 'cancelled'):\n"
+            "status = None\n"
+            "while time.time() < deadline:\n"
+            "    try:\n"
+            "        status = json.loads(snapshot.read_text())['status']\n"
+            "    except (OSError, ValueError):\n"
+            "        status = None\n"
+            "    if status in ('paused', 'done', 'error', 'cancelled'):\n"
+            "        break\n"
             "    time.sleep(0.05)\n"
-            "assert job.status == 'paused', job.status\n"
+            "assert status == 'paused', status\n"
             "print(job.id)\n"
         )
         created = subprocess.run(

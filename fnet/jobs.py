@@ -924,6 +924,10 @@ class JobManager:
         job.current = ""
         job.finished = _dt.datetime.now().isoformat(timespec="seconds")
         job.log.info(f"分析结束: {job.status}（成功 {succeeded}，失败 {failed}）")
+        # Persist the terminal/paused state: cross-process --resume reads
+        # job.json from disk, and a stale status (e.g. "running") would make
+        # can_resume False and the job unrestorable.
+        self._write_history(job)
         self._write_findings(job)
         self._write_report(job)
 
@@ -952,6 +956,16 @@ class JobManager:
                 clip = self._clip_shard(job, tshark, start, end, shard_index)
                 if clip is None:
                     job.log.warn(f"{feature.title}: 切片失败，回退为整包执行")
+                    call_feature(self._context(job, params, tshark, progress),
+                                 feature.handler)
+                    return
+                from fnet.tools.runner import count_frames
+                if not count_frames(clip, tshark.path if tshark else ""):
+                    # A clip without frames would silently produce no results;
+                    # fall back to the whole capture so the feature still runs.
+                    job.log.warn(
+                        f"{feature.title}: 切片 [{shard_index}/{len(ranges)}] "
+                        "为空，回退为整包执行")
                     call_feature(self._context(job, params, tshark, progress),
                                  feature.handler)
                     return
