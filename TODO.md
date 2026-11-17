@@ -49,7 +49,9 @@
 
 ## 分发与生态
 
-- [x] **Docker 镜像**：内置 `tshark` 与可选工具，一条命令启动 WebUI
+- [x] **Docker 镜像**：内置 `tshark` 与可选工具，一条命令启动 WebUI；
+      CI 的 `docker` job 会构建镜像并轮询 `/api/health` 做冒烟（本机验证
+      需能访问 Docker Hub）
 - [x] **包发布准备**：PyPI 名称 `fnet` 已被其他项目占用，发行名改为
       `fnet-ctf`（命令仍是 `fnet`）；`pyproject.toml`、`publish.yml`、
       `docs/RELEASE.md` 与本地 `build`/`twine check` 均已验证
