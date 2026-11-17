@@ -129,6 +129,9 @@ class LiveCapture:
                 output = proc.stdout.read() if proc.stdout else ""
             except OSError:
                 output = ""
+            finally:
+                if proc.stdout is not None:
+                    proc.stdout.close()
             raise ValueError(output.strip()[-800:] or "抓包进程立即退出")
         with self._lock:
             self._proc = proc
@@ -143,8 +146,10 @@ class LiveCapture:
         with self._lock:
             proc = self._proc
             path = self._path
-            if proc is None:
-                return self.status()
+        # ``status()`` takes the same lock, so it must be called after the
+        # ``with`` block; otherwise a second ``stop()`` would deadlock.
+        if proc is None:
+            return self.status()
         if proc.poll() is None:
             logger.info("停止实时抓包…")
             try:
@@ -167,6 +172,9 @@ class LiveCapture:
             output = proc.stdout.read() if proc.stdout else ""
         except OSError:
             output = ""
+        finally:
+            if proc.stdout is not None:
+                proc.stdout.close()
         with self._lock:
             self._output = (output or "")[-2000:]
             self._proc = None

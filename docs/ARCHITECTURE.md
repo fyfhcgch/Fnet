@@ -151,6 +151,9 @@ findings、统计与产出序列化为 JSON；`--resume`/`--compare` 直接调�
 - **路线图回归**：`tests/test_roadmap.py` 覆盖流式上传、规则导入与执行、
   暂停/继续、任务对比、CLI `--json`/`--compare`、实时抓包网卡解析，以及
   DNS/ICMP 隧道、SMTP、MySQL、Kerberos、WPA 的 handler 集成。
+- **实时抓包生命周期**：`tests/test_live.py` 用桩 `tshark` 覆盖 start/stop、
+  “同时只允许一个抓包”、SIGINT 停止、输出与文件大小回报；重复 `stop()`
+  必须幂等（早期版本在这里会因非重入锁自死锁）。
 - **性能**：`scripts/bench.py` 生成 10/100/1000 MB 抓包，按功能记录耗时与
   峰值 RSS，并写入 [`docs/PERFORMANCE.md`](PERFORMANCE.md)。
 - **CI**：GitHub Actions 在 Python 3.10–3.13 上安装 tshark，运行全量
