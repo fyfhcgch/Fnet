@@ -16,7 +16,10 @@ concurrency:
 jobs:
   test:
     name: Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
+    # Pin to 24.04: the 26.04 image ships an enforcing AppArmor profile for
+    # /usr/bin/tshark that only allows reads under /tmp, so tshark cannot open
+    # the fixtures in tests/data (see PyPCAPKit issue #2019).
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
