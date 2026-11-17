@@ -149,8 +149,9 @@ findings、统计与产出序列化为 JSON；`--resume`/`--compare` 直接调�
 - **抓包**：`tests/data/*.pcap` 由 `scripts/make_samples.py` 生成，断言
   关键字、HTTP 凭据、Webshell、NTLM、DNS、Modbus/MQTT 等结果。
 - **路线图回归**：`tests/test_roadmap.py` 覆盖流式上传、规则导入与执行、
-  暂停/继续、任务对比、CLI `--json`/`--compare`、实时抓包网卡解析，以及
-  DNS/ICMP 隧道、SMTP、MySQL、Kerberos、WPA 的 handler 集成。
+  暂停/继续、任务对比、CLI `--json`/`--compare`/`--shards`/`--resume`、实时
+  抓包网卡解析，以及 DNS/ICMP 隧道、SMTP、MySQL、Kerberos、WPA 的 handler
+  集成。
 - **实时抓包生命周期**：`tests/test_live.py` 用桩 `tshark` 覆盖 start/stop、
   “同时只允许一个抓包”、SIGINT 停止、输出与文件大小回报；重复 `stop()`
   必须幂等（早期版本在这里会因非重入锁自死锁）。

@@ -228,8 +228,8 @@ node --check fnet/webui/static/app.js    # 前端语法检查
 
 测试覆盖纯 Python 加密实现（AES/GCM/MD4/RC4/RSA 向量）、编解码、功能注册表、
 WebUI API 冒烟、UI 规格完整性，以及样例抓包上的关键断言。`tests/test_roadmap.py`
-额外覆盖流式上传、自定义规则、暂停/继续、任务对比、CLI JSON 以及 DNS/ICMP
-隧道、SMTP、MySQL、Kerberos、WPA 的集成；`tests/test_live.py` 用桩 `tshark`
+额外覆盖流式上传、自定义规则、暂停/继续、任务对比、CLI JSON 与
+`--shards`/`--resume`，以及 DNS/ICMP 隧道、SMTP、MySQL、Kerberos、WPA 的集成；`tests/test_live.py` 用桩 `tshark`
 验证实时抓包的 start/stop、单实例限制与重复停止。CI 在 Python 3.10–3.13 上
 安装 `tshark` 后运行全量测试；Docker 镜像与 Compose 文件位于仓库根目录。
 

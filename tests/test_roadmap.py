@@ -372,6 +372,58 @@ class CliRoadmapTest(unittest.TestCase):
                  if item.get("kind") == "rule"]
         self.assertTrue(rules, payload["findings"][:5])
 
+    def test_shards_preserve_frame_numbers(self):
+        one = self.run_cli("-C", str(DATA / "http_ntlm.pcap"),
+                           "--features", "checkBox_10", "--json")
+        four = self.run_cli("-C", str(DATA / "http_ntlm.pcap"),
+                            "--features", "checkBox_10",
+                            "--shards", "4", "--json")
+        self.assertEqual(one.returncode, 0, one.stderr[-2000:])
+        self.assertEqual(four.returncode, 0, four.stderr[-2000:])
+        single = json.loads(one.stdout)
+        shared = json.loads(four.stdout)
+        self.assertEqual(shared["job"]["shards"], 4)
+        self.assertEqual(shared["job"]["status"], "done")
+        self.assertEqual(shared["count"], single["count"])
+        frames_one = {item.get("frame") for item in single["findings"]
+                      if item.get("frame")}
+        frames_four = {item.get("frame") for item in shared["findings"]
+                       if item.get("frame")}
+        self.assertTrue(frames_one)
+        # Frame numbers must be translated back to the original capture.
+        self.assertEqual(frames_four, frames_one)
+
+    def test_resume_cli_after_pause(self):
+        script = (
+            "import os, time\n"
+            "from pathlib import Path\n"
+            "from fnet.app import build\n"
+            "from fnet.config import Config\n"
+            "rt = build(Config(Path(os.environ['FNET_HOME']) / 'config.ini'))\n"
+            "job = rt.jobs.create(\n"
+            "    str(Path('tests/data/http_ntlm.pcap').resolve()),\n"
+            "    ['checkBox_10'], {})\n"
+            "job.pause_event.set()\n"
+            "rt.jobs.start(job)\n"
+            "deadline = time.time() + 60\n"
+            "while time.time() < deadline and job.status not in (\n"
+            "        'paused', 'done', 'error', 'cancelled'):\n"
+            "    time.sleep(0.05)\n"
+            "assert job.status == 'paused', job.status\n"
+            "print(job.id)\n"
+        )
+        created = subprocess.run(
+            [sys.executable, "-c", script], cwd=str(ROOT), env=self.env,
+            capture_output=True, text=True, timeout=180)
+        self.assertEqual(created.returncode, 0, created.stderr[-2000:])
+        job_id = created.stdout.strip().splitlines()[-1]
+        process = self.run_cli("--resume", job_id, "--json")
+        self.assertEqual(process.returncode, 0, process.stderr[-2000:])
+        payload = json.loads(process.stdout)
+        self.assertEqual(payload["job"]["status"], "done")
+        self.assertEqual(payload["job"]["completed"], ["checkBox_10"])
+        self.assertEqual(payload["job"]["progress"], 100)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
