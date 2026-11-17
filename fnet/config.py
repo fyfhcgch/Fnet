@@ -48,6 +48,8 @@ DEFAULTS = {
         "tshark_timeout": "600",
         "tshark_max_field_kb": "256",
         "tshark_max_rows": "2000000",
+        "shards": "1",
+        "language": "zh",
     },
     "plugins": {"execute_cmd": "{}"},
     "paths": {
@@ -59,6 +61,8 @@ DEFAULTS = {
         "rdp_private_key": "",
         "antsword_rsa_public_key": "",
         "minidump": "",
+        "rules_file": "",
+        "live_interface": "",
         "hashcat": "",
         "john": "",
         "aircrack": "",

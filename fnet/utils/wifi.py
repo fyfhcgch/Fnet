@@ -436,3 +436,424 @@ def hcxtools_recipe(pcap: str, hash_file: str = "wifi.hc22000",
         f"hashcat -m 22000 --show {hash_file}",
     ]
     return lines
+
+
+# ---------------------------------------------------------------------------
+# WPA2 key derivation (IEEE 802.11i) and CCMP / AES-CCM decryption
+#
+# The helpers below turn a passphrase plus a captured 4-way handshake into the
+# temporal key, and rebuild the plaintext of CCMP-protected data frames.  They
+# are deliberately pure functions so the feature handler keeps owning tshark
+# and all I/O.  Only the standard library and ``fnet.utils.crypto`` are used.
+# ---------------------------------------------------------------------------
+import hashlib
+import hmac
+
+from fnet.utils.crypto import aes_encrypt_block
+
+PRF_LABEL = b"Pairwise key expansion"
+CCMP_HEADER_LEN = 8
+CCMP_MIC_LEN = 8
+LLC_SNAP_PREFIX = b"\xaa\xaa\x03"
+
+
+def _pn_bytes(pn: bytes | int) -> bytes:
+    """Return a 48-bit packet number as ``PN5 .. PN0`` (big endian)."""
+    if isinstance(pn, int):
+        if not 0 <= pn < 1 << 48:
+            raise ValueError("PN must fit in 48 bits")
+        return pn.to_bytes(6, "big")
+    raw = bytes(pn or b"")
+    if len(raw) == 6:
+        return raw
+    if len(raw) in (1, 2, 3, 4, 5):
+        return raw.rjust(6, b"\x00")
+    raise ValueError("PN must be 6 bytes or an int")
+
+
+def derive_pmk(psk: str, ssid: str) -> bytes:
+    """Derive the WPA2 PMK from a passphrase and SSID (PBKDF2-HMAC-SHA1).
+
+    ``PMK = PBKDF2(HMAC-SHA1, passphrase, SSID, 4096, 32)`` as defined by
+    IEEE 802.11i / RFC 2898.  The SSID is used verbatim (no length prefix).
+    """
+    return hashlib.pbkdf2_hmac(
+        "sha1", (psk or "").encode("utf-8"), (ssid or "").encode("utf-8"),
+        4096, 32)
+
+
+def _prf_sha1(key: bytes, label: bytes, data: bytes, length: int) -> bytes:
+    """IEEE 802.11i PRF (HMAC-SHA1): ``label || 0x00 || data || counter``."""
+    output = bytearray()
+    counter = 0
+    while len(output) < length:
+        counter += 1
+        output += hmac.new(
+            key, label + b"\x00" + data + bytes([counter]), hashlib.sha1
+        ).digest()
+    return bytes(output[:length])
+
+
+def derive_ptk(pmk: bytes, anonce: bytes, snonce: bytes,
+               ap: str, sta: str) -> dict:
+    """Derive the CCMP PTK (PRF-512 truncated to 48 bytes).
+
+    ``data = min(AP,STA) || max(AP,STA) || min(ANonce,SNonce) ||
+    max(ANonce,SNonce)``; the shorter MAC/nonce pair comes first as required by
+    IEEE 802.11i.  Returns ``{"kck", "kek", "tk", "ptk"}`` byte strings.
+    """
+    pmk = bytes(pmk or b"")
+    if len(pmk) != 32:
+        raise ValueError("PMK must be 32 bytes")
+    ap_bytes = bytes.fromhex(normalize_mac(ap))
+    sta_bytes = bytes.fromhex(normalize_mac(sta))
+    if len(ap_bytes) != 6 or len(sta_bytes) != 6:
+        raise ValueError("AP and station must be MAC addresses")
+    anonce = bytes(anonce or b"")
+    snonce = bytes(snonce or b"")
+    if len(anonce) != 32 or len(snonce) != 32:
+        raise ValueError("ANonce and SNonce must be 32 bytes")
+    mac_lo, mac_hi = sorted((ap_bytes, sta_bytes))
+    nonce_lo, nonce_hi = sorted((anonce, snonce))
+    data = mac_lo + mac_hi + nonce_lo + nonce_hi
+    ptk = _prf_sha1(pmk, PRF_LABEL, data, 48)
+    return {
+        "kck": ptk[0:16],
+        "kek": ptk[16:32],
+        "tk": ptk[32:48],
+        "ptk": ptk,
+    }
+
+
+# ---------------------------------------------------------------------------
+# AES-CCM (RFC 3610)
+# ---------------------------------------------------------------------------
+def _ccm_check(key: bytes, nonce: bytes, tag_len: int) -> int:
+    if len(key) not in (16, 24, 32):
+        raise ValueError("AES key must be 16, 24 or 32 bytes")
+    if not 7 <= len(nonce) <= 13:
+        raise ValueError("CCM nonce must be 7..13 bytes")
+    if tag_len not in (4, 6, 8, 10, 12, 14, 16):
+        raise ValueError("CCM tag length must be 4..16 and even")
+    return 15 - len(nonce)
+
+
+def _ccm_b0(nonce: bytes, aad_len: int, msg_len: int, tag_len: int) -> bytes:
+    """Build the first CBC-MAC block ``B0``."""
+    length_field = 15 - len(nonce)
+    flags = (((tag_len - 2) // 2) << 3) | (length_field - 1)
+    if aad_len:
+        flags |= 0x40
+    return bytes([flags]) + nonce + msg_len.to_bytes(length_field, "big")
+
+
+def _ccm_xor_block(state: bytes, block: bytes) -> bytes:
+    padded = block.ljust(16, b"\x00")
+    return bytes(a ^ b for a, b in zip(state, padded))
+
+
+def _ccm_cbc_mac(key: bytes, nonce: bytes, aad: bytes, plaintext: bytes,
+                 tag_len: int) -> bytes:
+    """Raw CCM CBC-MAC value ``T`` (before the ``S_0`` mask)."""
+    aad = bytes(aad or b"")
+    plaintext = bytes(plaintext or b"")
+    state = aes_encrypt_block(_ccm_b0(nonce, len(aad), len(plaintext), tag_len), key)
+    if aad:
+        size = len(aad)
+        if size < 0xFF00:
+            prefix = size.to_bytes(2, "big")
+        elif size < 1 << 32:
+            prefix = b"\xff\xfe" + size.to_bytes(4, "big")
+        else:
+            prefix = b"\xff\xff" + size.to_bytes(8, "big")
+        encoded = prefix + aad
+        for offset in range(0, len(encoded), 16):
+            state = aes_encrypt_block(
+                _ccm_xor_block(state, encoded[offset:offset + 16]), key)
+    for offset in range(0, len(plaintext), 16):
+        state = aes_encrypt_block(
+            _ccm_xor_block(state, plaintext[offset:offset + 16]), key)
+    return state[:tag_len]
+
+
+def ccm_mac(key: bytes, nonce: bytes, aad: bytes, plaintext: bytes,
+            tag_len: int = 8) -> bytes:
+    """Compute the CCM authentication tag ``U`` over ``aad || plaintext``.
+
+    This is the value appended to the ciphertext (RFC 3610 ``U = T xor
+    S_0``), not the bare CBC-MAC intermediate.
+    """
+    length_field = _ccm_check(key, nonce, tag_len)
+    raw = _ccm_cbc_mac(key, nonce, aad, plaintext, tag_len)
+    s0 = aes_encrypt_block(
+        bytes([length_field - 1]) + nonce + b"\x00" * length_field, key)
+    return bytes(a ^ b for a, b in zip(raw, s0[:tag_len]))
+
+
+def _ccm_ctr_crypt(key: bytes, nonce: bytes, data: bytes) -> bytes:
+    """CCM counter-mode keystream (counter starts at 1)."""
+    length_field = 15 - len(nonce)
+    prefix = bytes([length_field - 1]) + nonce
+    output = bytearray()
+    for block_index, offset in enumerate(range(0, len(data), 16), start=1):
+        stream = aes_encrypt_block(
+            prefix + block_index.to_bytes(length_field, "big"), key)
+        chunk = data[offset:offset + 16]
+        output += bytes(a ^ b for a, b in zip(chunk, stream))
+    return bytes(output)
+
+
+def ccm_encrypt(key: bytes, nonce: bytes, aad: bytes, plaintext: bytes,
+                tag_len: int = 8) -> bytes:
+    """AES-CCM encrypt; returns ``ciphertext || tag``."""
+    plaintext = bytes(plaintext or b"")
+    aad = bytes(aad or b"")
+    _ccm_check(key, nonce, tag_len)
+    ciphertext = _ccm_ctr_crypt(key, nonce, plaintext)
+    return ciphertext + ccm_mac(key, nonce, aad, plaintext, tag_len)
+
+
+def ccm_decrypt(key: bytes, nonce: bytes, aad: bytes,
+                ciphertext_with_tag: bytes,
+                tag_len: int = 8) -> tuple[bytes, bool]:
+    """AES-CCM decrypt; returns ``(plaintext, tag_valid)``.
+
+    The MIC is always recomputed, so a tampered payload returns the decrypted
+    bytes *and* ``False`` instead of raising.
+    """
+    data = bytes(ciphertext_with_tag or b"")
+    _ccm_check(key, nonce, tag_len)
+    if len(data) < tag_len:
+        return b"", False
+    ciphertext, tag = data[:-tag_len], data[-tag_len:]
+    plaintext = _ccm_ctr_crypt(key, nonce, ciphertext)
+    expected = ccm_mac(key, nonce, bytes(aad or b""), plaintext, tag_len)
+    return plaintext, hmac.compare_digest(expected, tag)
+
+
+# ---------------------------------------------------------------------------
+# 802.11 / CCMP frame helpers
+# ---------------------------------------------------------------------------
+def parse_dot11_header(frame: bytes) -> dict | None:
+    """Parse the fixed 802.11 MAC header.
+
+    Returns ``None`` when the frame is too short.  ``qos`` is true for QoS data
+    frames (2 extra bytes), ``has_addr4`` for WDS data frames (ToDS and FromDS
+    both set, 6 extra bytes); the HT-control field is included when the Order
+    bit is set on a QoS data frame.
+    """
+    data = bytes(frame or b"")
+    if len(data) < 2:
+        return None
+    fc = data[0] | (data[1] << 8)
+    version = fc & 0x0003
+    frame_type = (fc >> 2) & 0x03
+    subtype = (fc >> 4) & 0x0F
+    to_ds = bool(fc & 0x0100)
+    from_ds = bool(fc & 0x0200)
+    retry = bool(fc & 0x0800)
+    protected = bool(fc & 0x4000)
+    order = bool(fc & 0x8000)
+    has_addr4 = bool(to_ds and from_ds and frame_type == 2)
+    qos = bool(frame_type == 2 and subtype & 0x08)
+    header_len = 24 + (6 if has_addr4 else 0) + (2 if qos else 0)
+    if order and qos:
+        header_len += 4
+    if len(data) < header_len:
+        return None
+    a1 = mac_colon(data[4:10].hex())
+    a2 = mac_colon(data[10:16].hex())
+    a3 = mac_colon(data[16:22].hex())
+    a4 = mac_colon(data[24:30].hex()) if has_addr4 else ""
+    sequence = data[22] | (data[23] << 8)
+    qos_value = (data[24 + (6 if has_addr4 else 0)]
+                 | (data[25 + (6 if has_addr4 else 0)] << 8)) if qos else 0
+    # The CCMP nonce priority octet carries the QoS traffic identifier.
+    priority = qos_value & 0x0F if qos else 0
+    return {
+        "header_len": header_len,
+        "fc": fc,
+        "version": version,
+        "type": frame_type,
+        "subtype": subtype,
+        "protected": protected,
+        "to_ds": to_ds,
+        "from_ds": from_ds,
+        "retry": retry,
+        "order": order,
+        "a1": a1,
+        "a2": a2,
+        "a3": a3,
+        "a4": a4,
+        "has_addr4": has_addr4,
+        "qos": qos,
+        "qos_value": qos_value,
+        "priority": priority,
+        "sequence": sequence,
+    }
+
+
+def ccmp_nonce(a2: bytes, pn: bytes, priority: int = 0) -> bytes:
+    """Build the 13-byte CCMP nonce: priority || A2 || PN5..PN0."""
+    address = bytes(a2 or b"")
+    if len(address) != 6:
+        raise ValueError("A2 must be 6 bytes")
+    return bytes([priority & 0xFF]) + address + _pn_bytes(pn)
+
+
+def _ccmp_header(pn: bytes | int, key_id: int = 0) -> bytes:
+    """Build the 8-byte CCMP header (PN0, PN1, Rsvd, KeyID/ExtIV, PN2..PN5)."""
+    packet_number = _pn_bytes(pn)
+    key_id_byte = 0x20 | ((key_id & 0x03) << 6)
+    return bytes([
+        packet_number[5], packet_number[4], 0x00, key_id_byte,
+        packet_number[3], packet_number[2], packet_number[1],
+        packet_number[0],
+    ])
+
+
+def ccmp_aad(header: bytes, header_len: int, pn: bytes,
+             key_id: int = 0) -> bytes:
+    """Build the CCMP AAD: MPDU header + CCMP header.
+
+    The Frame Control protected bit is set and the retry bit cleared, matching
+    what the transmitter feeds into AES-CCM.  CCMP keeps the MIC outside the
+    MPDU header, so no MIC field needs zeroing here.
+    """
+    raw = bytearray(bytes(header or b"")[:header_len])
+    if len(raw) < 2:
+        raise ValueError("header is too short")
+    fc = (raw[0] | (raw[1] << 8) | 0x4000) & ~0x0800
+    raw[0] = fc & 0xFF
+    raw[1] = (fc >> 8) & 0xFF
+    return bytes(raw) + _ccmp_header(pn, key_id)
+
+
+def ccmp_decrypt_frame(tk: bytes, frame: bytes) -> dict | None:
+    """Decrypt one CCMP-protected data frame (8-byte MIC).
+
+    Returns ``{"plaintext", "pn", "pn_bytes", "key_id", "a1", "a2", "a3",
+    "tag_valid", "header_len", "priority"}`` or ``None`` when the frame is not
+    a CCMP data frame / is truncated.
+    """
+    data = bytes(frame or b"")
+    info = parse_dot11_header(data)
+    if info is None or not info["protected"] or info["type"] != 2:
+        return None
+    header_len = info["header_len"]
+    if len(data) < header_len + CCMP_HEADER_LEN + CCMP_MIC_LEN:
+        return None
+    ccmp_header = data[header_len:header_len + CCMP_HEADER_LEN]
+    key_id = (ccmp_header[3] >> 6) & 0x03
+    packet_number = bytes([
+        ccmp_header[7], ccmp_header[6], ccmp_header[5], ccmp_header[4],
+        ccmp_header[1], ccmp_header[0],
+    ])
+    address2 = data[10:16]
+    nonce = ccmp_nonce(address2, packet_number, info["priority"])
+    aad = ccmp_aad(data[:header_len], header_len, packet_number, key_id)
+    plaintext, valid = ccm_decrypt(
+        bytes(tk or b""), nonce, aad, data[header_len + CCMP_HEADER_LEN:],
+        CCMP_MIC_LEN)
+    return {
+        "plaintext": plaintext,
+        "pn": int.from_bytes(packet_number, "big"),
+        "pn_bytes": packet_number.hex(),
+        "key_id": key_id,
+        "a1": info["a1"],
+        "a2": info["a2"],
+        "a3": info["a3"],
+        "tag_valid": valid,
+        "header_len": header_len,
+        "priority": info["priority"],
+    }
+
+
+def ccmp_encrypt_frame(tk: bytes, frame_with_plaintext: bytes,
+                       pn: bytes | int, key_id: int = 0) -> bytes:
+    """Encrypt a plaintext data frame with CCMP (used for tests/fixtures).
+
+    ``frame_with_plaintext`` carries a normal 802.11 header followed by the
+    LLC/SNAP payload.  The protected bit is set, the CCMP header inserted and
+    the 8-byte MIC appended.
+    """
+    data = bytes(frame_with_plaintext or b"")
+    info = parse_dot11_header(data)
+    if info is None or info["type"] != 2:
+        raise ValueError("frame must be 802.11 data with a full MAC header")
+    header_len = info["header_len"]
+    header = bytearray(data[:header_len])
+    fc = (header[0] | (header[1] << 8)) | 0x4000
+    header[0] = fc & 0xFF
+    header[1] = (fc >> 8) & 0xFF
+    packet_number = _pn_bytes(pn)
+    nonce = ccmp_nonce(bytes(header[10:16]), packet_number, info["priority"])
+    aad = ccmp_aad(bytes(header), header_len, packet_number, key_id)
+    ciphertext = ccm_encrypt(
+        bytes(tk or b""), nonce, aad, data[header_len:], CCMP_MIC_LEN)
+    return bytes(header) + _ccmp_header(packet_number, key_id) + ciphertext
+
+
+def to_ethernet(plaintext: bytes, a1: str, a2: str) -> bytes | None:
+    """Convert an LLC/SNAP payload to a 14-byte Ethernet frame.
+
+    Any SNAP OUI is accepted (RFC 1042 ``00:00:00`` and bridge-tunnel
+    ``00:00:f8`` included); the EtherType is copied verbatim.  ``a1`` becomes
+    the destination and ``a2`` the source address.
+    """
+    data = bytes(plaintext or b"")
+    if len(data) < 8 or data[0:3] != LLC_SNAP_PREFIX:
+        return None
+    dst = bytes.fromhex(normalize_mac(a1))
+    src = bytes.fromhex(normalize_mac(a2))
+    if len(dst) != 6 or len(src) != 6:
+        return None
+    return dst + src + data[6:8] + data[8:]
+
+
+def _strip_radiotap(frame: bytes) -> bytes:
+    """Drop a leading radiotap header when the raw frame contains one."""
+    if len(frame) >= 8 and frame[0] == 0 and frame[1] == 0:
+        length = frame[2] | (frame[3] << 8)
+        if 8 <= length <= len(frame) - 2:
+            return frame[length:]
+    return frame
+
+
+def decrypt_frames(tk: bytes, rows) -> list[dict]:
+    """Decrypt CCMP frames from ``[frame_number, frame_raw_hex, time]`` rows.
+
+    Frames that are not protected CCMP data frames (or are truncated) are
+    skipped.  ``tag_valid`` mirrors the MIC check so a tampered frame is still
+    reported with its (untrusted) plaintext.
+    """
+    results: list[dict] = []
+    for row in rows or []:
+        try:
+            number, raw_hex, timestamp = row[0], row[1], row[2]
+        except (TypeError, IndexError, KeyError):
+            continue
+        frame = _strip_radiotap(_hex_bytes(str(raw_hex or "")))
+        if not frame:
+            continue
+        info = parse_dot11_header(frame)
+        if info is None or not info["protected"] or info["type"] != 2:
+            continue
+        decrypted = ccmp_decrypt_frame(bytes(tk or b""), frame)
+        if decrypted is None:
+            continue
+        results.append({
+            "frame": str(number),
+            "time": _float(str(timestamp or "")),
+            "plaintext": decrypted["plaintext"],
+            "ethernet": to_ethernet(
+                decrypted["plaintext"], decrypted["a1"], decrypted["a2"]),
+            "a1": decrypted["a1"],
+            "a2": decrypted["a2"],
+            "a3": decrypted["a3"],
+            "pn": decrypted["pn"],
+            "key_id": decrypted["key_id"],
+            "tag_valid": decrypted["tag_valid"],
+            "header_len": decrypted["header_len"],
+        })
+    return results

@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import re
 import secrets
 import shutil
+import subprocess
 import threading
 import traceback
 import zipfile
@@ -24,6 +26,25 @@ from fnet.report import (
     render_html, render_markdown, select_findings, write_reports,
 )
 from fnet.tools.runner import ToolBox
+
+
+def _split_ranges(total: int, shards: int) -> list[tuple[int, int]]:
+    """Split ``1..total`` into ``shards`` contiguous 1-based frame ranges."""
+    total = max(0, int(total))
+    shards = max(1, int(shards))
+    if total <= 0:
+        return []
+    shards = min(shards, total)
+    size, extra = divmod(total, shards)
+    ranges: list[tuple[int, int]] = []
+    start = 1
+    for index in range(shards):
+        length = size + (1 if index < extra else 0)
+        if length <= 0:
+            continue
+        ranges.append((start, start + length - 1))
+        start += length
+    return ranges
 
 
 @dataclass
@@ -48,6 +69,18 @@ class Job:
     findings: list = field(default_factory=list)
     log: JobLog = field(init=False)
     cancel_event: threading.Event = field(default_factory=threading.Event)
+    #: Set by :meth:`JobManager.pause`; the worker stops at the next
+    #: feature boundary so a paused job can resume without redoing work.
+    pause_event: threading.Event = field(default_factory=threading.Event)
+    #: ``checkbox`` values that already ran to completion (checkpointed in
+    #: ``job.json`` so a paused/interrupted job can continue).
+    completed: list[str] = field(default_factory=list)
+    #: ``checkbox -> pending|running|done|error|cancelled`` for the UI.
+    feature_status: dict = field(default_factory=dict)
+    succeeded: int = 0
+    failed: int = 0
+    #: Split stateless (``shardable``) features into this many frame ranges.
+    shards: int = 1
     thread: threading.Thread | None = None
     #: True for jobs created by :meth:`JobManager.submit_batch`; only those
     #: participate in the queue's active-slot accounting.
@@ -55,6 +88,11 @@ class Job:
 
     def __post_init__(self) -> None:
         self.log = JobLog(logger, prefix=self.id[:6])
+
+    @property
+    def can_resume(self) -> bool:
+        return self.status in ("paused", "interrupted") and bool(
+            self.completed or self.feature_status or self.progress < 100)
 
     def as_dict(self) -> dict:
         return {
@@ -64,12 +102,19 @@ class Job:
             "features": [f.checkbox for f in self.features],
             "feature_titles": [f.title for f in self.features],
             "status": self.status,
+            "paused": self.pause_event.is_set(),
+            "can_resume": self.can_resume,
             "progress": self.progress,
             "current": self.current,
             "error": self.error,
             "created": self.created,
             "started": self.started,
             "finished": self.finished,
+            "succeeded": self.succeeded,
+            "failed": self.failed,
+            "completed": list(self.completed),
+            "feature_status": dict(self.feature_status),
+            "shards": self.shards,
             "report": self.report_path,
             "report_markdown": self.report_markdown_path,
             "report_html": self.report_html_path,
@@ -111,6 +156,11 @@ class JobManager:
             "created": job.created,
             "started": job.started,
             "finished": job.finished,
+            "succeeded": job.succeeded,
+            "failed": job.failed,
+            "completed": list(job.completed),
+            "feature_status": dict(job.feature_status),
+            "shards": job.shards,
             "report": job.report_path,
             "report_markdown": job.report_markdown_path,
             "report_html": job.report_html_path,
@@ -443,7 +493,8 @@ class JobManager:
         return True
 
     # -- lifecycle -----------------------------------------------------
-    def create(self, pcap: str, checkboxes: list[str], params: dict | None = None) -> Job:
+    def create(self, pcap: str, checkboxes: list[str], params: dict | None = None,
+               shards: int = 1) -> Job:
         source = Path(pcap).expanduser()
         if not source.is_file():
             raise FileNotFoundError(f"流量包不存在: {source}")
@@ -464,7 +515,14 @@ class JobManager:
         job_id = secrets.token_hex(8)
         output = CACHE_DIR / "jobs" / job_id
         output.mkdir(parents=True, exist_ok=True)
-        job = Job(job_id, str(source.resolve()), features, params or {}, output)
+        try:
+            shards = max(1, min(int(shards or 1), 64))
+        except (TypeError, ValueError):
+            shards = 1
+        job = Job(job_id, str(source.resolve()), features, params or {}, output,
+                  shards=shards)
+        for feature in features:
+            job.feature_status[feature.checkbox] = "pending"
         with self._lock:
             self._jobs[job_id] = job
             self._prune()
@@ -478,12 +536,13 @@ class JobManager:
         return job
 
     def submit(self, pcap: str, checkboxes: list[str],
-               params: dict | None = None) -> Job:
-        job = self.create(pcap, checkboxes, params)
+               params: dict | None = None, shards: int = 1) -> Job:
+        job = self.create(pcap, checkboxes, params, shards=shards)
         return self.start(job)
 
     def submit_batch(self, pcaps: list[str], checkboxes: list[str],
-                     params: dict | None = None, concurrency: int = 1) -> list[Job]:
+                     params: dict | None = None, concurrency: int = 1,
+                     shards: int = 1) -> list[Job]:
         """Create several jobs and run at most ``concurrency`` at a time.
 
         The jobs are visible immediately with ``status="queued"``; the queue
@@ -495,7 +554,7 @@ class JobManager:
         jobs: list[Job] = []
         try:
             for pcap in pcaps:
-                jobs.append(self.create(pcap, checkboxes, params))
+                jobs.append(self.create(pcap, checkboxes, params, shards=shards))
         except Exception:
             # Do not leave half-created jobs behind when one path is bad.
             for job in jobs:
@@ -613,6 +672,145 @@ class JobManager:
         job.log.warn("收到取消请求，正在停止当前任务…")
         return True
 
+    def pause(self, job_id: str) -> bool:
+        """Ask a running job to stop at the next feature boundary."""
+        job = self.get(job_id)
+        if not job or job.status not in ("queued", "running"):
+            return False
+        job.pause_event.set()
+        job.log.warn("收到暂停请求，将在当前功能结束后暂停…")
+        return True
+
+    def resume(self, job_id: str) -> Job | None:
+        """Continue a paused job, or recover an interrupted one from disk."""
+        job = self.get(job_id)
+        if job is None:
+            job = self._load_from_history(job_id)
+        if job is None or not job.can_resume:
+            return None
+        job.pause_event.clear()
+        job.cancel_event.clear()
+        job.status = "queued"
+        job.error = ""
+        job.current = ""
+        job.finished = None
+        job.log.info(f"继续任务：已完成 {len(job.completed)}/{len(job.features)} 个功能")
+        with self._lock:
+            self._jobs[job.id] = job
+            self._prune()
+        self._write_history(job)
+        return self.start(job)
+
+    def _load_from_history(self, job_id: str) -> Job | None:
+        """Recreate an in-memory job from ``<cache>/jobs/<id>/job.json``."""
+        output = self._job_dir(job_id)
+        if output is None:
+            return None
+        try:
+            data = json.loads((output / "job.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict) or data.get("id") != job_id:
+            return None
+        pcap = str(data.get("pcap") or "")
+        if not pcap or not Path(pcap).is_file():
+            return None
+        features: list[Feature] = []
+        for item in data.get("features") or []:
+            feature = BY_CHECKBOX.get(item) or BY_HANDLER.get(item)
+            if feature is not None:
+                features.append(feature)
+        if not features:
+            return None
+        try:
+            shards = max(1, min(int(data.get("shards") or 1), 64))
+        except (TypeError, ValueError):
+            shards = 1
+        job = Job(job_id, pcap, features, dict(data.get("params") or {}),
+                  output, created=str(data.get("created") or ""), shards=shards)
+        job.status = str(data.get("status") or "interrupted")
+        job.progress = int(data.get("progress") or 0)
+        job.started = data.get("started")
+        job.finished = data.get("finished")
+        job.succeeded = int(data.get("succeeded") or 0)
+        job.failed = int(data.get("failed") or 0)
+        job.completed = [str(item) for item in data.get("completed") or []]
+        statuses = data.get("feature_status")
+        if isinstance(statuses, dict):
+            job.feature_status.update({str(k): str(v) for k, v in statuses.items()})
+        for feature in features:
+            job.feature_status.setdefault(feature.checkbox, "pending")
+        # Restore the old transcript so the resumed report keeps its history.
+        try:
+            report = (output / "report.txt").read_text(
+                encoding="utf-8", errors="replace")
+            if report:
+                job.log.seed(parse_report_text(report))
+        except OSError:
+            pass
+        return job
+
+    def compare(self, base_id: str, target_id: str,
+                limit: int = 5000) -> dict | None:
+        """Diff the structured findings of two jobs (target minus base)."""
+        base = self.findings_for(base_id, limit=findings_mod.MAX_FINDINGS)
+        target = self.findings_for(target_id, limit=findings_mod.MAX_FINDINGS)
+        if base is None or target is None:
+            return None
+
+        def key(item: dict) -> tuple:
+            return (str(item.get("kind") or ""),
+                    str(item.get("summary") or ""),
+                    str(item.get("detail") or ""))
+
+        def unique(items: list[dict]) -> dict[tuple, dict]:
+            seen: dict[tuple, dict] = {}
+            for item in items:
+                seen.setdefault(key(item), item)
+            return seen
+
+        base_map = unique(base["findings"])
+        target_map = unique(target["findings"])
+        added = [item for key_, item in target_map.items() if key_ not in base_map]
+        removed = [item for key_, item in base_map.items()
+                   if key_ not in target_map]
+        common = [item for key_, item in target_map.items() if key_ in base_map]
+
+        def kinds(items: list[dict]) -> dict:
+            counts: dict[str, int] = {}
+            for item in items:
+                name = str(item.get("kind") or "other")
+                counts[name] = counts.get(name, 0) + 1
+            return counts
+
+        base_job = self.history_detail(base_id)
+        target_job = self.history_detail(target_id)
+        try:
+            limit = max(1, int(limit))
+        except (TypeError, ValueError):
+            limit = 5000
+        return {
+            "base": str(base_id),
+            "target": str(target_id),
+            "base_name": ((base_job or {}).get("job") or {}).get("pcap_name", ""),
+            "target_name": ((target_job or {}).get("job") or {}).get("pcap_name", ""),
+            "added": added[:limit],
+            "removed": removed[:limit],
+            "common": common[:limit],
+            "counts": {
+                "base": len(base_map),
+                "target": len(target_map),
+                "added": len(added),
+                "removed": len(removed),
+                "common": len(common),
+            },
+            "kinds": {"base": kinds(base["findings"]),
+                      "target": kinds(target["findings"]),
+                      "added": kinds(added)},
+            "truncated": any(len(items) > limit for items in
+                             (added, removed, common)),
+        }
+
     def _prune(self, keep: int = 40) -> None:
         if len(self._jobs) <= keep:
             return
@@ -636,7 +834,7 @@ class JobManager:
             job.status = "cancelled"
             return
         job.status = "running"
-        job.started = _dt.datetime.now().isoformat(timespec="seconds")
+        job.started = job.started or _dt.datetime.now().isoformat(timespec="seconds")
         total = len(job.features)
         tshark = self.toolbox.tshark()
 
@@ -652,6 +850,8 @@ class JobManager:
                           self.config.get("cobaltstrike_keys", "paths"))
         params.setdefault("rdp_private_key",
                           self.config.get("rdp_private_key", "paths"))
+        params.setdefault("rules",
+                          self.config.get("rules_file", "paths"))
         params.setdefault("sql_success", self.config.get("sql_success"))
         params.setdefault("sql_time_threshold",
                           self.config.get_float("sql_time_threshold", fallback=1.0))
@@ -659,55 +859,65 @@ class JobManager:
         job.log.info(f"开始分析: {job.pcap}")
         job.log.info(f"输出目录: {job.output_dir}")
         job.log.info("功能: " + "、".join(f.title for f in job.features))
+        if job.shards > 1:
+            job.log.info(f"分片执行：无状态功能按 {job.shards} 个帧区间并行切片")
         if tshark is None:
             job.log.error("tshark 不可用，依赖 tshark 的功能将被跳过")
 
-        succeeded = failed = 0
+        resume_note = bool(job.completed)
+        if resume_note:
+            job.log.info("断点续跑：跳过已完成的功能 "
+                         + "、".join(job.completed))
+        for feature in job.features:
+            job.feature_status.setdefault(feature.checkbox, "pending")
+
+        succeeded = job.succeeded
+        failed = job.failed
+        paused = False
         for index, feature in enumerate(job.features):
             if job.cancel_event.is_set():
                 job.status = "cancelled"
                 break
+            if job.pause_event.is_set():
+                paused = True
+                job.log.warn(f"已在功能边界暂停（{index}/{total}）")
+                break
+            if feature.checkbox in job.completed:
+                job.feature_status[feature.checkbox] = "done"
+                continue
             job.current = feature.title
+            job.feature_status[feature.checkbox] = "running"
+            self._write_history(job)
             job.log.info(f"===== [{index + 1}/{total}] {feature.title} =====")
-            base = index / total * 100
-            span = 100 / total
-
-            def progress(value: int, _base=base, _span=span) -> None:
-                job.progress = int(_base + _span * (value / 100))
-
-            ctx = FeatureContext(
-                config=self.config,
-                logger=job.log,
-                tshark=tshark,
-                pcap=job.pcap,
-                params=params,
-                progress=progress,
-                cancel=job.cancel_event,
-                output_dir=job.output_dir,
-                findings=job.findings,
-            )
-            first_finding = len(job.findings)
             try:
-                call_feature(ctx, feature.handler)
+                self._run_feature(job, feature, params, tshark, index, total)
                 succeeded += 1
+                job.feature_status[feature.checkbox] = "done"
+                if feature.checkbox not in job.completed:
+                    job.completed.append(feature.checkbox)
                 job.log.good(f"{feature.title} 完成")
             except CancelledError:
+                job.feature_status[feature.checkbox] = "cancelled"
                 job.status = "cancelled"
                 job.log.warn(f"{feature.title} 已取消")
                 break
             except Exception as exc:  # noqa: BLE001 - one feature must not kill the job
                 failed += 1
+                job.feature_status[feature.checkbox] = "error"
                 job.log.error(f"{feature.title} 失败: {exc}")
                 job.log.debug(traceback.format_exc())
-            finally:
-                # Attribute whatever the handler recorded, even on failure.
-                for item in job.findings[first_finding:]:
-                    item["feature"] = feature.title
-                    item["checkbox"] = feature.checkbox
+            job.succeeded, job.failed = succeeded, failed
             job.progress = int((index + 1) / total * 100)
+            # Checkpoint after every feature so a crash/pause never loses work.
+            self._write_history(job)
+
+        if not paused and not job.cancel_event.is_set() and params.get("rules"):
+            self._apply_rules(job, params, tshark, total)
 
         if job.cancel_event.is_set():
             job.status = "cancelled"
+        elif paused:
+            job.status = "paused"
         elif failed and not succeeded:
             job.status = "error"
         else:
@@ -717,6 +927,169 @@ class JobManager:
         job.log.info(f"分析结束: {job.status}（成功 {succeeded}，失败 {failed}）")
         self._write_findings(job)
         self._write_report(job)
+
+    def _run_feature(self, job: Job, feature: Feature, params: dict,
+                     tshark, index: int, total: int) -> None:
+        """Run one handler, optionally across frame-range shards."""
+        base = index / total * 100
+        span = 100 / total
+
+        def progress(value: int, _base=base, _span=span) -> None:
+            job.progress = int(_base + _span * (value / 100))
+
+        ranges: list[tuple[int, int]] = []
+        if feature.shardable and job.shards > 1:
+            count = self._frame_count(job.pcap, tshark)
+            if count and count >= job.shards * 2:
+                ranges = _split_ranges(count, job.shards)
+                job.log.info(f"{feature.title}: {count} 帧，按 {len(ranges)} 片执行")
+
+        first_finding = len(job.findings)
+        try:
+            if not ranges:
+                call_feature(self._context(job, params, tshark, progress), feature.handler)
+                return
+            for shard_index, (start, end) in enumerate(ranges, 1):
+                clip = self._clip_shard(job, tshark, start, end, shard_index)
+                if clip is None:
+                    job.log.warn(f"{feature.title}: 切片失败，回退为整包执行")
+                    call_feature(self._context(job, params, tshark, progress),
+                                 feature.handler)
+                    return
+                job.log.info(f"[{shard_index}/{len(ranges)}] 帧 {start}-{end}")
+                ctx = self._context(job, params, tshark, None, pcap=str(clip),
+                                    frame_offset=start - 1,
+                                    shard=f"{shard_index}of{len(ranges)}")
+                call_feature(ctx, feature.handler)
+                progress(int(shard_index / len(ranges) * 100))
+        finally:
+            # Attribute whatever the handler recorded, even on failure.
+            for item in job.findings[first_finding:]:
+                item["feature"] = feature.title
+                item["checkbox"] = feature.checkbox
+
+    def _context(self, job: Job, params: dict, tshark, progress,
+                 pcap: str | None = None, frame_offset: int = 0,
+                 shard: str = "") -> FeatureContext:
+        return FeatureContext(
+            config=self.config,
+            logger=job.log,
+            tshark=tshark,
+            pcap=pcap or job.pcap,
+            params=params,
+            progress=progress,
+            cancel=job.cancel_event,
+            output_dir=job.output_dir,
+            findings=job.findings,
+            frame_offset=frame_offset,
+            shard=shard,
+        )
+
+    def _apply_rules(self, job: Job, params: dict, tshark, total: int) -> None:
+        """Run imported regex/YARA-subset rules and record matches as findings."""
+        from fnet.utils import rules as rules_mod
+
+        path = str(params.get("rules") or "").strip()
+        if not path:
+            return
+        if job.feature_status.get("__rules__") == "done":
+            return
+        path_obj = Path(path).expanduser()
+        if not path_obj.is_file():
+            job.log.warn(f"自定义规则文件不存在: {path_obj}")
+            return
+        job.feature_status["__rules__"] = "running"
+        job.current = "自定义规则"
+        try:
+            rule_set = rules_mod.load_rules(path_obj)
+        except Exception as exc:  # noqa: BLE001 - a bad rule file is not fatal
+            job.feature_status["__rules__"] = "error"
+            job.log.error(f"自定义规则加载失败: {exc}")
+            return
+        if not rule_set:
+            job.feature_status["__rules__"] = "done"
+            job.log.warn(f"自定义规则文件没有有效规则: {path_obj}")
+            return
+        job.log.info(f"===== 自定义规则（{len(rule_set)} 条）=====")
+        first = len(job.findings)
+        try:
+            matches = rules_mod.scan_pcap(rule_set, job.pcap, tshark,
+                                          cancel=job.cancel_event)
+        except CancelledError:
+            job.feature_status["__rules__"] = "cancelled"
+            return
+        except Exception as exc:  # noqa: BLE001
+            job.feature_status["__rules__"] = "error"
+            job.log.error(f"自定义规则执行失败: {exc}")
+            return
+        for match in matches:
+            item = findings_mod.make(
+                "rule", match.get("summary") or "",
+                frame=match.get("frame", ""), detail=match.get("detail", ""),
+                level=match.get("level") or "warn",
+                extra={"rule": match.get("rule", ""),
+                       "tags": match.get("tags") or []})
+            if item is not None:
+                item["feature"] = "自定义规则"
+                item["checkbox"] = "rules"
+                job.findings.append(item)
+        job.feature_status["__rules__"] = "done"
+        for item in job.findings[first:]:
+            item["feature"] = "自定义规则"
+            item["checkbox"] = "rules"
+        if matches:
+            job.log.good(f"自定义规则命中 {len(matches)} 条")
+        else:
+            job.log.info("自定义规则未命中")
+        job.progress = 100
+        self._write_history(job)
+
+    # -- sharding helpers ---------------------------------------------
+    def _frame_count(self, pcap: str, tshark) -> int:
+        """Total frame count using capinfos when available, tshark otherwise."""
+        capinfos = shutil.which("capinfos")
+        if capinfos:
+            try:
+                out = subprocess.run([capinfos, "-c", "-M", pcap],
+                                     capture_output=True, text=True,
+                                     timeout=120).stdout
+                match = re.search(r"Number of packets:\s*(\d+)", out)
+                if match:
+                    return int(match.group(1))
+            except (OSError, subprocess.SubprocessError):
+                pass
+        if tshark is not None:
+            try:
+                result = subprocess.run(
+                    [tshark.path, "-r", pcap, "-q", "-z", "io,stat,0"],
+                    capture_output=True, text=True, timeout=300)
+            except (OSError, subprocess.SubprocessError):
+                return 0
+            if result.returncode == 0:
+                # ``| 0.000 <> 1.000 |   123 |  4567 |``
+                matches = re.findall(r"\|\s*[\d.]+ <>\s*[\d.]+\s*\|\s*(\d+)\s*\|",
+                                     result.stdout or "")
+                if matches:
+                    return int(matches[-1])
+        return 0
+
+    def _clip_shard(self, job: Job, tshark, start: int, end: int,
+                    shard_index: int) -> Path | None:
+        """Write frames ``start..end`` to a temporary pcapng for one shard."""
+        if tshark is None:
+            return None
+        target = job.output_dir / "shards" / f"shard-{shard_index}-{start}-{end}.pcapng"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            code, out = subprocess.run(
+                [tshark.path, "-r", job.pcap, "-Y",
+                 f"frame >= {start} && frame <= {end}", "-w", str(target)],
+                capture_output=True, text=True, timeout=3600).returncode, ""
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if code != 0 or not target.is_file():
+            return None
+        return target
 
     def _write_findings(self, job: Job) -> None:
         """Persist structured findings as JSON + CSV next to the reports."""

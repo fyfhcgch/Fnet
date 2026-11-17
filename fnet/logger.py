@@ -177,6 +177,31 @@ class JobLog:
         with self._lock:
             return [r for r in self._records if r.seq > seq][:limit]
 
+    def seed(self, records: Iterable[LogRecord | dict]) -> None:
+        """Restore a previous transcript when a job is resumed from disk.
+
+        Records keep their original sequence numbers so the WebUI cursor and
+        report rendering stay stable across restarts.
+        """
+        with self._lock:
+            for item in records:
+                if isinstance(item, dict):
+                    record = LogRecord(
+                        int(item.get("seq") or 0),
+                        str(item.get("time") or ""),
+                        str(item.get("level") or "info"),
+                        str(item.get("text") or ""))
+                else:
+                    record = item
+                if record.seq <= 0:
+                    self._seq += 1
+                    record.seq = self._seq
+                else:
+                    self._seq = max(self._seq, record.seq)
+                self._records.append(record)
+            if len(self._records) > self._keep:
+                del self._records[: len(self._records) - self._keep]
+
     @property
     def last_seq(self) -> int:
         with self._lock:

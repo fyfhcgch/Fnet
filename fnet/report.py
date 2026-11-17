@@ -42,6 +42,7 @@ STATUS_NAMES = {
     "done": "完成",
     "error": "错误",
     "cancelled": "已取消",
+    "paused": "已暂停",
     "interrupted": "已中断",
 }
 

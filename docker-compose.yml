@@ -1,0 +1,21 @@
+services:
+  fnet:
+    build: .
+    image: fnet:latest
+    container_name: fnet
+    # Only expose the WebUI on loopback; the token still protects every API.
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      FNET_HOME: /data
+      FNET_HOST: 0.0.0.0
+      FNET_PORT: "8765"
+    volumes:
+      - ./data:/data
+      # Drop captures you want to analyse into ./captures.
+      - ./captures:/captures:ro
+    # Live capture needs raw sockets.  Remove these for file-only analysis.
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    restart: unless-stopped
