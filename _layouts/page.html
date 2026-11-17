@@ -1,0 +1,30 @@
+---
+layout: default
+---
+{%- comment -%}
+Overrides minima's ``page`` layout so every manual page gets the same
+hero-style header as the homepage: gradient card, lead description,
+version badge and a breadcrumb back to the manual index.
+{%- endcomment -%}
+<article class="docs-page">
+  <header class="hero docs-hero">
+    {%- if page.permalink and page.permalink != '/manual/' -%}
+    <p class="docs-crumb">
+      <a href="{{ '/manual/' | relative_url }}">← 用户教程</a>
+    </p>
+    {%- endif -%}
+    <h1>{{ page.title }}</h1>
+    {%- if page.description -%}
+    <p class="lead">{{ page.description }}</p>
+    {%- endif -%}
+    {%- if site.version -%}
+    <p class="cta-row">
+      <span class="badge version-badge">v{{ site.version }}</span>
+    </p>
+    {%- endif -%}
+  </header>
+
+  <div class="post-content">
+    {{ content }}
+  </div>
+</article>

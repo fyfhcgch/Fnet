@@ -184,6 +184,59 @@ $grey-color-dark: #3a3532;
   font-weight: 600;
 }
 
+/* ---------- 文档页 hero（覆写 minima page 布局） ---------- */
+
+.docs-hero {
+  margin: 1.8rem 0 1.6rem;
+  padding: 1.7rem 1.7rem 1.5rem;
+}
+
+.docs-hero h1 {
+  margin: 0 0 0.4rem;
+  font-size: 1.95rem;
+  letter-spacing: -0.02em;
+}
+
+.docs-hero .lead {
+  margin: 0;
+  color: #726b65;
+  font-size: 1rem;
+}
+
+.docs-crumb {
+  margin: 0 0 0.7rem;
+  font-size: 0.86rem;
+}
+
+.docs-crumb a {
+  color: #8f3d33;
+  text-decoration: none;
+}
+
+.docs-crumb a:hover {
+  text-decoration: underline;
+}
+
+.badge.version-badge {
+  display: inline-block;
+  padding: 0.12rem 0.6rem;
+  border-radius: 999px;
+  background: #f8e7e5;
+  color: #8f3d33;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+@media screen and (max-width: 600px) {
+  .docs-hero {
+    padding: 1.3rem 1.2rem;
+  }
+
+  .docs-hero h1 {
+    font-size: 1.6rem;
+  }
+}
+
 /* ---------- 步骤与提示 ---------- */
 
 .steps {

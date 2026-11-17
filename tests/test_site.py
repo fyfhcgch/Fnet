@@ -48,6 +48,19 @@ class SiteVersionTest(unittest.TestCase):
         for name in ("README.md", "TODO.md", "tests", "fnet"):
             self.assertRegex(config, rf"(?ms)^exclude:.*^\s*-\s*{re.escape(name)}\s*$")
 
+    def test_page_layout_override_applies_homepage_hero(self):
+        # _layouts/page.html overrides minima so every manual page gets the
+        # same hero UI (title, lead, version badge) as the homepage.
+        layout = (ROOT / "_layouts" / "page.html").read_text(encoding="utf-8")
+        self.assertIn("layout: default", layout)
+        self.assertIn("docs-hero", layout)
+        self.assertIn("site.version", layout)
+        self.assertIn("page.description", layout)
+        self.assertIn("site.version", layout)
+        scss = (ROOT / "assets" / "main.scss").read_text(encoding="utf-8")
+        self.assertIn(".docs-hero", scss)
+        self.assertIn(".badge.version-badge", scss)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
