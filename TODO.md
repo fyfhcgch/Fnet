@@ -55,5 +55,8 @@
 - [x] **包发布准备**：PyPI 名称 `fnet` 已被其他项目占用，发行名改为
       `fnet-ctf`（命令仍是 `fnet`）；`pyproject.toml`、`publish.yml`、
       `docs/RELEASE.md` 与本地 `build`/`twine check` 均已验证
-- [ ] **实际上传 PyPI**：仍需要维护者在 PyPI 配置 `fnet-ctf` 的 Trusted
-      Publisher（或账号凭据）并打 `v*` 标签；没有凭据时无法由代码侧完成
+- [ ] **实际上传 PyPI**：`v2.19.0` 标签已触发 `publish.yml`，`build` job
+      成功产出 sdist/wheel 并通过 `twine check`；`publish` job 在 PyPI OIDC
+      交换处返回 `invalid-publisher`（Publisher with matching claims was not
+      found）——即 PyPI 上尚未为 `fnet-ctf` 配置 Trusted Publisher，必须由
+      维护者登录 pypi.org 完成一次性配置后重跑（见 `docs/RELEASE.md`）

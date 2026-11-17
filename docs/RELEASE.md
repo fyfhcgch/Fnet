@@ -90,9 +90,18 @@ git push origin v2.19.0
 
 ## 当前阻塞
 
-截至 2.19.0，代码侧已完成构建配置、发布工作流与本文档；实际上传仍需要：
+截至 2.19.0，代码侧全部就绪并已实测：`v2.19.0` 标签触发的发布运行中
+`build` 成功（sdist/wheel 通过 `twine check`），`publish` 在 PyPI OIDC 交换
+处失败：
 
-- PyPI 账号或 Trusted Publisher 授权（由维护者配置）；
-- 确认 `fnet-ctf` 名称在目标索引可用（PyPI 查询为 404，表示尚未被占用）。
+```
+invalid-publisher: valid token, but no corresponding publisher
+```
 
-没有这些凭据时，任何自动化都无法代替维护者完成上传。
+OIDC claims 与工作流完全一致（repository `fyfhcgch/Fnet`、workflow
+`publish.yml`、environment `pypi`、ref `refs/tags/v2.19.0`），错误只可能
+来自 PyPI 侧未配置 Trusted Publisher。完成上文第 62–71 行的一次性配置后，
+在 GitHub 的 Actions 页面对 `publish.yml` 选择 `v2.19.0` 重跑
+（Re-run failed jobs）即可完成上传；或重新打任意 `v*` 标签。
+
+没有 PyPI 账号操作时，任何自动化都无法代替维护者完成上传。
