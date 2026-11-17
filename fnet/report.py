@@ -546,9 +546,11 @@ def render_html(meta: dict, logs, artifacts=None, sections=None,
 
 
 def write_reports(job, logs, artifacts=None, sections=None,
-                  findings=None) -> dict[str, Path]:
+                  findings=None, status=None) -> dict[str, Path]:
     """Render ``report.md`` / ``report.html`` next to a job's ``report.txt``.
 
+    ``status`` overrides ``job.status`` in the metadata so the worker can
+    render the terminal state before ``job.status`` is actually flipped.
     Failures are reported back to the caller instead of raising so a broken
     report can never turn a successful analysis into a failed job.
     """
@@ -560,7 +562,7 @@ def write_reports(job, logs, artifacts=None, sections=None,
         "features": [feature.checkbox for feature in job.features],
         "feature_titles": [feature.title for feature in job.features],
         "params": job.params,
-        "status": job.status,
+        "status": status or job.status,
         "created": job.created,
         "started": job.started,
         "finished": job.finished,

@@ -439,6 +439,11 @@ class Handler(BaseHTTPRequestHandler):
                 name += ".pcap"
             if Path(name).suffix.lower() not in (".pcap", ".pcapng", ".cap",
                                                  ".dmp", ".etl"):
+                # Unlink before responding: the ``finally`` cleanup runs after
+                # the HTTP response is sent, and a client checking uploads for
+                # leftovers right after the 400 would still see the .part.
+                temp.unlink(missing_ok=True)
+                temp = None
                 return self._error("仅支持 pcap/pcapng/cap/dmp/etl 文件")
             target = upload_dir / f"{secrets.token_hex(4)}_{name}"
             temp.replace(target)

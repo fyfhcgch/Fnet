@@ -914,22 +914,26 @@ class JobManager:
             self._apply_rules(job, params, tshark, total)
 
         if job.cancel_event.is_set():
-            job.status = "cancelled"
+            terminal = "cancelled"
         elif paused:
-            job.status = "paused"
+            terminal = "paused"
         elif failed and not succeeded:
-            job.status = "error"
+            terminal = "error"
         else:
-            job.status = "done"
+            terminal = "done"
         job.current = ""
         job.finished = _dt.datetime.now().isoformat(timespec="seconds")
-        job.log.info(f"分析结束: {job.status}（成功 {succeeded}，失败 {failed}）")
+        job.log.info(f"分析结束: {terminal}（成功 {succeeded}，失败 {failed}）")
+        # Write all artifacts BEFORE flipping job.status: API clients and the
+        # CLI break out of their poll loops as soon as they see the terminal
+        # status, and must see the complete artifact list at that moment.
+        self._write_findings(job)
+        self._write_report(job, terminal)
+        job.status = terminal
         # Persist the terminal/paused state: cross-process --resume reads
         # job.json from disk, and a stale status (e.g. "running") would make
         # can_resume False and the job unrestorable.
         self._write_history(job)
-        self._write_findings(job)
-        self._write_report(job)
 
     def _run_feature(self, job: Job, feature: Feature, params: dict,
                      tshark, index: int, total: int) -> None:
@@ -1108,7 +1112,13 @@ class JobManager:
         if job.findings:
             job.log.good(f"结构化结果 {len(job.findings)} 条，可在“分析结果”页查看")
 
-    def _write_report(self, job: Job) -> None:
+    def _write_report(self, job: Job, status: str | None = None) -> None:
+        """Render the txt/md/html reports; ``status`` overrides job.status.
+
+        The worker passes the terminal status here while ``job.status`` is
+        still "running", so artifacts are fully written before clients can
+        observe the terminal state.
+        """
         report = job.output_dir / "report.txt"
         lines = [
             "Fnet 分析报告",
@@ -1117,7 +1127,7 @@ class JobManager:
             f"任务 ID: {job.id}",
             f"开始时间: {job.started}",
             f"结束时间: {job.finished}",
-            f"状态: {job.status}",
+            f"状态: {status or job.status}",
             "功能: " + "、".join(f.title for f in job.features),
             "=" * 60,
             "",
@@ -1133,14 +1143,13 @@ class JobManager:
         try:
             written = write_reports(
                 job, [record.as_dict() for record in records], self.artifacts(job),
-                findings=job.findings)
+                findings=job.findings, status=status)
         except Exception as exc:  # noqa: BLE001 - reports must not fail a job
             job.log.warn(f"Markdown/HTML 报告生成失败: {exc}")
         job.report_markdown_path = str(written.get("md") or "")
         job.report_html_path = str(written.get("html") or "")
         if not written:
             job.log.warn("Markdown/HTML 报告生成失败，纯文本报告仍然可用")
-        self._write_history(job)
 
     # -- artifact helpers ---------------------------------------------
     @staticmethod
