@@ -46,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=None, help="使用指定的 config.ini")
     parser.add_argument("--features", default="",
                         help="逗号分隔的功能（checkBox_10 或 http.extract），默认全部默认勾选项")
-    parser.add_argument("--all", action="store_true", help="运行全部 45 个功能")
+    parser.add_argument("--all", action="store_true", help=f"运行全部 {len(FEATURES)} 个功能")
     parser.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
                         help="传给分析功能的额外参数，可重复")
     parser.add_argument("--json", action="store_true",

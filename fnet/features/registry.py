@@ -411,12 +411,14 @@ FEATURES: list[Feature] = [
                            "hashcat (bounded short enumeration, no brute by "
                            "default); otherwise hint hashcat -m 5600/5500"),
     Feature("checkBox_59", "OpenSSL加密文件分析", "openssl_file.detect_encrypted_files", "tls",
-            "按字节熵识别疑似加密/压缩文件；内置 EVP_BytesToKey + AES-CTR/CBC/ECB "
-            "OpenSSL 兼容解密，解密后自动扫 flag（openssl enc 场景）",
+            "识别 openssl enc 加密文件（Salted__/Base64 信封、熵值与特征），支持 "
+            "EVP_BytesToKey/PBKDF2、-iter/-saltlen、-md sha256、-a/-A Base64、-z、"
+            "原始 key/IV 解密并自动扫 flag；自动跳过 Fnet 生成的明文/报告工件",
             title_en="OpenSSL encrypted-file analysis",
-            description_en="Rank files by byte entropy to spot likely encrypted "
-                           "data; EVP_BytesToKey + AES-CTR/CBC/ECB OpenSSL-"
-                           "compatible decryption with automatic flag scan"),
+            description_en="Detect openssl enc files (Salted__/Base64 envelopes, "
+                           "entropy and signatures); EVP_BytesToKey/PBKDF2, "
+                           "iter/saltlen, sha256, Base64, zlib, raw key/IV "
+                           "decryption with flag scan; skip generated artifacts"),
     Feature("checkBox_60", "SMB密码候选生成", "smb_password.analyze", "auth",
             "从账号/域名/共享/文件名及弱口令字典派生密码候选，支持路径字典与"
             "受控暴力枚举，供 NTLM 验证与 SMB3 解密复用",

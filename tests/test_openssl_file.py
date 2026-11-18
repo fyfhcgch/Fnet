@@ -1,14 +1,21 @@
-"""Pure-stdlib unit tests for the OpenSSL file crypto/entropy module.
+"""Pure-stdlib unit tests for the OpenSSL file crypto/entropy/handler module.
 
-No tshark required. Covers the new ``crypto.py`` helpers (AES-CTR +
-EVP_BytesToKey), the ``entropy.py`` analysis, and the handler robustness.
+No tshark required. Covers the ``crypto.py`` helpers (AES-CTR +
+EVP_BytesToKey), the ``entropy.py`` analysis, and the modern
+``openssl_file`` handler (noise suppression, Base64/PBKDF2/zlib/raw key,
+password_file, no-password path) through a minimal ``FeatureContext`` stand-in.
+
+All encrypted fixtures are built with stdlib only (``hashlib.pbkdf2_hmac``,
+``base64``, ``zlib`` and the repo's pure-Python AES helpers); no openssl CLI.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import os
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 
 from fnet.utils.crypto import (
@@ -159,10 +166,65 @@ class EntropyTest(unittest.TestCase):
         self.assertIn("加密", cls["hint"])
 
 
+# ---------------------------------------------------------------------------
+# Handler-level helpers (all stdlib; no openssl CLI required).
+# ---------------------------------------------------------------------------
+class _FakeCtx:
+    """Minimal ``FeatureContext`` stand-in recording findings/logs/artifacts."""
+
+    def __init__(self, output_dir: Path | None = None, params: dict | None = None):
+        self.output_dir = output_dir
+        self.params = params or {}
+        self.findings: list[dict] = []
+        self.reports: list[tuple[str, str]] = []
+        self.writes: dict[str, bytes] = {}
+        self.progress: list[int] = []
+        self.cancels = 0
+
+    def report(self, text, level="info"):
+        self.reports.append((text, level))
+
+    def add_finding(self, kind, summary, *, frame="", detail="",
+                    level="info", extra=None):
+        self.findings.append({"kind": kind, "summary": summary,
+                              "frame": frame, "detail": detail,
+                              "level": level, "extra": extra or {}})
+
+    def set_progress(self, value):
+        self.progress.append(value)
+
+    def check_cancel(self):
+        self.cancels += 1
+
+    def cancelled(self):
+        return False
+
+    def write_output(self, name, data):
+        self.writes[name] = data
+        return Path(name)
+
+    def summaries(self):
+        return [item["summary"] for item in self.findings]
+
+    def log_text(self):
+        return "\n".join(text for text, _ in self.reports)
+
+
+def _pbkdf2_cbc_blob(password: str, salt: bytes, plaintext: bytes,
+                     *, iterations=10000, digest="sha256",
+                     salted=True, b64=False) -> bytes:
+    """Build an ``openssl enc -aes-256-cbc -pbkdf2`` compatible blob."""
+    material = hashlib.pbkdf2_hmac(digest, password.encode("utf-8"), salt,
+                                   iterations, dklen=48)
+    key, iv = material[:32], material[32:]
+    body = aes_cbc_encrypt(plaintext, key, iv)
+    blob = (b"Salted__" + salt + body) if salted else body
+    return base64.b64encode(blob) if b64 else blob
+
+
 class HandlerRobustnessTest(unittest.TestCase):
     def test_no_candidates_does_not_crash(self):
         from fnet.features.openssl_file import detect_encrypted_files
-        logs = []
 
         class FakeOut:
             def is_dir(self):
@@ -171,21 +233,20 @@ class HandlerRobustnessTest(unittest.TestCase):
             def iterdir(self):
                 return iter([])
 
-        class FakeCtx:
+        class BareCtx:
             output_dir = FakeOut()
 
             def __init__(self):
                 self.params = {}
-                self.calls = []
 
             def report(self, text, level="info"):
-                logs.append((level, text))
+                pass
 
             def check_cancel(self):
                 pass
 
             def set_progress(self, value):
-                self.calls.append(("progress", value))
+                pass
 
             def add_finding(self, *a, **k):
                 pass
@@ -193,14 +254,172 @@ class HandlerRobustnessTest(unittest.TestCase):
             def write_output(self, name, data):
                 return Path(name)
 
-        fake = FakeCtx()
-        detect_encrypted_files(fake)  # must not raise even with no files
-        self.assertTrue(any("未找到可分析的二进制文件" in text for _, text in logs))
+        detect_encrypted_files(BareCtx())  # must not raise even with no files
 
     def test_entropy_safe_without_file_param(self):
         from fnet.utils.entropy import classify
-        # Default classify on arbitrary no-param data stays safe.
         self.assertIsInstance(classify(b""), dict)
+
+
+class HandlerNoiseSuppressionTest(unittest.TestCase):
+    def test_generated_c2_readme_creates_no_finding(self):
+        """Screenshot case: medium-entropy generated text must not appear at all."""
+        from fnet.features.openssl_file import detect_encrypted_files
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # A medium-entropy (~6) UTF-8 helper text like the C2 handler writes.
+            text = ("C2 README\n" + "beacon task list: " +
+                    "".join(chr(33 + (i * 7) % 90) for i in range(400)) + "\n")
+            (root / "c2_README.txt").write_text(text, encoding="utf-8")
+            ctx = _FakeCtx(output_dir=root, params={})
+            detect_encrypted_files(ctx)
+            self.assertEqual(ctx.findings, [],
+                             f"生成文本不应产生任何发现: {ctx.summaries()}")
+            self.assertTrue(any("跳过" in text and "生成" in text
+                                for text, _ in ctx.reports),
+                            "应给出跳过生成/明文工件的中文日志")
+
+    def test_report_and_findings_are_skipped(self):
+        from fnet.features.openssl_file import detect_encrypted_files
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("findings.json", "findings.csv", "report.md",
+                         "job.json"):
+                (root / name).write_text("x" * 200, encoding="utf-8")
+            ctx = _FakeCtx(output_dir=root, params={})
+            detect_encrypted_files(ctx)
+            self.assertEqual(ctx.findings, [])
+
+    def test_medium_entropy_text_without_marker_is_log_only(self):
+        """Even if not recognised as generated, plain UTF-8 text has no finding."""
+        from fnet.features.openssl_file import _entropy_report
+        ctx = _FakeCtx()
+        data = ("".join(chr(33 + (i * 13) % 90) for i in range(500))
+                ).encode("utf-8")
+        _entropy_report(ctx, [("notes.txt", data)])
+        self.assertEqual(ctx.findings, [])
+
+
+class HandlerDecryptTest(unittest.TestCase):
+    def _run(self, root: Path, params: dict) -> _FakeCtx:
+        from fnet.features.openssl_file import detect_encrypted_files
+        ctx = _FakeCtx(output_dir=root, params=params)
+        detect_encrypted_files(ctx)
+        return ctx
+
+    def test_base64_pbkdf2_cbc_decrypts(self):
+        password = "hunter2"
+        plaintext = b"flag{base64-pbkdf2-aes256cbc}\n" * 3
+        salt = b"\x11" * 8
+        blob = _pbkdf2_cbc_blob(password, salt, plaintext,
+                                b64=True)
+        self.assertTrue(blob.startswith(b"U2FsdGVkX1"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "secret.enc").write_bytes(blob)
+            ctx = self._run(root, {
+                "password": password, "cipher": "aes-256-cbc",
+                "kdf": "pbkdf2", "digest": "sha256", "iter": 10000,
+                "base64": True, "saltlen": 8,
+            })
+            self.assertIn("OpenSSL 解密成功 secret.enc", ctx.summaries())
+            self.assertEqual(ctx.writes.get("decrypted.bin"), plaintext)
+            self.assertEqual(ctx.writes.get("secret.decrypted"), plaintext)
+            self.assertNotIn(password, ctx.log_text())
+
+    def test_evp_md5_nosalt_ctr_decrypts(self):
+        password = "haha"
+        plaintext = b"flag{evp-md5-nosalt-ctr}\n" * 2
+        key, iv = evp_bytes_to_key(password.encode("utf-8"), None, 32, 16, "md5")
+        body = aes_ctr_crypt(plaintext, key, iv)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "flag.bin").write_bytes(body)
+            ctx = self._run(root, {
+                "password": password, "cipher": "aes-256-ctr",
+                "kdf": "evp", "md": "md5", "nosalt": True,
+            })
+            self.assertIn("OpenSSL 解密成功 flag.bin", ctx.summaries())
+            self.assertEqual(ctx.writes.get("decrypted.bin"), plaintext)
+
+    def test_zlib_decompression(self):
+        password = "zip"
+        raw = b"flag{zlib-decompressed}\n" * 10
+        plaintext = zlib.compress(raw)
+        salt = b"\x22" * 8
+        blob = _pbkdf2_cbc_blob(password, salt, plaintext)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "packed.enc").write_bytes(blob)
+            ctx = self._run(root, {
+                "password": password, "cipher": "aes-256-cbc",
+                "kdf": "pbkdf2", "zlib": True,
+            })
+            self.assertIn("OpenSSL 解密成功 packed.enc", ctx.summaries())
+            self.assertEqual(ctx.writes.get("decrypted.bin"), raw)
+
+    def test_zlib_wraps_whole_envelope(self):
+        """Real OpenSSL 4.x ``-z``: zlib(Salted__ + salt + AES(...))."""
+        password = "zip-outer"
+        raw = b"flag{zlib-wrapped-envelope}\n" * 8
+        salt = b"\x55" * 8
+        envelope = _pbkdf2_cbc_blob(password, salt, raw)
+        self.assertTrue(envelope.startswith(b"Salted__"))
+        blob = zlib.compress(envelope)
+        self.assertTrue(blob.startswith(b"\x78"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "wrapped.enc").write_bytes(blob)
+            ctx = self._run(root, {
+                "password": password, "cipher": "aes-256-cbc",
+                "kdf": "pbkdf2", "zlib": True,
+            })
+            self.assertIn("OpenSSL 解密成功 wrapped.enc", ctx.summaries())
+            self.assertEqual(ctx.writes.get("decrypted.bin"), raw)
+
+    def test_explicit_key_and_iv(self):
+        key = bytes(range(32))
+        iv = bytes(range(16))
+        plaintext = b"flag{raw-key-iv}\n"
+        body = aes_cbc_encrypt(plaintext, key, iv)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "raw.enc").write_bytes(body)
+            ctx = self._run(root, {
+                "key": key.hex(), "iv": iv.hex(),
+                "cipher": "aes-256-cbc", "nosalt": True,
+            })
+            self.assertIn("OpenSSL 解密成功 raw.enc", ctx.summaries())
+            self.assertEqual(ctx.writes.get("decrypted.bin"), plaintext)
+
+    def test_password_file(self):
+        password = "from-file"
+        plaintext = b"flag{password-file-ok}\n"
+        salt = b"\x33" * 8
+        blob = _pbkdf2_cbc_blob(password, salt, plaintext)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data.enc").write_bytes(blob)
+            pw_path = root / "pw.txt"
+            pw_path.write_text(f"\n\n{password}\n", encoding="utf-8")
+            ctx = self._run(root, {
+                "password_file": str(pw_path), "cipher": "aes-256-cbc",
+                "kdf": "pbkdf2",
+            })
+            self.assertIn("OpenSSL 解密成功 data.enc", ctx.summaries())
+            self.assertEqual(ctx.writes.get("decrypted.bin"), plaintext)
+            self.assertNotIn(password, ctx.log_text())
+
+    def test_no_password_logs_without_crashing(self):
+        from fnet.features.openssl_file import detect_encrypted_files
+        blob = _pbkdf2_cbc_blob("pw", b"\x44" * 8, b"secret data" * 20)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "locked.enc").write_bytes(blob)
+            ctx = _FakeCtx(output_dir=root, params={})
+            detect_encrypted_files(ctx)  # must not raise
+            self.assertTrue(any("仅执行检测" in text for text, _ in ctx.reports))
+            self.assertFalse(any("解密成功" in s for s in ctx.summaries()))
 
 
 if __name__ == "__main__":

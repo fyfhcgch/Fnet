@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fnet-ctf"
-version = "2.21.1"
+version = "2.21.2"
 description = "Fnet - 开源 CTF 网络流量分析工具箱（WebUI，Linux/macOS/Windows）"
 readme = "README.md"
 requires-python = ">=3.10"

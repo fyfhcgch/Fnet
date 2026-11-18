@@ -209,9 +209,17 @@ Wi-Fi 处理器默认只做识别和取证，不会自动跑大字典：
 | 复选框 | Handler | 功能 | 说明 |
 | --- | --- | --- | --- |
 | `checkBox_24` | `tls.decrypt` | TLS流量解密 | 用 NSS keylog 或 RSA 私钥解密 TLS/QUIC，提取证书链、明文 HTTP、HTTP/2/gRPC、WebSocket 与 HTTP/3，并为每个 Client Hello 计算 JA3/JA4 指纹 |
-| `checkBox_59` | `openssl_file.detect_encrypted_files` | OpenSSL加密文件分析 | 按字节熵识别疑似加密/压缩文件；内置 `EVP_BytesToKey` + AES-CTR/CBC/ECB OpenSSL 兼容解密（`openssl enc` 场景），解密后自动扫 flag |
+| `checkBox_59` | `openssl_file.detect_encrypted_files` | OpenSSL加密文件分析 | 识别 `Salted__`/Base64 信封与高熵文件；EVP_BytesToKey/PBKDF2 + AES-CTR/CBC/ECB 解密，支持 `-iter`/`-saltlen`/`-md`/Base64/`-z`/原始 key/IV，自动扫 flag；跳过生成工件 |
 
-`openssl_file` 参数：`path`（待分析/解密文件，默认遍历已还原文件）、`password`（解密口令，仅做熵分析时留空）、`cipher`（默认 `aes-256-ctr`，支持 aes-128/192/256 + ctr/cbc/ecb）、`salt`/`salt_hex`/`nosalt`。解密结果落盘 `decrypted.bin` 并复用 `find_flags` 扫 flag。
+`openssl_file` 参数：
+
+- 文件与口令：`path`（待分析/解密文件，默认遍历已还原文件）、`password`（解密口令，仅检测时留空）、`password_file`（从文件首个非空行读取口令，绝不回显）。
+- 旧参数兼容：`cipher`（默认 `aes-256-ctr`，支持 aes-128/192/256 + ctr/cbc/ecb）、`salt`/`salt_hex`/`nosalt`。注意 OpenSSL 3.0+ 用 `-S` 显式指定的盐**不写入文件头**，解密时需再次传入；1.1.1 及更早版本会写入 `Salted__` 头，本处理器两种情况都能处理。
+- KDF/摘要：`kdf`（`evp`/`pbkdf2`/`auto`，默认 `auto` 自动尝试）、`digest` 或 `md`（默认随 OpenSSL 1.1.0+ 的 `sha256`，CTF 旧数据可传 `md5`）、`iter`/`iterations`（`-pbkdf2` 默认 10000）、`saltlen`（`-saltlen`，默认 8，最大 16）。
+- 编码/填充：`base64`（`-a`/`-A`，即 `U2FsdGVkX1` Base64 信封）、`zlib`（`-z` 解压）、`nopad`（不去除 PKCS#7 填充）。`openssl enc -z` 的真实 CLI 行为是**把整个 `Salted__` 信封再套一层 zlib**（解压后才见魔数），因此自动模式会先尝试 inflate 再做信封检测；显式 `zlib=true` 强制走该路径。核心同时兼容“先压缩明文再加密”的旧写法。
+- 原始密钥：`key`/`key_hex`（`-K`）、`iv`/`iv_hex`（`-iv`），无需口令即可解密。
+
+未提供配方时，处理器在 `recipe_candidates` 给出的常见配方上做上限尝试（日志会报告配方数量）。解密结果落盘 `decrypted.bin` 与逐文件 `<stem>.decrypted`，并复用 `find_flags` 扫 flag。Fnet 自己写出的 `*_README.txt`、`findings.json/csv`、`report*.txt/md/html`、`job.json` 等生成/明文工件会被自动跳过，不进入熵值排行与“疑似加密文件”发现；只有带 `Salted__`/`U2FsdGVkX1` 标记或高熵（≥7.2）低可打印率的文件才产生发现。
 
 `tls.decrypt` 会顺带调用 `tls.quic` 识别 QUIC v1/v2 连接：输出版本、SNI、
 ALPN、包类型与帧号到 `quic_connections.csv`；配置 keylog 后继续解密 HTTP/3

@@ -22,6 +22,16 @@ description: 把 pcap 拖进浏览器，勾选需要的检查项，得到 flag�
   </p>
 </div>
 
+## 2.21.2 更新
+
+- **OpenSSL 加密文件深度分析**：新增纯标准库 `enc` 信封核心，支持
+  `Salted__`/Base64、`-md`、PBKDF2/`-iter`/`-saltlen`、显式 `-S`、`-K/-iv`、
+  外层/内层 zlib，以及 AES-128/192/256 的 CBC/CTR/ECB 解密。
+- **降噪与可操作结果**：生成的 README/报告/明文工件不再进入分析结果；命中时
+  给出编码、salt、cipher、KDF、摘要、迭代数与 flag 细节，解密结果落盘。
+- **真实 CLI 校验**：新增 `openssl enc` 样本生成器与兼容性测试，覆盖 1.1+/3.x/4.x
+  常见配方；CLI `--all` 帮助改为按功能注册表动态显示数量。
+
 ## 2.21.1 更新
 
 - **Sliver 现代传输解密**：支持 v1.6 ChaCha20-Poly1305、74 字节 minisign 签名前缀跳过与 gzip 透明解压；兼容 v1.5 与旧版 AES-GCM，并识别 Age/TOTP/RSA 密钥交换及多种流量编码器。

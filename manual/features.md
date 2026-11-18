@@ -106,13 +106,23 @@ Webshell 解密（冰蝎 3.x/4.x、哥斯拉、蚁剑、菜刀、内存马）没
 | 无线流量暴力破解 | `checkBox_18` | WPA/WPA2 握手与 PMKID 识别、hashcat 22000 命令；已知 PSK 时用 `--wpa-psk` 解密 802.11 数据帧并把明文送回 HTTP/DNS/凭据分析 |
 | 蓝牙流量分析 | `checkBox_21` | Bluetooth / BTHCI 协议概览 |
 
-## TLS / 加密（1）
+## TLS / 加密（2）
 
 | 功能 | 复选框 | 说明 |
 | --- | --- | --- |
 | TLS流量解密 | `checkBox_24` | keylog 或私钥解密，继续还原 HTTP/2、gRPC、WebSocket、HTTP/3 与明文凭据 |
+| OpenSSL加密文件分析 | `checkBox_59` | 识别 `Salted__`/`U2FsdGVkX1` Base64 信封与高熵文件；支持 EVP_BytesToKey/PBKDF2、`-iter`/`-saltlen`/`-md sha256`、`-a/-A` Base64、`-z`、原始 key/IV 解密并自动扫 flag；自动生成/明文工件（如 `c2_README.txt`、`findings.*`、`report*.md`、`job.json`）会被跳过 |
 
-QUIC 识别与解密由该项自动调用（`tls.quic`），不需要额外勾选。
+QUIC 识别与解密由 `checkBox_24` 自动调用（`tls.quic`），不需要额外勾选。
+
+`openssl_file` 参数：`path`、`password`、`password_file`（首个非空行，口令不回显）、
+`cipher`、`salt`/`salt_hex`/`nosalt`、`kdf`（`evp`/`pbkdf2`/`auto`）、`digest` 或 `md`、
+`iter`/`iterations`、`saltlen`、`base64`、`zlib`、`key`/`key_hex`、`iv`/`iv_hex`、`nopad`。
+OpenSSL 3.0+ 用 `-S` 指定的盐不再写入文件头，解密须再次传入 `salt`/`salt_hex`；
+1.1.1 及更早版本写入 `Salted__` 头，两者均支持。默认摘要自 1.1.0 起为 `sha256`，
+`-pbkdf2` 默认 10000 次迭代，`-saltlen` 默认 8（最大 16），`-a/-A` 为 Base64。
+`-z` 会把整个 `Salted__` 信封包进 zlib（先 inflate 再识别信封），显式 `zlib=true`
+强制该路径；自动模式也会先尝试 inflate。
 
 ## 杂项（3）
 

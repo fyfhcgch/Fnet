@@ -1,7 +1,7 @@
 title: Fnet
 description: 面向 CTF 与流量取证的开源流量分析工具箱
 lang: zh-CN
-version: 2.21.1
+version: 2.21.2
 url: https://fyfhcgch.github.io
 baseurl: /Fnet
 theme: minima
