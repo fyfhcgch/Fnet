@@ -395,6 +395,35 @@ FEATURES: list[Feature] = [
                            "meterpreter_symkey parameters "
                            "(sliver_dns_domain lists known DNS beacon "
                            "domains)"),
+    Feature("checkBox_57", "SMB加密链路智能串联", "smb_intel.analyze", "flow",
+            "完整链路自动化：NTLM 账号 → 候选密码注入/离线验证 → SMB3 解密 → "
+            "导出文件 → 熵识别疑似加密 → 提示 flag；候选耗尽时自动回退/提示 hashcat",
+            title_en="SMB encrypted-chain intelligence",
+            description_en="Automate the full chain: NTLM accounts → candidate "
+                           "password injection/offline verify → SMB3 decrypt → "
+                           "file export → entropy-based encryption detection → "
+                           "flag hint; falls back to hashcat when exhausted"),
+    Feature("checkBox_58", "NTLM密码离线验证", "ntlm_verify.verify", "auth",
+            "无 hashcat 时直接验证/枚举 NetNTLMv2 密码（受控短枚举，默认不强攻）"
+            "；未命中提示 hashcat -m 5600 / -m 5500",
+            title_en="NTLM password offline verify",
+            description_en="Verify/enumerate NetNTLMv2 passwords without "
+                           "hashcat (bounded short enumeration, no brute by "
+                           "default); otherwise hint hashcat -m 5600/5500"),
+    Feature("checkBox_59", "OpenSSL加密文件分析", "openssl_file.detect_encrypted_files", "tls",
+            "按字节熵识别疑似加密/压缩文件；内置 EVP_BytesToKey + AES-CTR/CBC/ECB "
+            "OpenSSL 兼容解密，解密后自动扫 flag（openssl enc 场景）",
+            title_en="OpenSSL encrypted-file analysis",
+            description_en="Rank files by byte entropy to spot likely encrypted "
+                           "data; EVP_BytesToKey + AES-CTR/CBC/ECB OpenSSL-"
+                           "compatible decryption with automatic flag scan"),
+    Feature("checkBox_60", "SMB密码候选生成", "smb_password.analyze", "auth",
+            "从账号/域名/共享/文件名及弱口令字典派生密码候选，支持路径字典与"
+            "受控暴力枚举，供 NTLM 验证与 SMB3 解密复用",
+            title_en="SMB password candidate generation",
+            description_en="Derive password candidates from accounts/domains/"
+                           "shares/filenames plus a weak-password dictionary, "
+                           "with path wordlists and bounded brute force"),
 ]
 
 BY_CHECKBOX = {feature.checkbox: feature for feature in FEATURES}

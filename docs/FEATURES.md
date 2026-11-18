@@ -1,6 +1,6 @@
 # 功能说明
 
-Fnet 共 **46 个分析功能**、**13 个分类**。WebUI 侧栏按分类折叠展示；CLI 用
+Fnet 共 **50 个分析功能**、**13 个分类**。WebUI 侧栏按分类折叠展示；CLI 用
 复选框编号（`checkBox_10`）或 handler（`text_scan.keyword_scan`）选择。
 
 ```bash
@@ -72,14 +72,16 @@ python3 -m fnet -C x.pcap --features webshell.decrypt \
 | `checkBox_15` | `cs.analyze` | Cobalt Strike流量分析 | `cryptography` | 解析 beacon 元数据/任务，使用 `.cobaltstrike.beacon_keys` 解密 |
 | `checkBox_43` | `winrm.decrypt` | WINRM流量解密 | — | 从 NTLM 认证还原 WinRM 凭据；支持 hash 或明文密码 |
 | `checkBox_55` | `meterpreter.analyze` | Meterpreter会话分析 | — | Meterpreter/metsvc TCP TLV 会话识别：命令 ID、字符串参数、异常与命令时间线；不认识的 TLV type 显示 hex |
-| `checkBox_56` | `c2ext.analyze` | Sliver/meterpreter C2扩展 | — | Sliver HTTP/DNS/mTLS beacon 识别（URI 扩展名分类、改良 Base32/Base58 解码、证书画像）与 meterpreter staging/XOR 加密传输分析；有会话密钥时解密会话载荷 |
+| `checkBox_56` | `c2ext.analyze` | Sliver/meterpreter C2扩展 | — | Sliver HTTP/DNS/mTLS beacon 识别（v1.6 ChaCha20-Poly1305 与签名前缀/gzip、v1.5/旧版 AES-GCM 回退、密钥交换、流量编码器）与 meterpreter staging/AES-128/256-CBC wire 分析；有会话密钥时解密会话载荷 |
 
 Meterpreter 参数：无（自动按 TLV 结构识别，metsvc 默认端口 31337，
 反向连接端口不定）。输出 `meterpreter_timeline.csv`。
 
-C2 扩展参数：`sliver_session_key`（Sliver 会话 AES-256 密钥，hex）、
-`meterpreter_symkey`（meterpreter AES-256 对称密钥，hex）、
-`sliver_dns_domain`（已知 DNS beacon 域名，逗号分隔）。
+C2 扩展参数：`sliver_session_key`（Sliver 会话密钥，hex；v1.5/v1.6 为 32 字节
+ChaCha20-Poly1305，v1.4 及更早为 16 字节 AES-GCM）、`meterpreter_symkey`
+（meterpreter AES-CBC 对称密钥，hex；16 字节 = AES-128，32 字节 = AES-256）、
+`sliver_dns_domain`（已知 DNS beacon 域名，逗号分隔）。模块同时识别密钥交换、
+gzip 压缩与 Base64/Hex 等流量编码器。
 
 WinRM 参数：`winrm_auth=hash|password`、`winrm_ntlm`、`winrm_password`。
 CS 参数：`cobaltstrike_keys`（keys 文件路径）。
@@ -90,6 +92,8 @@ CS 参数：`cobaltstrike_keys`（keys 文件路径）。
 | --- | --- | --- | --- |
 | `checkBox_39` | `ntlm.extract` | NTLM HASH提取 | 从 HTTP/SMB/WinRM 的 NTLMSSP 消息提取账号、域、主机与 NetNTLMv1/v2 哈希，输出 hashcat/john 格式 |
 | `checkBox_45` | `kerberos.parse` | Kerberos解析破解 | 解析 AS-REQ/AS-REP/TGS-REP，生成 hashcat 18200/13100/19800/19900/19600/19700 哈希；可用 keytab、账号密码或原始密钥解密响应并解析 PAC、NTLM 哈希与用户时间线 |
+| `checkBox_58` | `ntlm_verify.verify` | NTLM密码离线验证 | 无 hashcat 时直接用购买的挑战/响应离线验证或受控枚举 NetNTLMv2 密码（默认不强攻）；命中输出密码、未命中提示 `hashcat -m 5600`/`-m 5500` |
+| `checkBox_60` | `smb_password.analyze` | SMB密码候选生成 | 从账号/域名/共享/文件名与弱口令字典派生密码候选，支持 `path` 字典与受控暴力枚举，供 NTLM 验证与 SMB3 解密复用 |
 
 NTLM 输出可直接用于：
 
@@ -113,7 +117,8 @@ hashcat -m 5500 ntlm_hashes.txt wordlist.txt   # NetNTLMv1
 | `checkBox_33` | `flows.tcp` | TCP流分析 | TCP 流重组、会话统计与内容提取 |
 | `checkBox_44` | `arp.analyze` | ARP协议分析 | IP/MAC 冲突、免费 ARP 与异常字段 |
 | `checkBox_48` | `ldap.analyze` | LDAP流量分析 | LDAP 绑定凭据/SASL 机制、查询 base/filter、条目属性（AD 账号等）与 StartTLS 告警 |
-| `checkBox_49` | `smb.analyze` | SMB流量分析 | SMB2/3 共享与会话、NTLM 身份、文件读写还原落盘、加密/压缩告警 |
+| `checkBox_49` | `smb.analyze` | SMB流量分析 | SMB2/3 共享与会话、NTLM 身份、文件读写还原落盘、加密/压缩告警、解密 SMB3 加密流量（会话密钥写入 `smb3_keys.txt`） |
+| `checkBox_57` | `smb_intel.analyze` | SMB加密链路智能串联 | 完整链路自动化：NTLM 账号 → 候选密码注入/离线验证 → SMB3 解密 → 导出文件 → 熵识别疑似加密 → 提示 flag；候选耗尽自动回退并提示 hashcat；解密出的会话密钥落盘 `smb3_keys.txt`，供 WebUI 的 SMB3 解密对话框自动填入 |
 | `checkBox_50` | `mongodb.analyze` | MongoDB流量分析 | OP_MSG 命令与集合、SCRAM 认证交换、GridFS 文件还原落盘 |
 | `checkBox_51` | `postgres.analyze` | PostgreSQL流量分析 | 查询语句与参数、结果摘要、明文口令消息与 COPY 数据 |
 | `checkBox_52` | `redis.analyze` | Redis流量分析 | RESP 命令、AUTH/ACL 凭据、敏感键读取与写入值摘要（支持非标准端口） |
@@ -204,6 +209,9 @@ Wi-Fi 处理器默认只做识别和取证，不会自动跑大字典：
 | 复选框 | Handler | 功能 | 说明 |
 | --- | --- | --- | --- |
 | `checkBox_24` | `tls.decrypt` | TLS流量解密 | 用 NSS keylog 或 RSA 私钥解密 TLS/QUIC，提取证书链、明文 HTTP、HTTP/2/gRPC、WebSocket 与 HTTP/3，并为每个 Client Hello 计算 JA3/JA4 指纹 |
+| `checkBox_59` | `openssl_file.detect_encrypted_files` | OpenSSL加密文件分析 | 按字节熵识别疑似加密/压缩文件；内置 `EVP_BytesToKey` + AES-CTR/CBC/ECB OpenSSL 兼容解密（`openssl enc` 场景），解密后自动扫 flag |
+
+`openssl_file` 参数：`path`（待分析/解密文件，默认遍历已还原文件）、`password`（解密口令，仅做熵分析时留空）、`cipher`（默认 `aes-256-ctr`，支持 aes-128/192/256 + ctr/cbc/ecb）、`salt`/`salt_hex`/`nosalt`。解密结果落盘 `decrypted.bin` 并复用 `find_flags` 扫 flag。
 
 `tls.decrypt` 会顺带调用 `tls.quic` 识别 QUIC v1/v2 连接：输出版本、SNI、
 ALPN、包类型与帧号到 `quic_connections.csv`；配置 keylog 后继续解密 HTTP/3
@@ -256,6 +264,10 @@ findings 做交集，任务没有 findings 时照常归一化日志。识别不�
 - `report.txt`：纯文本，与终端日志一致，适合 grep；
 - `report.md`：带概要、功能清单、关键发现、完整日志、产出文件与参数的 Markdown；
 - `report.html`：自包含样式，可离线打开，也可用浏览器打印为 PDF。
+
+“关键发现”和“时间线”只列出成功结果（`info`/`good`），`warn`、`error` 与
+`debug` 行仍保留在完整日志和 WebUI 的“分析结果”中；报告文件本身不会出现在
+“产出文件”列表里，因为它就是当前这份报告。
 
 WebUI 的“文件 → 导出分析报告…”可以勾选章节（`summary`、`features`、
 `findings`、`log`、`artifacts`、`params`），“任务历史”每一行也提供 HTML

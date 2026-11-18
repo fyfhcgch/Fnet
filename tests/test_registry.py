@@ -10,7 +10,7 @@ from fnet.features.registry import (
 
 class RegistryTest(unittest.TestCase):
     def test_feature_count_and_defaults(self):
-        self.assertEqual(len(FEATURES), 46)
+        self.assertEqual(len(FEATURES), 50)
         self.assertEqual(sum(1 for f in FEATURES if f.default), 2)
 
     def test_checkbox_and_handler_unique(self):

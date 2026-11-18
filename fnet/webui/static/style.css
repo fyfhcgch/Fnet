@@ -426,6 +426,7 @@ button:focus-visible, a:focus-visible, summary:focus-visible {
 .field { display: flex; flex-direction: column; gap: 5px; }
 .field label { font-size: 11.5px; color: var(--muted); }
 .field input, .field select { width: 100%; }
+.field input[type="checkbox"], .field input[type="radio"] { width: auto; }
 .check-row { display: flex; flex-wrap: wrap; gap: 8px 14px; font-size: 12px; }
 .check-list { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12.5px; }
 .check-row label, label.inline, .check-list label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
@@ -805,7 +806,8 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   display: grid; place-items: center; padding: 20px;
 }
 .modal-box {
-  width: min(560px, 100%); max-height: 86vh; display: flex; flex-direction: column;
+  width: min(560px, 100%); max-height: 86vh; min-width: 0;
+  display: flex; flex-direction: column;
   background: color-mix(in srgb, var(--panel) 96%, transparent);
   border: 1px solid var(--line-soft);
   border-radius: 22px; box-shadow: var(--shadow);
@@ -814,9 +816,32 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 @keyframes modal-in { from { opacity: 0; transform: scale(.985) translateY(6px); } to { opacity: 1; transform: none; } }
 .modal-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--line-soft); }
 .modal-head h3 { margin: 0; font-size: 15.5px; }
-.modal-body { padding: 16px 18px; overflow: auto; display: flex; flex-direction: column; gap: 10px; }
-.modal-body pre { margin: 0; white-space: pre-wrap; font-family: var(--mono); font-size: 12.5px; }
+.modal-body { padding: 16px 18px; overflow: auto; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+/* Hashes, base64 blobs and tshark dumps are single unbroken tokens.  Without
+   wrapping, the <pre>'s min-content width grows to thousands of pixels and the
+   centered grid item is pushed off-screen, leaving only the blurred backdrop. */
+.modal-body pre {
+  margin: 0; white-space: pre-wrap; font-family: var(--mono); font-size: 12.5px;
+  overflow-wrap: anywhere; word-break: break-word;
+}
 .modal-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 13px 18px; border-top: 1px solid var(--line-soft); }
+.modal-detail h4 { margin: 0 0 6px; font-size: 12.5px; color: var(--muted); }
+.smb-detail { width: 100%; border-collapse: collapse; font-size: 12px; }
+.smb-detail th, .smb-detail td {
+  padding: 5px 8px; border-bottom: 1px solid var(--line-soft);
+  text-align: left; vertical-align: top; overflow-wrap: anywhere;
+}
+.smb-detail th {
+  width: 34%; white-space: nowrap; font-weight: 500;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--panel2) 70%, var(--panel));
+}
+.smb-detail code { font-size: 11.5px; word-break: break-all; }
+.smb-flags code {
+  display: inline-block; margin: 0 6px 6px 0; padding: 2px 7px;
+  border-radius: 7px; background: var(--tint-2); font-size: 12px;
+}
+.smb-files .mono { font-size: 11.5px; padding: 2px 0; overflow-wrap: anywhere; }
 .packet-box { width: min(860px, 100%); }
 .packet-summary {
   background: color-mix(in srgb, var(--panel2) 60%, transparent);
@@ -826,7 +851,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .packet-neighbors { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .packet-neighbors th, .packet-neighbors td {
   padding: 6px 8px; border-bottom: 1px solid var(--line-soft);
-  text-align: left; vertical-align: top;
+  text-align: left; vertical-align: top; overflow-wrap: anywhere;
 }
 .packet-neighbors th { background: color-mix(in srgb, var(--panel2) 82%, var(--panel)); white-space: nowrap; }
 .packet-neighbors tr.active { background: var(--tint-2); }
@@ -835,6 +860,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
   max-height: 42vh; overflow: auto; background: var(--log);
   border: 1px solid var(--line-soft); border-radius: 12px;
   padding: 12px; font-size: 12px; line-height: 1.55;
+  white-space: pre-wrap; overflow-wrap: anywhere;
 }
 
 /* ------------------------------------------------- timeline / annotations */

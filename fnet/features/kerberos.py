@@ -180,7 +180,7 @@ def _report_pac(ctx: FeatureContext, plaintext: bytes, user: str,
         ctx.add_finding("hash", f"NTLM {account}", frame=frame, level="good",
                         detail=pac["ntlm_hash"],
                         extra={"protocol": "kerberos", "account": account,
-                               "hash": pac["ntlm_hash"]})
+                               "hash": pac["ntlm_hash"], "mode": "1000"})
 
 
 def parse(ctx: FeatureContext) -> None:

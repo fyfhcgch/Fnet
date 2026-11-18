@@ -121,6 +121,14 @@ class Smb2Message:
     encrypted: bool = False
     compressed: bool = False
     original_size: int = 0
+    #: Raw SMB2/transform bytes (used for the SMB3 preauth hash and decryption).
+    raw: bytes = b""
+    #: ``TRANSFORM_HEADER.Signature`` (the AEAD tag) and ``Nonce``.
+    signature: bytes = b""
+    nonce: bytes = b""
+    #: ``TRANSFORM_HEADER.Flags`` / ``CompressionAlgorithm``.
+    transform_flags: int = 0
+    compression: str = ""
 
     @property
     def success(self) -> bool:
@@ -191,40 +199,79 @@ def iter_nbss(data: bytes):
         offset = next_offset
 
 
-def _ntlm_identity(blob: bytes) -> tuple[str, str, str]:
+def ntlm_type3(blob: bytes) -> dict:
+    """Decode an ``NTLMSSP`` AUTHENTICATE (type 3) message.
+
+    Returns ``{}`` for anything that is not a type 3 message.  The returned
+    dict carries the identity fields plus the raw ``nt``/``lm`` responses and
+    the encrypted session key, which is what SMB3 key derivation needs.
+    """
     if len(blob) < 64 or not blob.startswith(NTLMSSP):
-        return "", "", ""
-    kind = int.from_bytes(blob[8:12], "little")
-    if kind != 3:
-        return "", "", ""
+        return {}
+    if int.from_bytes(blob[8:12], "little") != 3:
+        return {}
 
     def read(length_at: int, offset_at: int) -> bytes:
         length = _u16(blob, length_at)
         offset = _u32(blob, offset_at)
-        if not length or offset + length > len(blob):
+        if not length or offset <= 0 or offset + length > len(blob):
             return b""
         return blob[offset:offset + length]
 
-    domain = _utf16(read(28, 32))
-    user = _utf16(read(36, 40))
-    workstation = _utf16(read(44, 48))
-    return user, domain, workstation
+    nt = read(20, 24)
+    return {
+        "user": _utf16(read(36, 40)),
+        "domain": _utf16(read(28, 32)),
+        "workstation": _utf16(read(44, 48)),
+        "lm": read(12, 16),
+        "nt": nt,
+        # NTLMv2 puts the HMAC-MD5 proof in the first 16 bytes of NTResponse.
+        "nt_proof": nt[:16] if len(nt) > 24 else b"",
+        "session_key": read(52, 56),
+        "flags": _u32(blob, 60),
+    }
+
+
+def find_ntlm_type3(blob: bytes) -> dict:
+    """Locate the first type 3 message inside a security blob."""
+    pos = bytes(blob or b"").find(NTLMSSP)
+    while pos != -1:
+        found = ntlm_type3(blob[pos:])
+        if found:
+            return found
+        pos = blob.find(NTLMSSP, pos + len(NTLMSSP))
+    return {}
+
+
+def _ntlm_identity(blob: bytes) -> tuple[str, str, str]:
+    found = ntlm_type3(blob)
+    return (found.get("user", ""), found.get("domain", ""),
+            found.get("workstation", ""))
 
 
 def _parse_transform(payload: bytes, offset: int) -> Smb2Message:
-    # COMPRESSION/ENCRYPTION transform header: proto(4) signature(16)
-    # nonce(16) original_size(4) reserved(2) flags(2) session_id(8).
+    # ENCRYPTION transform header: proto(4) signature(16) nonce(16)
+    # original_size(4) reserved(2) flags(2) session_id(8).
     original_size = _u32(payload, 36)
     session_id = _u64(payload, 44) if len(payload) >= 52 else 0
-    return Smb2Message(protocol="SMB3-Transform", command_name="ENCRYPTED",
-                       encrypted=True, original_size=original_size,
-                       session_id=session_id, offset=offset)
+    return Smb2Message(
+        protocol="SMB3-Transform", command_name="ENCRYPTED",
+        encrypted=True, original_size=original_size,
+        session_id=session_id, offset=offset, raw=payload,
+        signature=payload[4:20], nonce=payload[20:36],
+        transform_flags=_u16(payload, 42))
 
 
 def _parse_compressed(payload: bytes, offset: int) -> Smb2Message:
-    return Smb2Message(protocol="SMB3-Compressed", command_name="COMPRESSED",
-                       compressed=True, original_size=_u32(payload, 4),
-                       offset=offset)
+    # COMPRESSION transform header: proto(4) uncompressed_size(4)
+    # compression_algorithm(2) flags(2) session_id(8).
+    algorithm = _u16(payload, 8)
+    return Smb2Message(
+        protocol="SMB3-Compressed", command_name="COMPRESSED",
+        compressed=True, original_size=_u32(payload, 4), offset=offset,
+        raw=payload, session_id=_u64(payload, 12) if len(payload) >= 20 else 0,
+        compression={0: "NONE", 1: "LZNT1", 2: "LZ77", 3: "LZ77+Huffman"}
+        .get(algorithm, f"0x{algorithm:04x}"))
 
 
 def parse_packet(payload: bytes, offset: int = 0) -> list[Smb2Message]:
@@ -259,6 +306,7 @@ def parse_packet(payload: bytes, offset: int = 0) -> list[Smb2Message]:
             credit=_u16(header, 14),
             offset=offset + base,
             body=payload[base + 64:body_end],
+            raw=payload[base:body_end],
         )
         message.command_name = command_name(message.command)
         _parse_body(message)

@@ -469,3 +469,92 @@ def looks_printable(data: bytes, threshold: float = 0.85) -> bool:
         return False
     good = sum(32 <= b < 127 or b in (9, 10, 13) or b > 127 for b in data)
     return good / len(data) >= threshold
+
+
+# ---------------------------------------------------------------------------
+# AES-CTR (big-endian counter) + OpenSSL EVP_BytesToKey key derivation
+# CTF: ``openssl enc -aes-256-ctr -d -nosalt -in flag -out out.bin -pass pass:...``
+# ---------------------------------------------------------------------------
+def _increment_counter(counter: bytes) -> bytes:
+    """Increment a 128-bit big-endian counter by one (mod 2**128)."""
+    value = (int.from_bytes(counter, "big") + 1) & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+    return value.to_bytes(16, "big")
+
+
+def aes_ctr_crypt(data: bytes, key: bytes, counter: bytes = b"\x00" * 16) -> bytes:
+    """Encrypt ``data`` with AES in CTR mode (big-endian counter).
+
+    ``counter`` is the initial counter block (defaults to 16 zero bytes).
+    CTR only XORs the AES-encrypted counter stream over the data, so
+    encryption and decryption are identical; this shares the AES block
+    implementation used by the existing ECB/CBC/GCM handlers.
+    """
+    if len(key) not in (16, 24, 32):
+        raise ValueError("AES key must be 16, 24 or 32 bytes")
+    if len(counter) != 16:
+        raise ValueError("AES-CTR counter must be 16 bytes")
+    out = bytearray()
+    block_counter = counter
+    for i in range(0, len(data), 16):
+        stream = aes_encrypt_block(block_counter, key)
+        chunk = data[i:i + 16]
+        out += bytes(a ^ b for a, b in zip(chunk, stream))
+        block_counter = _increment_counter(block_counter)
+    return bytes(out)
+
+
+def aes_ctr_decrypt(data: bytes, key: bytes, counter: bytes = b"\x00" * 16) -> bytes:
+    """Decrypt AES-CTR ciphertext (symmetric with :func:`aes_ctr_crypt`)."""
+    return aes_ctr_crypt(data, key, counter)
+
+
+_DIGEST_MODS = {
+    "md5": hashlib.md5,
+    "sha1": hashlib.sha1,
+    "sha256": hashlib.sha256,
+    "sha384": hashlib.sha384,
+    "sha512": hashlib.sha512,
+}
+
+
+def evp_bytes_to_key(password, salt: bytes | None, key_len: int, iv_len: int,
+                     dgst: str = "md5") -> tuple[bytes, bytes]:
+    """OpenSSL ``EVP_BytesToKey`` key/IV derivation.
+
+    With no ``-md`` flag OpenSSL 1.1+ uses SHA-256, but the classic
+    ``openssl enc`` (and the pre-1.1.0 default) uses MD5; the default here is
+    MD5 for CTF compatibility.
+
+    ``D_1 = HASH(password + salt)``,
+    ``D_i = HASH(D_{i-1} + password + salt)`` for i = 2..count.
+    The concatenated ``D_i`` fills ``key`` (first ``key_len`` bytes) and then
+    ``iv`` (next ``iv_len`` bytes). ``None`` (or empty) salt is treated as no
+    salt. Supports ``md5/sha1/sha256/...`` digest names.
+    """
+    if isinstance(password, str):
+        password = password.encode("utf-8")
+    dgst_lc = (dgst or "md5").lower()
+    mod = _DIGEST_MODS.get(dgst_lc)
+    if mod is None:
+        # Also accept bare "sha" aliases and tolerate hashlib constructor name.
+        mod = getattr(hashlib, dgst_lc, None)
+        if mod is None and not dgst_lc.startswith("sha"):
+            raise ValueError(f"不支持的摘要算法: {dgst}")
+    if mod is None:
+        raise ValueError(f"不支持的摘要算法: {dgst}")
+
+    material = b"" if not salt else salt
+    d = b""
+    total = key_len + iv_len
+    data = b""
+    while len(data) < total:
+        block = d + password + material
+        d = mod(block).digest()
+        data += d
+    return data[:key_len], data[key_len:key_len + iv_len]
+
+
+def openssl_derive(password, salt: bytes | None = None, key_len: int = 32,
+                   iv_len: int = 16, dgst: str = "md5") -> tuple[bytes, bytes]:
+    """Convenience wrapper around :func:`evp_bytes_to_key` for AES-256 + CBC."""
+    return evp_bytes_to_key(password, salt, key_len, iv_len, dgst)

@@ -53,27 +53,83 @@ class SectionTest(unittest.TestCase):
                          ["artifacts"])
         self.assertEqual(normalise_sections(["unknown"]), list(DEFAULT_SECTIONS))
 
-    def test_findings_drop_noise_and_keep_warnings(self):
+    def test_findings_drop_noise_and_failures(self):
         findings = select_findings(LOGS)
         texts = [item["text"] for item in findings]
         self.assertTrue(any("flag{report_test}" in text for text in texts))
-        self.assertIn("疑似 ARP 欺骗", texts)
+        self.assertNotIn("疑似 ARP 欺骗", texts)
         self.assertNotIn("关键字检测 完成", texts)
         self.assertNotIn("开始分析: /tmp/example.pcap", texts)
+
+
+class ReportFilterTest(unittest.TestCase):
+    """Exported reports advertise results only: no failure or noise rows."""
+
+    FINDINGS = [
+        {"kind": "hash", "level": "good", "frame": "16", "time": "10:00:02",
+         "feature": "NTLM HASH提取", "summary": "Administrator NetNTLMv2",
+         "detail": "Administrator::LAB:1122"},
+        {"kind": "file", "level": "info", "frame": "18", "time": "10:00:03",
+         "feature": "HTTP数据提取", "summary": "导出 admin.aspx",
+         "detail": "2048 字节"},
+        {"kind": "protocol", "level": "warn", "frame": "20", "time": "10:00:04",
+         "feature": "SMB流量分析", "summary": "SMB3 加密流量", "detail": ""},
+        {"kind": "protocol", "level": "error", "frame": "21", "time": "10:00:05",
+         "feature": "TCP流分析", "summary": "tshark 执行失败", "detail": ""},
+        {"kind": "protocol", "level": "debug", "frame": "22", "time": "10:00:06",
+         "feature": "DNS流量分析", "summary": "调试细节", "detail": ""},
+        {"kind": "protocol", "level": "good", "frame": "23", "time": "10:00:07",
+         "feature": "ICMP流量分析", "summary": "-", "detail": ""},
+    ]
+
+    def test_finding_rows_keep_only_results(self):
+        from fnet.report import finding_rows
+        rows = finding_rows(self.FINDINGS)
+        self.assertEqual([row[4] for row in rows],
+                         ["Administrator NetNTLMv2", "导出 admin.aspx"])
+
+    def test_timeline_keeps_only_results(self):
+        from fnet.report import timeline_rows
+        rows = timeline_rows(self.FINDINGS)
+        self.assertEqual([row[4] for row in rows],
+                         ["Administrator NetNTLMv2", "导出 admin.aspx"])
+
+    def test_rendered_reports_hide_failures(self):
+        text = render_markdown(sample_meta(), LOGS, [], findings=self.FINDINGS)
+        page = render_html(sample_meta(), LOGS, [], findings=self.FINDINGS)
+        for content in (text, page):
+            self.assertIn("Administrator NetNTLMv2", content)
+            self.assertIn("导出 admin.aspx", content)
+            self.assertNotIn("SMB3 加密流量", content)
+            self.assertNotIn("tshark 执行失败", content)
+            self.assertNotIn("调试细节", content)
 
 
 class MarkdownTest(unittest.TestCase):
     def test_all_default_sections_and_findings(self):
         text = render_markdown(sample_meta(), LOGS,
-                              [{"name": "report.txt", "size": 2048}])
+                              [{"name": "ntlm_hashes.txt", "size": 2048}])
         for heading in ("## 概要", "## 功能清单", "## 关键发现",
                         "## 完整日志", "## 产出文件"):
             self.assertIn(heading, text)
         self.assertIn("flag{report_test}", text)
         self.assertIn("`http.extract`", text)
-        self.assertIn("`report.txt`", text)
+        self.assertIn("`ntlm_hashes.txt`", text)
         self.assertIn("2.0 KB", text)
         self.assertNotIn("## 分析参数", text)
+
+    def test_artifacts_skip_report_files(self):
+        text = render_markdown(
+            sample_meta(), LOGS,
+            [{"name": "report.txt", "size": 10},
+             {"name": "report.md", "size": 11},
+             {"name": "report.html", "size": 12},
+             {"name": "hashes.txt", "size": 20}],
+            sections=["artifacts"])
+        self.assertIn("`hashes.txt`", text)
+        self.assertNotIn("report.txt", text)
+        self.assertNotIn("report.md", text)
+        self.assertNotIn("report.html", text)
 
     def test_section_selection_and_escaping(self):
         text = render_markdown(sample_meta(), LOGS, [], sections=["summary"])
@@ -107,7 +163,8 @@ class HtmlTest(unittest.TestCase):
         self.assertIn('href="#section-summary"', page)
         self.assertIn('href="#section-findings"', page)
         self.assertNotIn('id="section-log"', page)
-        self.assertIn("疑似 ARP 欺骗", page)
+        self.assertIn("flag{report_test}", page)
+        self.assertNotIn("疑似 ARP 欺骗", page)
 
 
 class StructuredFindingsTest(unittest.TestCase):
@@ -136,10 +193,11 @@ class StructuredFindingsTest(unittest.TestCase):
         self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", page)
         self.assertNotIn("<script>alert(1)</script>", page)
 
-    def test_findings_without_rows_falls_back_to_log_highlights(self):
+    def test_findings_without_rows_falls_back_to_success_highlights(self):
         page = render_html(sample_meta(), LOGS, [], sections=["findings"])
         self.assertIn('<ul class="findings">', page)
-        self.assertIn("疑似 ARP 欺骗", page)
+        self.assertIn("flag{report_test}", page)
+        self.assertNotIn("疑似 ARP 欺骗", page)
 
 
 class IocsAttackTimelineTest(unittest.TestCase):
@@ -156,6 +214,9 @@ class IocsAttackTimelineTest(unittest.TestCase):
          "feature": "Webshell 解密", "time": "10:00:01",
          "summary": "哥斯拉内存马 <script>alert(1)</script>",
          "detail": "命令执行：whoami"},
+        {"kind": "flag", "level": "good", "frame": "24",
+         "feature": "关键字检测", "time": "10:00:04",
+         "summary": "flag{timeline}", "detail": "流量包尾部命中"},
     ]
 
     def test_iocs_extracted_and_deduplicated(self):
@@ -195,10 +256,18 @@ class IocsAttackTimelineTest(unittest.TestCase):
         rows = timeline_rows(self.FINDINGS)
         times = [row[0] for row in rows]
         self.assertEqual(times, sorted(times))
-        self.assertEqual(rows[0][4], "哥斯拉内存马 <script>alert(1)</script>")
+        self.assertEqual([row[4] for row in rows],
+                         ["Administrator 凭据", "flag{timeline}"])
+        self.assertNotIn("哥斯拉内存马", [row[4] for row in rows])
+        self.assertNotIn("长标签查询 ev1l.example.com (10.0.0.5)",
+                         [row[4] for row in rows])
 
     def test_html_sections_render_and_escape(self):
-        page = render_html({}, [], [], findings=self.FINDINGS)
+        findings = self.FINDINGS + [{
+            "kind": "flag", "level": "good", "frame": "28",
+            "feature": "关键字检测", "time": "10:00:05",
+            "summary": "flag{<script>alert(1)</script>}", "detail": ""}]
+        page = render_html({}, [], [], findings=findings)
         self.assertIn('id="section-iocs"', page)
         self.assertIn('id="section-attack"', page)
         self.assertIn('id="section-timeline"', page)

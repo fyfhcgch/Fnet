@@ -37,6 +37,24 @@ def _decode_utf16(value: bytes) -> str:
         return value.decode("latin-1", "ignore")
 
 
+def _to_int(value, default: int = 0) -> int:
+    """Parse a tshark numeric cell.
+
+    ``ntlmssp.negotiateflags`` is a FLAGS field, so tshark prints it as
+    ``0x62088235`` (and repeats it comma-separated when a frame carries more
+    than one message).  Plain decimal cells still work.
+    """
+    if isinstance(value, int):
+        return value
+    text = str(value or "").strip().split(",", 1)[0].strip()
+    if not text:
+        return default
+    try:
+        return int(text, 16) if text.lower().startswith("0x") else int(text)
+    except ValueError:
+        return default
+
+
 def _read(msg: bytes, length_at: int, offset_at: int) -> bytes:
     length = int.from_bytes(msg[length_at:length_at + 2], "little")
     offset = int.from_bytes(msg[offset_at:offset_at + 4], "little")
@@ -132,13 +150,23 @@ def _collect(ctx: FeatureContext) -> list[dict]:
                     event.update(parse_type3(message))
                 events.append(event)
         # Structured fallback (newer tshark exposes decoded fields directly).
+        # ``ntlmssp.ntlmauthenticate`` / ``ntlmssp.ntlmchallenge`` only exist in
+        # old tshark builds; SMB/LDAP/RDP sessions expose the same data through
+        # these decoded fields (the server challenge lives on its own frame).
         challenge = normalize_hex(item.get("ntlmssp.ntlmserverchallenge", ""))
         ntproof = normalize_hex(item.get("ntlmssp.ntlmv2_response.ntproofstr", ""))
         ntresponse = normalize_hex(item.get("ntlmssp.auth.ntresponse", ""))
-        if (challenge or ntproof) and item.get("ntlmssp.auth.username"):
+        username = item.get("ntlmssp.auth.username", "")
+        if challenge and not username:
+            events.append({
+                "frame": frame, "stream": stream, "type": TYPE2,
+                "challenge": bytes.fromhex(challenge),
+                "source": "structured", "item": item,
+            })
+        if (challenge or ntproof) and username:
             events.append({
                 "frame": frame, "stream": stream, "type": TYPE3,
-                "user": item.get("ntlmssp.auth.username", ""),
+                "user": username,
                 "domain": item.get("ntlmssp.auth.domain", ""),
                 "challenge": bytes.fromhex(challenge) if challenge else b"",
                 "ntproof": bytes.fromhex(ntproof) if ntproof else b"",
@@ -156,6 +184,7 @@ def extract(ctx: FeatureContext) -> None:
         return
 
     challenge_by_stream: dict[str, bytes] = {}
+    reported_challenges: set[tuple[str, str]] = set()
     hashes: list[str] = []
     seen: set[str] = set()
     users: set[str] = set()
@@ -167,9 +196,12 @@ def extract(ctx: FeatureContext) -> None:
             challenge = event.get("challenge") or event.get("challenge", b"")
             if challenge:
                 challenge_by_stream[stream] = challenge
-                ctx.report(
-                    f"帧 {event['frame']} NTLM CHALLENGE: {challenge.hex()}",
-                    "info")
+                key = (stream, challenge.hex())
+                if key not in reported_challenges:
+                    reported_challenges.add(key)
+                    ctx.report(
+                        f"帧 {event['frame']} NTLM CHALLENGE: {challenge.hex()}",
+                        "info")
             continue
         if event["type"] != TYPE3:
             continue
@@ -206,13 +238,17 @@ def extract(ctx: FeatureContext) -> None:
         if line and line not in seen:
             seen.add(line)
             hashes.append(line)
+            is_v2 = bool(len(nt) > 24 or ntproof)
             ctx.add_finding(
-                "hash", f"{identity} {('NetNTLMv2' if len(nt) > 24 or ntproof else 'NetNTLMv1')}",
+                "hash", f"{identity} {('NetNTLMv2' if is_v2 else 'NetNTLMv1')}",
                 frame=event["frame"], level="good", detail=line,
                 extra={"protocol": "ntlm", "account": identity,
-                       "domain": domain, "hash": line})
+                       "domain": domain, "hash": line,
+                       "mode": "5600" if is_v2 else "5500"})
 
-        flags = event.get("flags") or int(item.get("ntlmssp.negotiateflags", "0") or 0)
+        flags = event.get("flags")
+        if not flags:
+            flags = _to_int(item.get("ntlmssp.negotiateflags"))
         if flags:
             ctx.report(f"协商标志: 0x{flags:08x}", "info")
         session_key = event.get("session_key", b"")

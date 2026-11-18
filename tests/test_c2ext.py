@@ -7,6 +7,7 @@ returns canned rows (no capture file needed).
 """
 from __future__ import annotations
 
+import base64
 import struct
 import tempfile
 import unittest
@@ -17,10 +18,13 @@ from fnet.features import c2ext
 from fnet.features.registry import FeatureContext
 from fnet.logger import Logger
 from fnet.utils import c2ext as c2
+from fnet.utils import meterpreter_wire, sliver_c2
 from fnet.utils.crypto import aes_cbc_encrypt, aes_gcm_encrypt
 
 SLIVER_KEY = bytes(range(32))
+SLIVER_KEY16 = bytes(range(16))
 METERPRETER_KEY = bytes(range(1, 33))
+METERPRETER_KEY128 = bytes(range(1, 17))
 
 
 # ---------------------------------------------------------------------------
@@ -54,13 +58,13 @@ def modern_packet(ptype: int = 0, key: bytes = b"\x37\x41\x5e\x02",
 
 
 def encrypted_packet(key: bytes = METERPRETER_KEY,
-                     xor_key: bytes = b"\x11\x22\x33\x44") -> bytes:
-    """AES-256 encrypted meterpreter packet (flag 1, IV = first 16 bytes)."""
+                     xor_key: bytes = b"\x11\x22\x33\x44",
+                     flags: int = 1) -> bytes:
+    """AES-CBC encrypted meterpreter packet (flags 1=256 / 2=128)."""
     tlv_raw = _build_tlvs()
-    inner = struct.pack(">II", len(tlv_raw) + 8, 1) + tlv_raw
     iv = bytes(range(16))
-    cipher = aes_cbc_encrypt(inner[8:], key, iv)  # encrypt only the TLV stream
-    payload = bytes(range(16)) + struct.pack(">I", 1) + \
+    cipher = aes_cbc_encrypt(tlv_raw, key, iv)  # encrypt the nested TLV stream
+    payload = bytes(range(16)) + struct.pack(">I", flags) + \
         struct.pack(">II", len(cipher) + 16 + 8, 1) + iv + cipher
     return xor_key + _xor(payload, xor_key)
 
@@ -472,7 +476,12 @@ class C2ExtHandlerTest(unittest.TestCase):
         }
         ctx, text = self.run_handler(rows)
         self.assertIn("未识别到 Sliver / meterpreter C2 特征", text)
-        self.assertTrue((self.path / "out" / "c2_README.txt").is_file())
+        readme = self.path / "out" / "c2_README.txt"
+        self.assertTrue(readme.is_file())
+        content = readme.read_text(encoding="utf-8")
+        self.assertIn("74 字节 minisign 签名前缀", content)
+        self.assertIn("AES-128-CBC", content)
+        self.assertIn("AES-256-CBC", content)
 
     def test_bad_key_param_reported(self):
         rows = {
@@ -483,6 +492,249 @@ class C2ExtHandlerTest(unittest.TestCase):
         }
         ctx, text = self.run_handler(rows, {"sliver_session_key": "zzzz"})
         self.assertIn("不是有效的十六进制字符串", text)
+
+
+# --- test-only RFC 8439 ChaCha20-Poly1305 sealer (no third-party deps) -------
+def _rotl32(value: int, shift: int) -> int:
+    return ((value << shift) | (value >> (32 - shift))) & 0xFFFFFFFF
+
+
+def _chacha_block(key: bytes, counter: int, nonce: bytes) -> bytes:
+    state = [0x61707865, 0x3320646E, 0x79622D32, 0x6B206574]
+    state.extend(struct.unpack("<8I", key))
+    state.append(counter)
+    state.extend(struct.unpack("<3I", nonce))
+
+    def quarter(word: list[int], a: int, b: int, c: int, d: int) -> None:
+        word[a] = (word[a] + word[b]) & 0xFFFFFFFF
+        word[d] = _rotl32(word[d] ^ word[a], 16)
+        word[c] = (word[c] + word[d]) & 0xFFFFFFFF
+        word[b] = _rotl32(word[b] ^ word[c], 12)
+        word[a] = (word[a] + word[b]) & 0xFFFFFFFF
+        word[d] = _rotl32(word[d] ^ word[a], 8)
+        word[c] = (word[c] + word[d]) & 0xFFFFFFFF
+        word[b] = _rotl32(word[b] ^ word[c], 7)
+
+    rounds = ((0, 4, 8, 12), (1, 5, 9, 13), (2, 6, 10, 14), (3, 7, 11, 15),
+              (0, 5, 10, 15), (1, 6, 11, 12), (2, 7, 8, 13), (3, 4, 9, 14))
+    work = state[:]
+    for _ in range(10):
+        for indexes in rounds:
+            quarter(work, *indexes)
+    return struct.pack("<16I", *((word + original) & 0xFFFFFFFF
+                                 for word, original in zip(work, state)))
+
+
+def _poly1305_tag(message: bytes, one_time_key: bytes) -> bytes:
+    prime = (1 << 130) - 5
+    value = int.from_bytes(one_time_key[:16], "little")
+    r = value & 0x0FFFFFFC0FFFFFFC0FFFFFFC0FFFFFFF
+    s = int.from_bytes(one_time_key[16:], "little")
+    acc = 0
+    for offset in range(0, len(message), 16):
+        block = message[offset:offset + 16]
+        number = int.from_bytes(block, "little") | (1 << (8 * len(block)))
+        acc = ((acc + number) * r) % prime
+    return ((acc + s) & ((1 << 128) - 1)).to_bytes(16, "little")
+
+
+def _chacha_seal(plaintext: bytes, key: bytes,
+                 nonce: bytes = bytes(range(12))) -> bytes:
+    otk = _chacha_block(key, 0, nonce)[:32]
+    stream = bytearray()
+    for offset in range(0, len(plaintext), 64):
+        stream.extend(_chacha_block(key, 1 + offset // 64, nonce))
+    sealed = bytes(a ^ b for a, b in zip(plaintext, stream))
+    pad = lambda data: b"\x00" * (-len(data) % 16)
+    mac_input = (sealed + pad(sealed) + struct.pack("<Q", 0)
+                 + struct.pack("<Q", len(sealed)))
+    tag = _poly1305_tag(mac_input, otk)
+    return nonce + sealed + tag
+
+
+def _sliver_envelope(env_id: int, env_type: int, data: bytes) -> bytes:
+    def varint(number: int) -> bytes:
+        out = bytearray()
+        while True:
+            byte = number & 0x7F
+            number >>= 7
+            if number:
+                out.append(byte | 0x80)
+            else:
+                out.append(byte)
+                return bytes(out)
+
+    return (b"\x08" + varint(env_id) + b"\x10" + varint(env_type)
+            + b"\x1a" + varint(len(data)) + data)
+
+
+# ---------------------------------------------------------------------------
+# new-core integration through the handler
+# ---------------------------------------------------------------------------
+class C2ExtNewCoreTest(unittest.TestCase):
+    """Fake-tshark tests exercising the new sliver/meterpreter cores."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_handler(self, rows: dict[str, list],
+                    params: dict | None = None):
+        fake = _FakeTshark(rows)
+        ctx = make_ctx(self.path, fake, params)
+        c2ext.analyze(ctx)
+        log = self.path / "fnet.log"
+        text = log.read_text(encoding="utf-8") if log.is_file() else ""
+        return ctx, text
+
+    @staticmethod
+    def rows(body: bytes, uri: str = "/api/v1/data"):
+        return {
+            "http.request": [["3", "0", "POST", uri, "10.0.0.9",
+                              body.hex(), ""]],
+            "http.response": [],
+            "dns.flags.response == 0": [],
+            "tls.handshake.certificates": [],
+        }
+
+    def test_encrypted_packet_aes256_recipient(self):
+        body = encrypted_packet(METERPRETER_KEY, flags=1)
+        ctx, text = self.run_handler(
+            self.rows(body),
+            {"meterpreter_symkey": METERPRETER_KEY.hex()})
+        findings = [f for f in ctx.findings
+                    if f["kind"] == "protocol"
+                    and f["summary"].startswith("meterpreter")]
+        self.assertTrue(findings)
+        summary = findings[0]["summary"]
+        self.assertIn("0x0000000a", summary)
+        self.assertIn("response", summary)
+        detail = findings[0]["detail"]
+        for fragment in ("AES-256-CBC", "COMMAND_ID", "AES 解密校验通过"):
+            self.assertIn(fragment, detail)
+        self.assertIn("AES-256", text)
+
+    def test_encrypted_packet_aes128_recipient(self):
+        body = encrypted_packet(METERPRETER_KEY128, flags=2)
+        ctx, text = self.run_handler(
+            self.rows(body),
+            {"meterpreter_symkey": METERPRETER_KEY128.hex()})
+        findings = [f for f in ctx.findings
+                    if f["kind"] == "protocol"
+                    and f["summary"].startswith("meterpreter")]
+        self.assertTrue(findings)
+        detail = findings[0]["detail"]
+        self.assertIn("AES-128-CBC", detail)
+        self.assertIn("AES 解密校验通过", detail)
+        self.assertIn("AES-128", text)
+
+    def test_encrypted_packet_without_key_has_ciphertext_artifact(self):
+        body = encrypted_packet(METERPRETER_KEY, flags=1)
+        ctx, text = self.run_handler(self.rows(body))
+        findings = [f for f in ctx.findings
+                    if f["kind"] == "protocol"
+                    and f["summary"].startswith("meterpreter")]
+        self.assertTrue(findings)
+        self.assertIn("缺少 meterpreter_symkey", findings[0]["detail"])
+        artifacts = list((self.path / "out").glob("c2_meterpreter_enc_*.bin"))
+        self.assertTrue(artifacts)
+
+    def test_encrypted_packet_wrong_key_reports_failure(self):
+        body = encrypted_packet(METERPRETER_KEY, flags=1)
+        ctx, text = self.run_handler(
+            self.rows(body),
+            {"meterpreter_symkey": bytes(range(200, 232)).hex()})
+        findings = [f for f in ctx.findings
+                    if f["kind"] == "protocol"
+                    and f["summary"].startswith("meterpreter")]
+        self.assertTrue(findings)
+        self.assertIn("AES 解密校验失败", findings[0]["detail"])
+
+    def test_base64_http_body_yields_meterpreter_packet(self):
+        encoded = base64.b64encode(modern_packet()).decode("ascii")
+        ctx, text = self.run_handler(self.rows(encoded.encode("ascii")))
+        findings = [f for f in ctx.findings
+                    if f["kind"] == "protocol"
+                    and f["summary"].startswith("meterpreter")]
+        self.assertTrue(findings)
+        self.assertIn("0x0000000a", findings[0]["summary"])
+
+    def test_bogus_legacy_header_creates_no_finding(self):
+        bogus = (b"\x00\x00\x00\x00" + struct.pack(">II", 20, 0)
+                 + b"junkjunkjunkjunkjunkjunk")
+        ctx, text = self.run_handler(self.rows(bogus))
+        self.assertFalse([f for f in ctx.findings
+                          if "meterpreter" in f["summary"]])
+
+    def test_sliver_v16_chacha_gzip_signature(self):
+        import gzip
+        inner = _sliver_envelope(42, 1, b"flag{v16_chacha}")
+        sealed = _chacha_seal(gzip.compress(inner), SLIVER_KEY)
+        # Sanity check: the core decrypts what this test helper sealed.
+        self.assertEqual(
+            sliver_c2.chacha20_poly1305_decrypt(sealed, SLIVER_KEY)[0],
+            gzip.compress(inner))
+        blob = b"S" * 74 + sealed  # minisign signature prefix
+        ctx, text = self.run_handler(
+            self.rows(blob, "/umd/bootstrap.js?_=1a2b3c4d5e6f"),
+            {"sliver_session_key": SLIVER_KEY.hex()})
+        self.assertIn("Sliver 会话载荷解密成功", text)
+        self.assertIn("ChaCha20-Poly1305", text)
+        self.assertIn("gzip 已解压", text)
+        self.assertIn("已跳过签名前缀", text)
+        self.assertIn("flag{v16_chacha}", text)
+        findings = [f for f in ctx.findings
+                    if f["kind"] == "protocol"
+                    and "Sliver 会话载荷解密" in f["summary"]]
+        self.assertTrue(findings)
+        self.assertIn("ID=42", findings[0]["detail"])
+        self.assertIn("Type=1", findings[0]["detail"])
+        artifacts = list((self.path / "out").glob("c2_sliver_session_*.bin"))
+        self.assertTrue(artifacts)
+        self.assertEqual(artifacts[0].read_bytes(), inner)
+
+    def test_sliver_v16_chacha_unsigned(self):
+        import gzip
+        inner = _sliver_envelope(7, 2, b"flag{v16_unsigned}")
+        blob = _chacha_seal(gzip.compress(inner), SLIVER_KEY)
+        ctx, text = self.run_handler(
+            self.rows(blob, "/umd/bootstrap.js?_=1a2b3c4d5e6f"),
+            {"sliver_session_key": SLIVER_KEY.hex()})
+        self.assertIn("ChaCha20-Poly1305", text)
+        self.assertIn("无签名前缀", text)
+        self.assertIn("flag{v16_unsigned}", text)
+
+    def test_sliver_legacy_aes_gcm_16_byte_key(self):
+        iv = bytes(range(12))
+        blob = iv + aes_gcm_encrypt(b"flag{legacy_aes_gcm}", SLIVER_KEY16, iv)
+        ctx, text = self.run_handler(
+            self.rows(blob, "/umd/bootstrap.js?_=1a2b3c4d5e6f"),
+            {"sliver_session_key": SLIVER_KEY16.hex()})
+        self.assertIn("AES-GCM", text)
+        self.assertIn("flag{legacy_aes_gcm}", text)
+
+    def test_sliver_key_exchange_classification(self):
+        age = (bytes(range(32)) + b"age-encryption.org/v1\n"
+               b"-> X25519 " + b"A" * 43 + b"\n"
+               + b"B" * 43 + b"\n--- MAC\n")
+        ctx, text = self.run_handler(
+            self.rows(age, "/login/signin.html"))
+        self.assertIn("Sliver 密钥交换", text)
+        self.assertIn("v1.6", text)
+        self.assertIn("age-x25519", text)
+        findings = [f for f in ctx.findings
+                    if f["summary"].startswith("Sliver 密钥交换")]
+        self.assertTrue(findings)
+        self.assertIn("age-x25519", findings[0]["detail"])
+
+    def test_recv_poll_has_no_finding(self):
+        ctx, text = self.run_handler(self.rows(b"RECV"))
+        self.assertIn("RECV body", text)
+        self.assertFalse([f for f in ctx.findings
+                          if "meterpreter" in f["summary"]])
 
 
 if __name__ == "__main__":

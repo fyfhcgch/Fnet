@@ -175,6 +175,43 @@ class NtlmTest(CtxTestCase):
         saved = (self.tmp / "out" / "ntlm_hashes.txt").read_text("utf-8")
         self.assertIn(expected, saved)
 
+    def test_extract_accepts_hex_negotiateflags(self):
+        # tshark renders ntlmssp.negotiateflags as 0x...; the structured
+        # fallback path used to int() it as base 10 and crash the feature.
+        proof = "00112233445566778899aabbccddeeff"
+        row = ["1", "0", "", "", "vuser", "CORP", "PC01",
+               "1122334455667788", proof, "", proof + "cc" * 24, "",
+               "0x62088235", "", ""]
+        fake = FakeTshark(routes={"ntlmssp": [row]})
+        ctx = make_ctx(self.tmp, fake)
+        ntlm.extract(ctx)
+        text = self.lines(ctx)
+        self.assertIn("vuser::CORP:", text)
+        self.assertIn("协商标志: 0x62088235", text)
+
+    def test_extract_smb_structured_challenge(self):
+        # SMB2/LDAP/RDP: modern tshark has no ``ntlmssp.ntlmauthenticate``
+        # column, so the server challenge arrives on its own frame and the
+        # response fields on the AUTHENTICATE frame.
+        challenge = "4078a5505a450ffd"
+        proof = "7830894e632367cc9b516b255f12f8f0"
+        blob = "01" * 24
+        rows = [
+            ["10", "0", "", "", "", "", "", challenge, "", "", "", "",
+             "0x62088235", "", ""],
+            ["12", "0", "", "", "winuser", "LAB", "PC-WIN11", "",
+             proof, "", proof + blob, "", "0x62088235", "", ""],
+        ]
+        fake = FakeTshark(routes={"ntlmssp": rows})
+        ctx = make_ctx(self.tmp, fake)
+        ntlm.extract(ctx)
+        text = self.lines(ctx)
+        self.assertIn(f"NTLM CHALLENGE: {challenge}", text)
+        self.assertIn(f"winuser::LAB:{challenge}:{proof}:{blob}", text)
+        self.assertIn("NetNTLMv2 (hashcat -m 5600):", text)
+        saved = (self.tmp / "out" / "ntlm_hashes.txt").read_text("utf-8")
+        self.assertIn(f"winuser::LAB:{challenge}:{proof}:{blob}", saved)
+
     def test_extract_without_tshark_reports_error(self):
         ctx = make_ctx(self.tmp, None)
         ntlm.extract(ctx)

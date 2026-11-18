@@ -7,7 +7,7 @@ Linux, macOS and Windows.
 """
 from __future__ import annotations
 
-__version__ = "2.20.0"
+__version__ = "2.21.1"
 __author__ = "Fnet contributors"
 __license__ = "Apache-2.0"
 

@@ -82,7 +82,7 @@ fnet
     或在下方的输入框里填写本机路径后点“使用”。
   </li>
   <li>
-    左侧已按 13 个分类列出 46 个功能，默认勾选“关键字检测”和“HTTP数据提取”。
+    左侧已按 13 个分类列出 50 个功能，默认勾选“关键字检测”和“HTTP数据提取”。
     不确定时可以先点“全选”，或只勾与本题相关的功能。
   </li>
   <li>
@@ -93,7 +93,7 @@ fnet
     按帧号下钻与导出 CSV。
   </li>
   <li>
-    在“产出文件”页下载报告与还原的文件，或从“文件”菜单导出 Markdown / HTML 报告。
+    在“产出文件”页下载还原的文件，或从“文件”菜单导出 Markdown / HTML 报告。
   </li>
 </ol>
 
@@ -101,7 +101,7 @@ fnet
 
 ```bash
 python3 -m fnet -C capture.pcapng                       # 只跑默认勾选项
-python3 -m fnet -C capture.pcapng --all                 # 跑全部 46 个功能
+python3 -m fnet -C capture.pcapng --all                 # 跑全部 50 个功能
 python3 -m fnet -C capture.pcapng --features checkBox_10,webshell.decrypt
 ```
 

@@ -71,6 +71,13 @@ _FINDING_RE = re.compile(
 _NOISE_PREFIXES = ("开始分析:", "输出目录:", "功能:", "=====", "分析结束:")
 _NOISE_SUFFIXES = ("完成", "已取消", "已停止")
 _DATE_FALLBACK = "—"
+#: Levels that never describe a usable result, so reports leave them to the log.
+_FAILURE_LEVELS = ("debug", "warn", "error")
+#: Summaries that carry no information (placeholders written by some handlers).
+_PLACEHOLDER_TEXTS = {"", "-", "—", "--", "n/a", "none", "null"}
+#: Report files are exported from the result view; they are never listed as
+#: "产出文件" artifacts in a report or in the WebUI artifact tab.
+REPORT_FILES = frozenset({"report.txt", "report.md", "report.html"})
 
 
 # ---------------------------------------------------------------------------
@@ -194,23 +201,54 @@ def artifact_rows(artifacts) -> list[tuple[str, str]]:
     for item in artifacts or []:
         if not isinstance(item, dict):
             continue
-        rows.append((str(item.get("name") or ""), _fmt_size(item.get("size"))))
-    return [(name, size) for name, size in rows if name]
+        name = str(item.get("name") or "")
+        if not name or Path(name).name in REPORT_FILES:
+            continue
+        rows.append((name, _fmt_size(item.get("size"))))
+    return rows
+
+
+def is_success_finding(item) -> bool:
+    """True when a finding is a usable result rather than noise or failure.
+
+    The "关键发现" and "时间线" sections only advertise what the analysis
+    actually produced.  ``warn``/``error``/``debug`` rows stay visible in the
+    full log and in the WebUI, but are dropped from the exported report;
+    ``info`` is kept on purpose because many successful extractions (exported
+    files, credentials, hashes) use it.
+    """
+    if not isinstance(item, dict):
+        return False
+    level = str(item.get("level") or "info").strip().lower()
+    if level in _FAILURE_LEVELS:
+        return False
+    return _has_content(item.get("summary"))
+
+
+def _has_content(value) -> bool:
+    text = str(value or "").strip()
+    return text.lower() not in _PLACEHOLDER_TEXTS
 
 
 def select_findings(logs) -> list[dict]:
-    """Pick the log records that are worth highlighting at the top."""
+    """Pick the log records that are worth highlighting at the top.
+
+    Only usable results survive: failure/noise lines (``warn``/``error``/
+    ``debug``, "未发现 ...", completion markers) are left to the full log.
+    """
     findings: list[dict] = []
     seen: set[str] = set()
     for record in logs or []:
         text = str(record.get("text") or "")
         stripped = text.strip()
-        if not stripped or stripped.startswith(_NOISE_PREFIXES):
+        if not _has_content(stripped) or stripped.startswith(_NOISE_PREFIXES):
             continue
         if stripped.endswith(_NOISE_SUFFIXES):
             continue
         level = str(record.get("level") or "info")
-        if level not in ("warn", "error") and not _FINDING_RE.search(stripped):
+        if level in _FAILURE_LEVELS:
+            continue
+        if level != "good" and not _FINDING_RE.search(stripped):
             continue
         if stripped in seen:
             continue
@@ -230,11 +268,9 @@ def finding_rows(findings) -> list[tuple[str, str, str, str, str, str, str]]:
 
     rows: list[tuple[str, str, str, str, str, str, str]] = []
     for item in findings or []:
-        if not isinstance(item, dict):
+        if not is_success_finding(item):
             continue
         summary = str(item.get("summary") or "").strip()
-        if not summary:
-            continue
         rows.append((
             KIND_NAMES.get(str(item.get("kind") or ""),
                            str(item.get("kind") or "")),
@@ -294,11 +330,9 @@ def timeline_rows(findings) -> list[tuple[str, str, str, str, str]]:
 
     rows: list[tuple] = []
     for order, item in enumerate(findings or []):
-        if not isinstance(item, dict):
+        if not is_success_finding(item):
             continue
         summary = str(item.get("summary") or "").strip()
-        if not summary:
-            continue
         kind = KIND_NAMES.get(str(item.get("kind") or ""),
                               str(item.get("kind") or ""))
         rows.append((order, str(item.get("time") or ""), kind,

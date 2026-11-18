@@ -39,7 +39,7 @@ python3 -m fnet --port 9000             # 换端口
 python3 -m fnet capture.pcapng          # 启动并预选流量包
 python3 -m fnet capture.pcapng --features checkBox_10,http.extract
 python3 -m fnet --doctor                # 检查 tshark / java / hashcat 等
-python3 -m fnet --list-features         # 列出 46 个功能与复选框编号
+python3 -m fnet --list-features         # 列出 50 个功能与复选框编号
 ```
 
 WebUI 顶栏可切换中文 / English；大文件上传显示进度并可按 `Esc` 取消，
@@ -61,7 +61,7 @@ fnet
 # 运行默认勾选的功能，日志直接打印到终端
 python3 -m fnet -C capture.pcapng
 
-# 运行全部 46 个功能
+# 运行全部 50 个功能
 python3 -m fnet -C capture.pcapng --all
 
 # 只运行指定功能（复选框编号或 handler 均可）
@@ -108,11 +108,11 @@ tshark 字段提取默认启用磁盘缓存与超时重试，可通过 `config.i
 
 ## WebUI 界面
 
-![Fnet WebUI：左侧 46 个功能的勾选面板，右侧分析结果表格与统计图表](docs/images/webui.webp)
+![Fnet WebUI：左侧 50 个功能的勾选面板，右侧分析结果表格与统计图表](docs/images/webui.webp)
 
 | 区域       | 说明                                                                                                             |
 | ---------- | ---------------------------------------------------------------------------------------------------------------- |
-| 左侧功能栏 | 46 个功能按 13 个分类折叠展示，可全选/全不选                                                                 |
+| 左侧功能栏 | 50 个功能按 13 个分类折叠展示，可全选/全不选                                                                 |
 | 顶部       | 全局功能搜索、文件/统计/设置/工具菜单、tshark 状态、语言切换、主题切换                                           |
 | 主区域     | 关键字、HTTP、Webshell、SQL、认证、C2、工控、杂项、文本、设置、关于                                              |
 | 分析结果   | 凭据、哈希、flag、导出文件等汇总为可排序表格，支持筛选、搜索、分页、列显示/隐藏、批量复制、按帧号跳转与 CSV 导出 |
@@ -138,7 +138,8 @@ HTML 报告自带样式、无需联网，适合直接交付或打印成 PDF。
 结果、导出的文件等）整理成表格：可以按类别与级别筛选、搜索、点击表头排序、
 分页浏览并调整每页条数、切换显示的列、复制本页或选中行、按帧号跳转，也可
 导出 CSV；任务结束时相同数据也会写入输出目录的 `findings.json` 与
-`findings.csv`。
+`findings.csv`。哈希类结果的详情弹窗还能一键调用 hashcat 破解：可指定字典、
+加速档位、`-O`、`--force`、超时和附加参数，日志与密码实时回显，设置会持久化。
 
 日志与分析结果中的“帧 N”是可点击按钮：弹窗会显示该帧的摘要、前后文帧和
 `tshark -V` 解码详情，可一键导出包含上下文的小 pcapng 片段，或在检测到
@@ -216,7 +217,7 @@ Fnet/
 │   ├── findings.py        结构化结果（类别、级别、筛选、CSV）
 │   ├── report.py          纯文本/Markdown/HTML 报告渲染与章节选择
 │   ├── config.py          config.ini 读写与默认值
-│   ├── features/          46 个分析功能（按主题拆分）
+│   ├── features/          50 个分析功能（按主题拆分）
 │   ├── tools/runner.py    外部工具发现与 tshark 封装
 │   ├── utils/             编解码、AES/RC4/MD4/RSA、pcap、TCP 流重组、
 │   │                      MySQL/Kerberos/邮件/隧道/WPA/规则解析

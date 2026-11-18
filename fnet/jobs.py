@@ -40,8 +40,9 @@ from fnet.logger import JobLog, logger
 # keeps working; do not use this binding inside the manager.
 from fnet.paths import CACHE_DIR
 from fnet.report import (
-    MAX_LOG_RECORDS, MAX_REPORT_FINDINGS, annotation_lines, normalise_sections,
-    parse_report_text, render_html, render_markdown, write_reports,
+    MAX_LOG_RECORDS, MAX_REPORT_FINDINGS, REPORT_FILES, annotation_lines,
+    normalise_sections, parse_report_text, render_html, render_markdown,
+    write_reports,
 )
 from fnet.tools.runner import ToolBox
 
@@ -1130,7 +1131,8 @@ class JobManager:
         if not output_dir.is_dir():
             return items
         for path in sorted(output_dir.rglob("*")):
-            if path.is_file() and path.name != "job.json":
+            if path.is_file() and path.name != "job.json" \
+                    and path.name not in REPORT_FILES:
                 items.append({
                     "name": path.relative_to(output_dir).as_posix(),
                     "size": path.stat().st_size,

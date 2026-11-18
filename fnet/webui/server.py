@@ -17,12 +17,74 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from fnet import APP_DISPLAY_NAME, __version__
+from fnet.crack import CrackManager
 from fnet.live import LiveCapture
 from fnet.logger import logger
+from fnet.ntlmcrack_service import NtlmCrackManager
 
 STATIC_DIR = Path(__file__).with_name("static")
 MAX_JSON = 4 * 1024 * 1024
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._\-\u4e00-\u9fff]+")
+
+#: Fields the "SMB3 解密" dialog can auto-fill from what the job already knows.
+SMB_HINT_FIELDS = ("password", "nt_hash", "session_key", "user", "domain",
+                   "stream")
+#: Chinese labels for those fields (same wording as the dialog itself).
+SMB_HINT_LABELS = {
+    "password": "明文密码",
+    "nt_hash": "NT 哈希",
+    "session_key": "会话密钥",
+    "user": "账号",
+    "domain": "域",
+    "stream": "TCP 流",
+}
+
+
+def empty_smb_hints() -> dict:
+    """An all-empty hints payload: the dialog stays manually fillable."""
+    return {
+        "hints": dict.fromkeys(SMB_HINT_FIELDS, ""),
+        "sources": dict.fromkeys(SMB_HINT_FIELDS, ""),
+        "accounts": [],
+        "notes": [],
+    }
+
+
+def smb_hints_payload(jobs, job_id: str, stream: str = "",
+                      cracked=None) -> dict:
+    """Collect SMB3 auto-fill clues, degrading to empties on any failure.
+
+    :mod:`fnet.smb_hints` is imported lazily (like :mod:`fnet.smb3` in the
+    decrypt route) and every failure shape -- a missing module, a broken
+    resolver, a payload with the wrong types -- just means "no clues", so
+    the dialog stays usable by hand.
+    """
+    try:
+        from fnet.smb_hints import hints_for_job
+    except ImportError:  # the resolver is optional; manual filling still works
+        return empty_smb_hints()
+    try:
+        payload = hints_for_job(jobs, job_id, stream=stream, cracked=cracked)
+    except Exception as exc:  # noqa: BLE001 - hints are a convenience only
+        logger.warn(f"SMB3 自动填入线索读取失败: {exc}")
+        return empty_smb_hints()
+    if not isinstance(payload, dict):
+        return empty_smb_hints()
+    hints = payload.get("hints")
+    sources = payload.get("sources")
+    hints = hints if isinstance(hints, dict) else {}
+    sources = sources if isinstance(sources, dict) else {}
+    accounts = payload.get("accounts")
+    notes = payload.get("notes")
+    fields = SMB_HINT_FIELDS
+    return {
+        "hints": {key: str(hints.get(key) or "") for key in fields},
+        "sources": {key: str(sources.get(key) or "") for key in fields},
+        "accounts": ([item for item in accounts if isinstance(item, dict)]
+                     if isinstance(accounts, (list, tuple)) else []),
+        "notes": ([str(item) for item in notes]
+                  if isinstance(notes, (list, tuple)) else []),
+    }
 
 
 class FnetApp:
@@ -34,6 +96,8 @@ class FnetApp:
         self.jobs = jobs
         self.plugins = plugins
         self.live = LiveCapture(toolbox, config)
+        self.crack = CrackManager(jobs, toolbox, config)
+        self.ntlmcrack = NtlmCrackManager(jobs, toolbox, config)
         self.token = secrets.token_urlsafe(24)
         self.server: ThreadingHTTPServer | None = None
         #: Pre-selected capture/features from ``fnet capture.pcapng --features ...``.
@@ -83,6 +147,14 @@ class FnetApp:
                 "default_sections": list(DEFAULT_SECTIONS),
             },
             "findings": {"kinds": kind_catalogue()},
+            "crack": {
+                "available": bool(tools.get("hashcat", {}).get("available")),
+                "settings": self.crack_settings(),
+            },
+            "smb": {
+                "available": bool(tools.get("tshark", {}).get("available")),
+                "hints": True,
+            },
             "initial": {
                 "pcap": self.initial_pcap,
                 "features": list(self.initial_features),
@@ -94,6 +166,20 @@ class FnetApp:
             "config": self.config.as_dict("config"),
             "paths": self.config.as_dict("paths"),
             "plugins": self.config.as_dict("plugins"),
+        }
+
+    def crack_settings(self) -> dict:
+        """hashcat knobs persisted in ``config.ini`` (shared with the UI)."""
+        from fnet.paths import DEFAULT_WORDLIST
+
+        return {
+            "wordlist": self.config.get("passwddir") or str(DEFAULT_WORDLIST),
+            "workload": self.config.get("hashcat_workload") or "3",
+            "optimized": self.config.get_bool("hashcat_optimized",
+                                              fallback=True),
+            "force": self.config.get_bool("hashcat_force", fallback=False),
+            "timeout": self.config.get_int("hashcat_timeout", fallback=300),
+            "extra": self.config.get("hashcat_extra") or "",
         }
 
     def _rule_count(self) -> int:
@@ -111,6 +197,8 @@ class FnetApp:
 class Handler(BaseHTTPRequestHandler):
     server_version = "FnetWebUI"
     protocol_version = "HTTP/1.1"
+    #: Bytes of the current POST body already pulled off the socket.
+    _body_used = 0
 
     # -- plumbing ------------------------------------------------------
     @property
@@ -152,11 +240,42 @@ class Handler(BaseHTTPRequestHandler):
                     or (self._query().get("token") or [""])[0])
         return secrets.compare_digest(supplied, self.app.token)
 
+    def _declared_body(self) -> int:
+        try:
+            return max(0, int(self.headers.get("Content-Length") or 0))
+        except (TypeError, ValueError):
+            return 0
+
     def _body(self, limit: int = MAX_JSON) -> bytes:
-        length = int(self.headers.get("Content-Length") or 0)
+        length = self._declared_body()
         if length > limit:
             raise ValueError("请求体过大")
-        return self.rfile.read(length) if length else b""
+        data = self.rfile.read(length) if length else b""
+        self._body_used += len(data)
+        return data
+
+    def _drain_body(self) -> None:
+        """Consume any request-body bytes the route did not read.
+
+        ``protocol_version`` is HTTP/1.1, so the connection is reused for the
+        next request.  Routes that answer without parsing the body (delete,
+        cancel, pause, ...) would otherwise leave e.g. the ``{}`` sent by the
+        UI's ``body: {}`` in the socket, and it would be parsed as part of the
+        next request line (``{}GET /api/history`` -> 501).
+        """
+        remaining = self._declared_body() - self._body_used
+        if remaining <= 0:
+            return
+        if remaining > MAX_JSON:
+            # Too large to swallow safely; make the server close the socket
+            # instead of misreading the leftover bytes as a new request.
+            self.close_connection = True
+            return
+        while remaining > 0:
+            chunk = self.rfile.read(min(65536, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
 
     def _json_body(self) -> dict:
         raw = self._body()
@@ -205,6 +324,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._download()
             if path == "/api/findings":
                 return self._findings()
+            if path == "/api/smb/hints":
+                return self._smb_hints()
+            if path == "/api/crack":
+                return self._crack_status()
+            if path == "/api/ntlmcrack":
+                return self._ntlmcrack_get()
             if path == "/api/packet":
                 return self._packet()
             if path == "/api/report":
@@ -238,6 +363,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        self._body_used = 0
         try:
             if path == "/api/upload":
                 if not self._token_ok():
@@ -327,6 +453,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._replay()
             if path == "/api/annotations":
                 return self._annotations_set()
+            if path == "/api/crack":
+                return self._crack_start()
+            if path == "/api/crack/cancel":
+                return self._crack_cancel()
+            if path == "/api/ntlmcrack":
+                return self._ntlmcrack_start()
+            if path == "/api/ntlmcrack/cancel":
+                return self._ntlmcrack_cancel()
+            if path == "/api/smb/decrypt":
+                return self._smb_decrypt()
             match = re.fullmatch(r"/api/history/([0-9a-f]+)/delete", path)
             if match:
                 ok = self.app.jobs.delete_history(match.group(1))
@@ -339,6 +475,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             logger.error(f"HTTP POST {path} 失败: {exc}")
             return self._error(str(exc), 500)
+        finally:
+            self._drain_body()
 
     # -- static --------------------------------------------------------
     def _index(self) -> None:
@@ -483,6 +621,7 @@ class Handler(BaseHTTPRequestHandler):
             handle.write(chunk)
             total += len(chunk)
             remaining -= len(chunk)
+            self._body_used += len(chunk)
         return total
 
     def _receive_multipart(self, boundary: bytes, limit: int,
@@ -495,39 +634,44 @@ class Handler(BaseHTTPRequestHandler):
         if length > limit:
             raise ValueError("文件超过大小限制")
         reader = _MultipartStream(self.rfile, boundary, length, limit)
-        filename = "capture.pcap"
-        temp: Path | None = None
-        # Skip the preamble and stop on the first boundary line.
-        line = reader.readline()
-        while line and reader.delimiter not in line:
+        try:
+            filename = "capture.pcap"
+            temp: Path | None = None
+            # Skip the preamble and stop on the first boundary line.
             line = reader.readline()
-        if not line:
-            raise ValueError("multipart 中没有文件字段")
-        while True:
-            headers: dict[str, str] = {}
-            while True:
+            while line and reader.delimiter not in line:
                 line = reader.readline()
-                if not line or line in (b"\r\n", b"\n"):
+            if not line:
+                raise ValueError("multipart 中没有文件字段")
+            while True:
+                headers: dict[str, str] = {}
+                while True:
+                    line = reader.readline()
+                    if not line or line in (b"\r\n", b"\n"):
+                        break
+                    text = line.decode("utf-8", "replace").rstrip("\r\n")
+                    key, _, value = text.partition(":")
+                    if key:
+                        headers[key.strip().lower()] = value.strip()
+                disposition = headers.get("content-disposition", "")
+                found = re.search(r'filename="([^"]*)"', disposition)
+                if found and temp is None:
+                    filename = found.group(1) or filename
+                    temp = upload_dir / f"upload-{secrets.token_hex(8)}.part"
+                    with temp.open("wb") as handle:
+                        reader.stream_to(handle)
+                else:
+                    reader.drain_part()
+                line = reader.readline()
+                if not line or line.startswith(b"--"):
                     break
-                text = line.decode("utf-8", "replace").rstrip("\r\n")
-                key, _, value = text.partition(":")
-                if key:
-                    headers[key.strip().lower()] = value.strip()
-            disposition = headers.get("content-disposition", "")
-            found = re.search(r'filename="([^"]*)"', disposition)
-            if found and temp is None:
-                filename = found.group(1) or filename
-                temp = upload_dir / f"upload-{secrets.token_hex(8)}.part"
-                with temp.open("wb") as handle:
-                    reader.stream_to(handle)
-            else:
-                reader.drain_part()
-            line = reader.readline()
-            if not line or line.startswith(b"--"):
-                break
-        if temp is None:
-            raise ValueError("multipart 中没有文件字段")
-        return filename, temp
+            if temp is None:
+                raise ValueError("multipart 中没有文件字段")
+            return filename, temp
+        finally:
+            # Bytes already pulled off the socket count as consumed even if
+            # they only sit in the reader's buffer.
+            self._body_used += length - reader.remaining
 
     def _upload_rules(self, name: str, temp: Path) -> None:
         """Validate and store an imported regex/YARA-subset rule file."""
@@ -943,6 +1087,175 @@ class Handler(BaseHTTPRequestHandler):
         if notes is None:
             return self._error("任务不存在", 404)
         return self._json({"ok": True, "job": job_id, "annotations": notes})
+
+    def _crack_status(self) -> None:
+        """Live state (log, password, elapsed) of one hashcat task."""
+        task_id = (self._query().get("id") or [""])[0]
+        if not task_id:
+            return self._error("缺少破解任务 id")
+        task = self.app.crack.get(task_id)
+        if task is None:
+            return self._error("破解任务不存在", 404)
+        return self._json({"ok": True, "task": task.as_dict()})
+
+    def _crack_start(self) -> None:
+        """Start hashcat for one finding; the UI polls ``/api/crack``."""
+        data = self._json_body()
+        job_id = str(data.get("job") or "")
+        if not job_id:
+            return self._error("缺少任务 ID")
+        task = self.app.crack.start(
+            job_id,
+            data.get("seq") if data.get("seq") is not None
+            else data.get("id") or "",
+            wordlist=data.get("wordlist"),
+            workload=data.get("workload"),
+            optimized=data.get("optimized"),
+            force=data.get("force"),
+            timeout=data.get("timeout"),
+            extra=data.get("extra"),
+        )
+        return self._json({"ok": True, "task": task.as_dict(),
+                           "settings": self.app.crack_settings()})
+
+    def _crack_cancel(self) -> None:
+        data = self._json_body()
+        ok = self.app.crack.cancel(str(data.get("id") or ""))
+        return self._json({"ok": ok,
+                           "text": "已停止破解" if ok else "破解任务未在运行"})
+
+    def _ntlmcrack_get(self) -> None:
+        """Live state (attempts, password) of one local NTLM crack task."""
+        task_id = (self._query().get("id") or [""])[0]
+        if not task_id:
+            return self._error("缺少 NTLM 破解任务 id")
+        task = self.app.ntlmcrack.get(task_id)
+        if task is None:
+            return self._error("NTLM 破解任务不存在", 404)
+        return self._json({"ok": True, "task": task.as_dict()})
+
+    def _ntlmcrack_start(self) -> None:
+        """Start local NetNTLMv2 cracking for one finding; the UI polls it."""
+        data = self._json_body()
+        job_id = str(data.get("job") or "")
+        if not job_id:
+            return self._error("缺少任务 ID")
+        task = self.app.ntlmcrack.start(
+            job_id,
+            data.get("seq") if data.get("seq") is not None
+            else data.get("id") or "",
+            candidates=data.get("candidates"),
+            min_len=data.get("min_len"),
+            max_len=data.get("max_len"),
+            alphabet=data.get("alphabet"),
+            max_attempts=data.get("max_attempts"),
+            timeout=data.get("timeout"),
+        )
+        return self._json({"ok": True, "task": task.as_dict()})
+
+    def _ntlmcrack_cancel(self) -> None:
+        data = self._json_body()
+        ok = self.app.ntlmcrack.cancel(str(data.get("id") or ""))
+        return self._json({"ok": ok,
+                           "text": "已停止 NTLM 破解" if ok
+                           else "NTLM 破解任务未在运行"})
+
+    def _cracked_passwords(self, job_id: str) -> list[dict]:
+        """Cracked plaintexts of this job (hashcat tasks + local NTLM tasks)."""
+        entries: list[dict] = []
+        for attribute in ("crack", "ntlmcrack"):
+            manager = getattr(self.app, attribute, None)
+            if manager is None:
+                continue
+            try:
+                found = manager.passwords_for(job_id)
+            except Exception as exc:  # noqa: BLE001 - a hint never breaks an API
+                logger.warn(f"{attribute} 已破解口令读取失败: {exc}")
+                continue
+            if isinstance(found, (list, tuple)):
+                entries.extend(item for item in found if isinstance(item, dict))
+        return entries
+
+    def _smb_hints(self) -> None:
+        """Auto-fill clues for the "SMB3 解密" dialog of one job."""
+        query = self._query()
+        job_id = (query.get("job") or [""])[0].strip()
+        stream = (query.get("stream") or [""])[0].strip()
+        if not job_id:
+            return self._error("缺少任务 ID")
+        if self.app.jobs.findings_for(job_id, limit=1) is None:
+            return self._error("任务不存在", 404)
+        cracked = self._cracked_passwords(job_id)
+        return self._json({"ok": True, "job": job_id, "stream": stream,
+                           "cracked": cracked,
+                           **smb_hints_payload(self.app.jobs, job_id, stream,
+                                               cracked)})
+
+    def _smb_decrypt(self) -> None:
+        """Derive SMB3 keys from credentials and decrypt the job's capture."""
+        from fnet.smb3 import decrypt_capture
+
+        data = self._json_body()
+        job_id = str(data.get("job") or "")
+        if not job_id:
+            return self._error("缺少任务 ID")
+        pcap = self.app.jobs.pcap_for(job_id)
+        if not pcap:
+            return self._error("任务不存在或流量包已被删除", 404)
+        output = self.app.jobs.output_dir_for(job_id)
+        tshark = self.app.toolbox.tshark()
+        if tshark is None:
+            return self._error("未找到 tshark，无法读取流量包")
+        values = {
+            "password": str(data.get("password") or ""),
+            "nt_hash": str(data.get("nt_hash") or data.get("hash") or ""),
+            "session_key": str(data.get("session_key") or ""),
+            "user": str(data.get("user") or ""),
+            "domain": str(data.get("domain") or ""),
+            "stream": str(data.get("stream") or ""),
+        }
+        autofill: list[str] = []
+        secret_keys = ("password", "nt_hash", "session_key")
+        if not any(values[key].strip() for key in secret_keys):
+            # Nothing was typed: reuse what the job already revealed (SMB NTLM
+            # credentials, cracked plaintexts, keys of a previous decrypt).
+            hints = smb_hints_payload(self.app.jobs, job_id, values["stream"],
+                                      self._cracked_passwords(job_id))
+            for key in SMB_HINT_FIELDS:
+                value = str(hints["hints"].get(key) or "")
+                if values[key].strip() or not value.strip():
+                    continue
+                values[key] = value
+                source = str(hints["sources"].get(key) or "").strip()
+                autofill.append(f"已自动填入：{SMB_HINT_LABELS[key]} 来自 "
+                                f"{source or '分析结果'}")
+            if not any(values[key].strip() for key in secret_keys):
+                return self._error("缺少 NT 哈希、密码或会话密钥，"
+                                   "也没有可用的自动填入线索")
+        result = decrypt_capture(
+            pcap, tshark,
+            password=values["password"],
+            nt_hash=values["nt_hash"],
+            session_key=values["session_key"],
+            user=values["user"],
+            domain=values["domain"],
+            stream=values["stream"],
+            output_dir=output,
+        )
+        payload = {
+            "ok": bool(result.get("ok")),
+            "job": job_id,
+            "text": result.get("text") or "",
+            "log": autofill + list(result.get("log") or []),
+            "files": result.get("files") or [],
+            "keys": result.get("keys") or [],
+            "flags": result.get("flags") or [],
+            "sessions": result.get("sessions") or [],
+            "decrypted": result.get("decrypted") or 0,
+        }
+        if not payload["ok"]:
+            payload["error"] = result.get("error") or "SMB3 解密失败"
+        return self._json(payload)
 
     def _topology(self) -> None:
         """Compact endpoint graph for one job's capture."""

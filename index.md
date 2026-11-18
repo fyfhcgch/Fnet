@@ -14,7 +14,7 @@ description: 把 pcap 拖进浏览器，勾选需要的检查项，得到 flag�
   <p class="cta-row">
     <a class="btn" href="{{ '/manual/tutorial/' | relative_url }}">开始实战</a>
     <a class="btn ghost" href="{{ '/manual/install/' | relative_url }}">安装与启动</a>
-    <a class="btn ghost" href="{{ '/manual/features/' | relative_url }}">浏览 46 项功能</a>
+    <a class="btn ghost" href="{{ '/manual/features/' | relative_url }}">浏览 50 项功能</a>
     <a class="btn ghost" href="https://github.com/fyfhcgch/Fnet">GitHub 仓库</a>
     {%- if site.version %}
     <span class="badge version-badge">v{{ site.version }}</span>
@@ -22,10 +22,29 @@ description: 把 pcap 拖进浏览器，勾选需要的检查项，得到 flag�
   </p>
 </div>
 
+## 2.21.1 更新
+
+- **Sliver 现代传输解密**：支持 v1.6 ChaCha20-Poly1305、74 字节 minisign 签名前缀跳过与 gzip 透明解压；兼容 v1.5 与旧版 AES-GCM，并识别 Age/TOTP/RSA 密钥交换及多种流量编码器。
+- **Meterpreter 线协议增强**：严格解析现代/旧版 XOR 头、TLV 与 staging，支持 AES-128/256-CBC 密钥解密；结果改为带命令号、GUID、加密与解密状态的线索，消除空信息与截图式伪头误报。
+- **C2 参数与文档**：`sliver_session_key` 接受 32/16 字节，`meterpreter_symkey` 接受 32/16 字节；功能清单同步更新，继续沿用 `checkBox_56`。
+
+## 2.21.0 更新
+
+- **SMB 加密链路智能串联**：NTLM 账号 → 候选密码注入/离线验证 → SMB3 解密 →
+  导出文件 → 熵识别疑似加密 → 提示 flag，一条命令自动串联；候选耗尽自动回退
+  并提示 hashcat，缺模块时优雅降级不崩溃；WebUI 的 SMB3 解密对话框会按链路
+  查到的账号、密码与会话密钥自动填入。
+- **NTLM 密码离线验证**：无 hashcat 也能用捕获的挑战/响应直接验证或受控枚举
+  NetNTLMv2 密码（默认不强攻），命中输出口令、未命中提示 hashcat -m 5600/5500。
+- **OpenSSL 加密文件分析**：按字节熵识别疑似加密/压缩文件；内置 `EVP_BytesToKey`
+  + AES-CTR/CBC/ECB OpenSSL 兼容解密（`openssl enc` 场景），解密后自动扫 flag。
+- **密码候选生成**：从账号/域名/共享/文件名与弱口令字典派生候选，支持路径字典
+  与受控暴力枚举，供 NTLM 验证与 SMB3 解密复用。
+
 ## 2.20.0 更新
 
 - **协议补齐**：LDAP、SMB2/3、MongoDB、PostgreSQL、Redis、SSH 六个会话级功能
-  注册为独立复选框（共 46 项），统一输出命令、查询、凭据、文件与爆破时间线。
+  注册为独立复选框（会话级共 46 项），统一输出命令、查询、凭据、文件与爆破时间线。
 - **C2 与取证**：Sliver（HTTP/DNS/mTLS beacon）与 meterpreter（staging、XOR 线
   格式、AES 加密包）识别解密；导入 Suricata `eve.json` 与 Zeek 日志，按 IP/
   端口/时间与流量发现做旁证关联。
@@ -54,7 +73,7 @@ description: 把 pcap 拖进浏览器，勾选需要的检查项，得到 flag�
 
 <p class="shot">
   <img src="{{ '/assets/images/webui.webp' | relative_url }}"
-       alt="Fnet WebUI：左侧 46 个功能的勾选面板，右侧分析结果表格">
+       alt="Fnet WebUI：左侧 50 个功能的勾选面板，右侧分析结果表格">
 </p>
 <p class="shot-caption">真实界面截图：暖夜主题下的分析结果页</p>
 
@@ -67,7 +86,7 @@ description: 把 pcap 拖进浏览器，勾选需要的检查项，得到 flag�
   </div>
   <div class="card">
     <h3>按赛题组织功能</h3>
-    <p>46 个分析功能分成 13 类：从 flag 扫描、HTTP 与 Webshell，到工控、无线、TLS 解密。</p>
+    <p>50 个分析功能分成 13 类：从 flag 扫描、HTTP 与 Webshell，到工控、无线、TLS 解密。</p>
   </div>
   <div class="card">
     <h3>结果能带走</h3>
@@ -173,14 +192,14 @@ python3 -m fnet</code></pre>
     <p>Cobalt Strike beacon 解密与 WinRM 凭据还原。</p>
   </div>
   <div class="card">
-    <span class="badge">2 项</span>
+    <span class="badge">4 项</span>
     <h3>认证与凭据</h3>
-    <p>NTLM 哈希与 Kerberos 票据；keytab/口令/原始密钥解密、PAC 与用户时间线，输出 hashcat 格式。</p>
+    <p>NTLM 哈希与 Kerberos 票据；keytab/口令/原始密钥解密、PAC 与用户时间线，输出 hashcat 格式；无 hashcat 时也可离线验证 NetNTLMv2 密码并派生 SMB 密码候选。</p>
   </div>
   <div class="card">
-    <span class="badge">16 项</span>
+    <span class="badge">17 项</span>
     <h3>协议流量</h3>
-    <p>TCP / UDP / DNS / ICMP / FTP / SMTP / Telnet / MySQL / ARP / GTP / LDAP / SMB / MongoDB / PostgreSQL / Redis / SSH；DNS/ICMP 隧道重组、邮件附件、MySQL 结果集与 LOAD，数据库与 SSH 会话凭据还原。</p>
+    <p>TCP / UDP / DNS / ICMP / FTP / SMTP / Telnet / MySQL / ARP / GTP / LDAP / SMB / MongoDB / PostgreSQL / Redis / SSH；DNS/ICMP 隧道重组、邮件附件、MySQL 结果集与 LOAD，数据库与 SSH 会话凭据还原；SMB 加密链路智能串联。</p>
   </div>
   <div class="card">
     <span class="badge">7 项</span>
@@ -240,7 +259,7 @@ python3 -m fnet</code></pre>
   <li>
     <a href="{{ '/manual/features/' | relative_url }}">
       <strong>功能清单</strong>
-      <span>46 项功能的作用、复选框编号与所需工具</span>
+      <span>50 项功能的作用、复选框编号与所需工具</span>
     </a>
   </li>
   <li>

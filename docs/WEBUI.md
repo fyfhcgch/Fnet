@@ -128,6 +128,11 @@ python3 -m fnet capture.pcapng --features checkBox_10,http.extract
 | GET | `/api/topology?job=<id>` | 端点拓扑图数据（`nodes`/`links`，复用会话统计） |
 | GET | `/api/annotations?job=<id>` | 该任务 findings 的人工标注（按 `seq` 索引） |
 | POST | `/api/annotations` | 设置/清除一条结果的标注（`job`、`seq`、`status`、`note`），持久化到 `<job>/annotations.json` |
+| GET | `/api/crack?id=<task>` | 查询一次 hashcat 破解的实时状态、日志与已破解密码 |
+| POST | `/api/crack` | 对一条哈希结果启动 hashcat（`job`、`seq`，可选 `wordlist`/`workload`/`optimized`/`force`/`timeout`/`extra`），设置写回配置 |
+| POST | `/api/crack/cancel` | 停止正在运行的破解任务（`id`） |
+| GET | `/api/smb/hints?job=<id>&stream=<n>` | SMB3 解密对话框的自动填入线索：可容纳多条 SMB 流与多个账号；`hints`/`sources` 给出明文密码、NT 哈希、会话密钥、账号、域、TCP 流及每条自动填入值的来源，`accounts` 列出可选账号，`notes` 是给人看的说明 |
+| POST | `/api/smb/decrypt` | 用密码 / NT 哈希 / 会话密钥解密 SMB3 流量（`job`，可选 `password`/`nt_hash`/`session_key`/`user`/`domain`/`stream`），会话密钥落盘到 `<job>/smb3_keys.txt` |
 | POST | `/api/replay` | 生成会话重放脚本（`job` + `stream` 或 `frame`；HTTP 返回 requests 版，裸 TCP 返回 socket 版） |
 | GET | `/api/rules` | 当前自定义规则文件、规则数量与名称 |
 | POST | `/api/rules` | 设置自定义规则文件路径（空字符串关闭） |
@@ -253,7 +258,9 @@ curl -H "X-Fnet-Token: $TOKEN" \
 `sections` 取值：`summary`（概要）、`features`（功能清单）、
 `findings`（关键发现）、`log`（完整日志）、`artifacts`（产出文件）、
 `params`（分析参数）。留空时使用默认章节（不含参数）。旧任务没有
-Markdown/HTML 文件时，会从 `report.txt` 重建日志后再渲染。
+Markdown/HTML 文件时，会从 `report.txt` 重建日志后再渲染。`findings` 与
+`timeline` 只保留成功结果（`info`/`good`）；报告文件自身不会出现在
+`artifacts` 列表中。
 
 报告中的所有流量内容都会经过 HTML 转义，只有 `flag{...}` 会被包成
 `<mark>` 高亮；HTML 响应带 `CSP: default-src 'none'`，不会执行流量包里的
@@ -302,6 +309,50 @@ curl -H "X-Fnet-Token: $TOKEN" \
 `/api/compare` 的 diff 逻辑保持不变。结果时间线按 `capture`（抓包侧时间，
 可选字段）或记录时间、帧号纵向排列，支持按类别过滤，
 点击帧号可直接打开数据包详情。
+
+#### 一键 hashcat 破解
+
+类别为“哈希”且带有 hashcat 格式哈希行的结果，详情弹窗底部会出现
+“用 hashcat 破解”按钮（NetNTLMv1/v2、Kerberos AS-REP/TGS-REP、NTLM、
+WPA 22000 等，模式由功能写入 `extra.mode`，旧任务按摘要推断）。弹窗中可以
+调整：
+
+- 字典路径（与 Wi-Fi 破解共用 `passwddir`，运行后持久化到配置）
+- 加速档位 `-w`（1–4）、优化内核 `-O`、强制模式 `--force`
+- 超时时间与附加参数（如 `-r rules/best64.rule`）
+
+破解在后台线程运行，弹窗实时显示 hashcat 日志、进度与最终状态；命中后直接
+显示密码并可一键复制。所有设置都会写回 `config.ini`，下次打开沿用。
+
+#### SMB3 解密对话框
+
+“分析结果 / 结果时间线”里 `extra.protocol == "smb2"` 的结果，详情弹窗底部有
+“解密 SMB3”按钮，打开凭据对话框。“SMB3 加密流量”这类结果只带 TCP 流号，
+所以前端会先请求 `GET /api/smb/hints?job=<id>&stream=<n>`，把服务端拼出来的
+线索直接填进表单；来源按下面的优先级合并，空串不算有值：
+
+- 被点击结果自带的 `extra`（`hash` / `user` / `domain` / `stream`）优先于服务端线索
+- SMB NTLM 认证结果提供账号与域
+- NTLM 验证、`smb_password.candidates` 与 hashcat（`-m 5600`）命中提供明文密码
+- 上次 SMB3 解密写下的 `<job>/smb3_keys.txt` 提供会话密钥
+- SMB3 加密流量结果提供 TCP 流号
+
+只有 32 位十六进制的裸 NT 哈希才会填进“NT 哈希”框；NetNTLMv2 哈希行必须先
+破解（详情弹窗的“用 hashcat 破解”或“用 NTLM 离线破解”），否则该字段留空。
+对话框正文第二段列出自动填入的字段与来源，例如
+`已自动填入：明文密码（NTLM 破解命中）、账号（SMB NTLM 认证）`；一条线索都没有
+时改为提示先运行 NTLM 验证 / SMB 密码候选。
+
+弹窗底部的“重新检测”按钮在不关闭对话框的情况下重新拉取线索：只覆盖用户没有
+输入过的输入框，并重写来源说明与一条 toast 摘要。`/api/smb/hints` 不存在
+（旧版本服务）、返回 `ok: false` 或请求异常时，对话框照旧打开，不报错。
+存在多个账号时，表单顶部给出“选择账号”下拉框（`域\账号 · 流 N`），切换即填入
+该账号的账号 / 域 / TCP 流与已破解密码，并清掉上一个账号遗留的密码与哈希。
+
+日常发现（SMB 协商方言、候选密码数量等信息级行）只出现在分析日志与 `smb_password_candidates.txt` 中，不再出现在“分析结果”里；可操作的结果由 `SMB加密链路智能串联` 与 `NTLM HASH提取` 承担，恢复的旧任务仍可能包含那些旧行。
+
+解密成功后结果视图按 `流 3 · AES-GCM · <hex>` 列出会话密钥，`smb3_keys.txt`
+等产出文件通过 `/api/jobs/<id>` 刷新到“产出文件”页。
 
 ### 菜单动作
 

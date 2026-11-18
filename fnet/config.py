@@ -30,6 +30,11 @@ DEFAULTS = {
     "config": {
         "regmatch": DEFAULT_REGMATCH,
         "passwddir": "wordlists/top25000.txt",
+        "hashcat_workload": "3",
+        "hashcat_optimized": "1",
+        "hashcat_force": "0",
+        "hashcat_timeout": "300",
+        "hashcat_extra": "",
         "javapath": "java",
         "font": "JetBrains Mono",
         "font_size": "12",

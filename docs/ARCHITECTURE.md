@@ -39,6 +39,11 @@ JobManager ─────────────►  worker thread
   功能、摘要、详情）。功能处理器在写日志的同时调用
   `ctx.add_finding(...)`，`JobManager` 负责归属功能、落盘，并通过
   `GET /api/findings` 提供给“分析结果”表格；报告与 CSV 复用同一批数据。
+- **一键破解**：`fnet/crack.py` 的 `CrackManager` 对带 `extra.hash` 的结果
+  启动 hashcat（模式来自 `extra.mode`，旧结果按摘要推断），在后台线程中流式
+  读取日志；`POST /api/crack` 立即返回任务 id，前端轮询 `GET /api/crack`
+  显示进度与密码，`POST /api/crack/cancel` 终止子进程。字典路径与 `-w`/
+  `-O`/`--force`/超时等参数写回 `config.ini`，下次沿用。
 - **报告**：`fnet/report.py` 只依赖标准库，把任务元数据、日志、产出与结构化
   结果渲染为 Markdown/HTML。WebUI 的 `GET /api/report` 对运行中的任务使用
   内存日志，对重启后恢复的任务则从 `report.txt` 反解日志，再按 `sections`
@@ -74,7 +79,7 @@ JobManager ─────────────►  worker thread
 | 实时抓包 | `fnet/live.py` | tshark 网卡枚举与单实例抓包控制 |
 | 结果 | `fnet/findings.py` | 结构化结果的格式、筛选、CSV 导出 |
 | 报告 | `fnet/report.py` | Markdown/HTML 报告渲染、章节选择、旧报告反解 |
-| 功能 | `fnet/features/` | 46 个分析功能，按主题拆文件 |
+| 功能 | `fnet/features/` | 50 个分析功能，按主题拆文件 |
 | 外部工具 | `fnet/tools/runner.py` | 工具发现、子进程、tshark 字段校验 |
 | 工具库 | `fnet/utils/` | 编解码、AES/RC4/MD4/RSA/GCM、pcap 辅助、TCP 流重组、RESP/PostgreSQL/BSON-MongoDB/WebSocket/MySQL 解析、Kerberos 原语、DNS/ICMP 隧道、邮件 MIME、WPA CCMP 解密、规则解析 |
 | 配置 | `fnet/config.py` | `config.ini` 默认值、读写、最近文件 |

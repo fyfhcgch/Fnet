@@ -44,6 +44,8 @@
     upload: null,
     paused: false,
     liveTimer: null,
+    crack: { timer: null, id: "", password: "" },
+    ntlm: { timer: null, id: "", password: "" },
   };
 
   const TERMINAL = new Set(["done", "error", "cancelled", "paused"]);
@@ -78,12 +80,76 @@
       replay_button: "生成重放脚本", replay_title: "攻击重放脚本",
       replay_running: "正在生成重放脚本…", replay_copied: "重放脚本已复制到剪贴板",
       replay_close: "关闭",
+      crack_button: "用 hashcat 破解", crack_title: "hashcat 破解",
+      crack_wordlist: "字典路径", crack_workload: "加速档位 (-w)",
+      crack_optimized: "优化内核 -O（更快，密码长度 ≤ 31）",
+      crack_force: "强制模式 --force（无 GPU / OpenCL 报错时勾选）",
+      crack_timeout: "超时（秒）", crack_extra: "附加参数",
+      crack_start: "开始破解", crack_stop: "停止", crack_close: "关闭",
+      crack_running: "破解中…", crack_cracked: "已破解",
+      crack_exhausted: "字典已跑完，未找到", crack_error: "破解失败",
+      crack_cancelled: "已取消",
+      crack_no_hashcat: "未找到 hashcat，请先安装或在设置中指定路径",
+      crack_password: "密码", crack_copied: "密码已复制",
+      ntlmcrack_button: "用 NTLM 离线破解", ntlmcrack_title: "NetNTLMv2 离线破解",
+      ntlmcrack_hint: "纯 Python 本地计算（hashcat 的离线回退），速度较慢；"
+        + "建议填入候选口令列表，或把尝试上限设低。大量候选请改用 hashcat -m 5600。",
+      ntlmcrack_candidates: "候选口令（可选，逗号/分号分隔）",
+      ntlmcrack_min_len: "最小长度", ntlmcrack_max_len: "最大长度",
+      ntlmcrack_alphabet: "字母表（如 ascii_letters+digits 或 abc123）",
+      ntlmcrack_max_attempts: "尝试上限（次）", ntlmcrack_timeout: "超时（秒）",
+      ntlmcrack_start: "开始破解", ntlmcrack_stop: "停止", ntlmcrack_close: "关闭",
+      ntlmcrack_running: "破解中…", ntlmcrack_cracked: "已破解",
+      ntlmcrack_exhausted: "候选已验证完毕，未找到", ntlmcrack_error: "破解失败",
+      ntlmcrack_cancelled: "已取消", ntlmcrack_attempts: "已尝试",
+      ntlmcrack_password: "密码", ntlmcrack_copied: "密码已复制",
+      smb_decrypt_button: "解密 SMB3", smb_decrypt_title: "SMB3 解密",
+      smb_decrypt_hint: "用 NT 哈希、明文密码或会话密钥还原 SMB3 加密流量。"
+        + "NetNTLMv2 哈希需要先破解成密码，或直接填入 NT 哈希（32 位十六进制）。",
+      smb_password: "明文密码", smb_nt_hash: "NT 哈希（32 位十六进制）",
+      smb_session_key: "会话密钥（可选，十六进制）",
+      smb_user: "账号（可选）", smb_domain: "域（可选）",
+      smb_stream: "TCP 流（可选，留空自动）", smb_start: "开始解密",
+      smb_close: "关闭", smb_running: "解密中…", smb_no_tshark: "未找到 tshark，无法解密",
+      smb_need_job: "还没有可解密的分析任务",
+      smb_need_secret: "请填写 NT 哈希、密码或会话密钥",
+      smb_hints_recheck: "重新检测", smb_hints_prefill: "已自动填入：",
+      smb_hints_saved: "线索已更新：",
+      smb_hints_none: "未发现可自动填入的线索，可先运行 NTLM 验证 / SMB 密码候选，"
+        + "或手工填入。",
+      smb_hints_failed: "读取自动填入线索失败",
+      smb_hints_from_finding: "本条结果",
+      smb_hint_password: "明文密码", smb_hint_nt_hash: "NT 哈希",
+      smb_hint_session_key: "会话密钥", smb_hint_user: "账号",
+      smb_hint_domain: "域", smb_hint_stream: "TCP 流",
+      smb_stream_short: "流", smb_keys: "会话密钥",
+      smb_account_pick: "选择账号（填入其凭据与 TCP 流）",
+      smb_account_none: "不选择",
+      smb_ok: "SMB3 解密完成", smb_failed: "SMB3 解密失败",
+      smb_result_title: "SMB3 解密结果", smb_no_result: "没有解密出任何消息",
+      smb_detail_title: "SMB 分析详情", smb_detail_extra: "协议字段",
+      smb_flags: "flag", smb_files: "还原文件",
+      smb_field_protocol: "协议", smb_field_smb: "类型", smb_field_stream: "TCP 流",
+      smb_field_client: "客户端", smb_field_server: "服务端",
+      smb_field_dialect: "方言", smb_field_session_id: "会话 ID",
+      smb_field_nonce: "Nonce", smb_field_transforms: "加密消息",
+      smb_field_encrypted_bytes: "加密字节", smb_field_first_frame: "首个帧",
+      smb_field_account: "账号", smb_field_user: "用户", smb_field_domain: "域",
+      smb_field_workstation: "主机", smb_field_auth: "认证包",
+      smb_field_hash: "哈希", smb_field_mode: "hashcat 模式",
+      smb_field_share: "共享", smb_field_encrypted: "要求加密",
+      smb_field_share_flags: "共享标志", smb_field_path: "路径",
+      smb_field_name: "文件名", smb_field_size: "大小", smb_field_md5: "MD5",
+      smb_field_pipe: "命名管道", smb_field_algorithm: "压缩算法",
+      smb_field_original_size: "原始大小", smb_field_security_mode: "签名策略",
+      smb_field_capabilities: "能力标志", smb_field_artifact: "产出文件",
+      smb_encrypted_hint: "该结果来自加密流量；填入凭据后可还原明文、文件与 flag。",
       topo_hint: "点击节点可按该端点过滤分析结果；连线按协议着色。",
     },
     en: {
       tab_log: "Log", tab_findings: "Findings", tab_artifacts: "Artifacts",
       tab_batch: "Batch queue", tab_viz: "Charts", tab_history: "History",
-      tab_text: "Text tools", tab_about: "About",
+      tab_text: "Text tools", tab_about: "About", tab_timeline: "Timeline",
       menu_file: "File", menu_stats: "Statistics", menu_settings: "Settings",
       menu_tools: "Tools", menu_special: "One-click", menu_help: "Help",
       search: "Search features / categories / handlers", select_all: "Select all",
@@ -109,6 +175,75 @@
       replay_running: "Generating replay script…",
       replay_copied: "Replay script copied to clipboard",
       replay_close: "Close",
+      crack_button: "Crack with hashcat", crack_title: "hashcat cracking",
+      crack_wordlist: "Wordlist path", crack_workload: "Workload profile (-w)",
+      crack_optimized: "Optimized kernels -O (faster, passwords ≤ 31)",
+      crack_force: "Force --force (for GPU / OpenCL warnings)",
+      crack_timeout: "Timeout (seconds)", crack_extra: "Extra arguments",
+      crack_start: "Start cracking", crack_stop: "Stop", crack_close: "Close",
+      crack_running: "Cracking…", crack_cracked: "Cracked",
+      crack_exhausted: "Wordlist exhausted, not found", crack_error: "Cracking failed",
+      crack_cancelled: "Cancelled",
+      crack_no_hashcat: "hashcat not found; install it or set its path in Settings",
+      crack_password: "Password", crack_copied: "Password copied",
+      ntlmcrack_button: "Crack NTLM locally",
+      ntlmcrack_title: "NetNTLMv2 offline cracking",
+      ntlmcrack_hint: "Pure-Python local computation (hashcat fallback) is slow; "
+        + "prefer a candidate list or keep the attempt cap low. Use hashcat "
+        + "-m 5600 for large runs.",
+      ntlmcrack_candidates: "Candidates (optional, comma/semicolon separated)",
+      ntlmcrack_min_len: "Min length", ntlmcrack_max_len: "Max length",
+      ntlmcrack_alphabet: "Alphabet (e.g. ascii_letters+digits or abc123)",
+      ntlmcrack_max_attempts: "Attempt cap", ntlmcrack_timeout: "Timeout (seconds)",
+      ntlmcrack_start: "Start cracking", ntlmcrack_stop: "Stop",
+      ntlmcrack_close: "Close",
+      ntlmcrack_running: "Cracking…", ntlmcrack_cracked: "Cracked",
+      ntlmcrack_exhausted: "Candidates exhausted, not found",
+      ntlmcrack_error: "Cracking failed", ntlmcrack_cancelled: "Cancelled",
+      ntlmcrack_attempts: "Attempted", ntlmcrack_password: "Password",
+      ntlmcrack_copied: "Password copied",
+      smb_decrypt_button: "Decrypt SMB3", smb_decrypt_title: "SMB3 decryption",
+      smb_decrypt_hint: "Recover SMB3 encrypted traffic with an NT hash, plaintext "
+        + "password or session key. NetNTLMv2 hashes must be cracked first, or "
+        + "paste the NT hash (32 hex digits) directly.",
+      smb_password: "Plaintext password", smb_nt_hash: "NT hash (32 hex digits)",
+      smb_session_key: "Session key (optional, hex)",
+      smb_user: "Account (optional)", smb_domain: "Domain (optional)",
+      smb_stream: "TCP stream (optional, auto)", smb_start: "Decrypt",
+      smb_close: "Close", smb_running: "Decrypting…", smb_no_tshark: "tshark not found; cannot decrypt",
+      smb_need_job: "No analysis job available",
+      smb_need_secret: "Enter an NT hash, password or session key",
+      smb_hints_recheck: "Re-check hints", smb_hints_prefill: "Auto-filled: ",
+      smb_hints_saved: "Hints updated: ",
+      smb_hints_none: "Nothing could be auto-filled; run the NTLM verification or "
+        + "the SMB password candidates first, or type the credentials in.",
+      smb_hints_failed: "Could not read the auto-fill hints",
+      smb_hints_from_finding: "this finding",
+      smb_hint_password: "password", smb_hint_nt_hash: "NT hash",
+      smb_hint_session_key: "session key", smb_hint_user: "account",
+      smb_hint_domain: "domain", smb_hint_stream: "TCP stream",
+      smb_stream_short: "stream", smb_keys: "Session keys",
+      smb_account_pick: "Pick an account (fills its credentials and stream)",
+      smb_account_none: "Don't pick one",
+      smb_ok: "SMB3 decrypted", smb_failed: "SMB3 decryption failed",
+      smb_result_title: "SMB3 decryption result", smb_no_result: "Nothing was decrypted",
+      smb_detail_title: "SMB analysis detail", smb_detail_extra: "Protocol fields",
+      smb_flags: "Flags", smb_files: "Recovered files",
+      smb_field_protocol: "Protocol", smb_field_smb: "Type", smb_field_stream: "TCP stream",
+      smb_field_client: "Client", smb_field_server: "Server",
+      smb_field_dialect: "Dialect", smb_field_session_id: "Session ID",
+      smb_field_nonce: "Nonce", smb_field_transforms: "Encrypted messages",
+      smb_field_encrypted_bytes: "Encrypted bytes", smb_field_first_frame: "First frame",
+      smb_field_account: "Account", smb_field_user: "User", smb_field_domain: "Domain",
+      smb_field_workstation: "Workstation", smb_field_auth: "Auth package",
+      smb_field_hash: "Hash", smb_field_mode: "hashcat mode",
+      smb_field_share: "Share", smb_field_encrypted: "Encryption required",
+      smb_field_share_flags: "Share flags", smb_field_path: "Path",
+      smb_field_name: "File name", smb_field_size: "Size", smb_field_md5: "MD5",
+      smb_field_pipe: "Named pipe", smb_field_algorithm: "Compression",
+      smb_field_original_size: "Original size", smb_field_security_mode: "Signing policy",
+      smb_field_capabilities: "Capabilities", smb_field_artifact: "Artifact",
+      smb_encrypted_hint: "This finding comes from encrypted traffic; supply credentials to recover plaintext, files and flags.",
       topo_hint: "Click a node to filter findings by that endpoint; links are colored by protocol.",
     },
   };
@@ -1862,6 +1997,49 @@
       (match) => `<mark>${match}</mark>`);
   }
 
+  const SMB_FIELD_ORDER = [
+    "smb", "stream", "client", "server", "dialect", "session_id",
+    "account", "user", "domain", "workstation", "auth", "hash", "mode",
+    "share", "path", "name", "size", "md5", "artifact", "pipe",
+    "encrypted", "share_flags", "transforms", "encrypted_bytes",
+    "original_size", "algorithm", "nonce", "first_frame",
+    "security_mode", "capabilities",
+  ];
+
+  function smbFieldLabel(key) {
+    return t(`smb_field_${key}`, key);
+  }
+
+  function smbDetailHtml(item) {
+    const extra = item.extra || {};
+    const rows = [];
+    SMB_FIELD_ORDER.forEach((key) => {
+      if (extra[key] === undefined || extra[key] === null || extra[key] === "") return;
+      rows.push([key, extra[key]]);
+    });
+    Object.entries(extra).forEach(([key, value]) => {
+      if (key === "protocol" || SMB_FIELD_ORDER.includes(key)) return;
+      if (value === undefined || value === null || value === "") return;
+      rows.push([key, value]);
+    });
+    if (!rows.length) return "";
+    const body = rows.map(([key, value]) => {
+      const text = clip(String(value), 400);
+      const display = key === "hash"
+        ? `<code class="mono">${esc(text)}</code>`
+        : esc(text);
+      return `<tr><th>${esc(smbFieldLabel(key))}</th><td>${display}</td></tr>`;
+    }).join("");
+    const hint = extra.smb === "encrypted"
+      ? `<p class="muted small">${esc(t("smb_encrypted_hint"))}</p>` : "";
+    return `<h4>${esc(t("smb_detail_title"))}</h4>
+      <table class="smb-detail">${body}</table>${hint}`;
+  }
+
+  function isSmbFinding(item) {
+    return Boolean(item && item.extra && item.extra.protocol === "smb2");
+  }
+
   async function showFinding(seq) {
     const item = state.findings.find((entry) => String(entry.seq) === String(seq));
     if (!item) return;
@@ -1878,9 +2056,22 @@
       lines.push("", `备注: ${item.annotation.note}`);
     }
     const ann = item.annotation || { status: "", note: "" };
+    const crackable = Boolean(item.extra && item.extra.hash)
+      && Boolean(state.meta && state.meta.crack && state.meta.crack.available);
+    const smb = isSmbFinding(item);
+    const ntlmcrackable = isNtlmCrackable(item);
+    const extraButtons = [];
+    if (smb && state.meta && state.meta.smb && state.meta.smb.available) {
+      extraButtons.push({ name: "smb", label: t("smb_decrypt_button") });
+    }
+    if (crackable) extraButtons.push({ name: "crack", label: t("crack_button") });
+    if (ntlmcrackable) {
+      extraButtons.push({ name: "ntlmcrack", label: t("ntlmcrack_button") });
+    }
     const values = await openModal({
       title: `结果详情 · ${findingValue(item, "kind")}`,
       text: lines.join("\n"),
+      html: smb ? smbDetailHtml(item) : "",
       fields: [
         {
           name: "status", label: t("ann_status"), type: "select",
@@ -1895,8 +2086,21 @@
         { name: "note", label: t("ann_note"), type: "textarea", value: ann.note || "" },
       ],
       okText: t("ann_save"),
+      extraButtons,
     });
     if (!values) return;
+    if (values.__action === "crack") {
+      await openCrackDialog(item);
+      return;
+    }
+    if (values.__action === "ntlmcrack") {
+      await openNtlmCrackDialog(item);
+      return;
+    }
+    if (values.__action === "smb") {
+      await openSmbDecryptDialog(item);
+      return;
+    }
     const job = packetJob();
     if (!job) { toast(state.language === "en"
       ? "No analysis job available" : "还没有可标注的分析任务", "warn"); return; }
@@ -1914,10 +2118,788 @@
     }
   }
 
+  /* --------------------------------------------------------------- SMB3 */
+  // Fields the SMB3 dialog can prefill; the server side resolver knows where
+  // each value came from and reports it in `sources`.
+  const SMB3_HINT_FIELDS = ["password", "nt_hash", "session_key",
+                            "user", "domain", "stream"];
+  const SMB3_SECRETS = ["password", "nt_hash", "session_key"];
+  const SMB3_HINT_LABELS = {
+    password: "smb_hint_password",
+    nt_hash: "smb_hint_nt_hash",
+    session_key: "smb_hint_session_key",
+    user: "smb_hint_user",
+    domain: "smb_hint_domain",
+    stream: "smb_hint_stream",
+  };
+
+  function isNtHash(value) {
+    return /^[0-9a-fA-F]{32}$/.test(String(value || "").trim());
+  }
+
+  // GET /api/smb/hints may be missing (old server), fail or answer junk; the
+  // caller only needs to know whether usable hints came back.
+  async function loadSmbHints(job, stream) {
+    const query = `?job=${encodeURIComponent(job)}`
+      + (stream ? `&stream=${encodeURIComponent(stream)}` : "");
+    try {
+      const data = await api(`/api/smb/hints${query}`);
+      if (!data || data.ok === false || !data.hints
+          || typeof data.hints !== "object" || Array.isArray(data.hints)) {
+        return { payload: null, failed: true,
+                 error: clip((data && (data.error || data.text)) || "") };
+      }
+      return { payload: data, failed: false, error: "" };
+    } catch (error) {
+      return { payload: null, failed: true, error: clip(error.message || error) };
+    }
+  }
+
+  // The clicked finding wins over server hints, an empty string is not a
+  // value, and a NetNTLMv2 line is never an NT hash — both sides are checked.
+  function mergeSmbHints(extra, payload) {
+    const sourceExtra = (typeof extra === "object" && extra
+      && !Array.isArray(extra)) ? extra : {};
+    const rawPayload = (typeof payload === "object" && payload) ? payload : {};
+    const hints = (typeof rawPayload.hints === "object" && rawPayload.hints
+      && !Array.isArray(rawPayload.hints)) ? rawPayload.hints : {};
+    const sources = (typeof rawPayload.sources === "object" && rawPayload.sources
+      && !Array.isArray(rawPayload.sources)) ? rawPayload.sources : {};
+    const values = {};
+    const filled = [];
+    SMB3_HINT_FIELDS.forEach((name) => {
+      const hashKey = name === "nt_hash" ? "hash" : name;
+      let own = String(sourceExtra[hashKey] ?? "").trim();
+      let hinted = String(hints[name] ?? "").trim();
+      if (name === "nt_hash") {
+        if (!isNtHash(own)) own = "";
+        if (!isNtHash(hinted)) hinted = "";
+      }
+      if (name === "stream") {
+        // 只发送纯数字的 TCP 流号，非数字（如 "0abc"）绝不发给解密接口。
+        if (!/^\d+$/.test(own)) own = "";
+        if (!/^\d+$/.test(hinted)) hinted = "";
+      }
+      const value = own || hinted;
+      if (!value) return;
+      values[name] = value;
+      filled.push({ name, value, fromFinding: Boolean(own),
+                    source: own ? "" : clip(String(sources[name] || "").trim(), 160) });
+    });
+    return { values, filled };
+  }
+
+  function smbFillSummary(filled, prefix) {
+    if (!Array.isArray(filled) || !filled.length) return "";
+    const zh = state.language !== "en";
+    const parts = filled.map((entry) => {
+      const label = t(SMB3_HINT_LABELS[entry.name] || entry.name);
+      const source = entry.fromFinding
+        ? t("smb_hints_from_finding") : entry.source;
+      if (!source) return label;
+      return zh ? `${label}（${source}）` : `${label} (${source})`;
+    });
+    return `${prefix}${parts.join(zh ? "、" : ", ")}`;
+  }
+
+  function smbDialogText(payload, failed, error, filled) {
+    const lines = [t("smb_decrypt_hint")];
+    const summary = smbFillSummary(filled, t("smb_hints_prefill"));
+    if (summary) {
+      lines.push("", summary);
+      (Array.isArray(payload && payload.notes) ? payload.notes.slice(0, 3) : [])
+        .forEach((note) => {
+          const text = String(note || "").trim();
+          if (text) lines.push(clip(text, 160));
+        });
+    } else if (failed) {
+      lines.push("", error ? `${t("smb_hints_failed")}：${error}`
+                           : t("smb_hints_failed"));
+    } else {
+      lines.push("", t("smb_hints_none"));
+    }
+    return lines.join("\n");
+  }
+
+  // A cracked account carries the plaintext password; its `hash` is a
+  // NetNTLMv2 line and must be cracked before it can be used here.
+  function smbAccountValues(account) {
+    const values = {};
+    if (!account || typeof account !== "object" || Array.isArray(account)) {
+      return values;
+    }
+    ["user", "domain", "stream", "password", "nt_hash"].forEach((name) => {
+      const raw = String(account[name] ?? "").trim();
+      if (name === "stream" && !/^\d+$/.test(raw)) return;
+      if (name === "nt_hash" && !isNtHash(raw)) return;
+      if (raw) values[name] = raw;
+    });
+    return values;
+  }
+
+  function smbAccountLabel(account) {
+    if (!account || typeof account !== "object") return "";
+    const name = [String(account.domain || "").trim(),
+                  String(account.user || "").trim()].filter(Boolean).join("\\");
+    const stream = String(account.stream ?? "").trim();
+    if (!name) return `${t("smb_stream_short")} ${stream}`;
+    return stream ? `${name} · ${t("smb_stream_short")} ${stream}` : name;
+  }
+
+  function smbDecryptFields(values, accounts) {
+    const fields = [];
+    if (accounts.length > 1) {
+      fields.push({
+        name: "account", label: t("smb_account_pick"), type: "select",
+        value: "",
+        options: [{ value: "", label: t("smb_account_none") }].concat(
+          accounts.map((account, index) => ({
+            value: String(index), label: smbAccountLabel(account),
+          }))),
+      });
+    }
+    fields.push(
+      { name: "password", label: t("smb_password"), type: "password",
+        value: values.password || "", placeholder: "haha" },
+      { name: "nt_hash", label: t("smb_nt_hash"), value: values.nt_hash || "",
+        placeholder: "31d6cfe0d16ae931b73c59d7e0c089c0" },
+      { name: "session_key", label: t("smb_session_key"),
+        value: values.session_key || "",
+        placeholder: "2e9dd1f6407acfad0ccfa0cee66c12da" },
+      { name: "user", label: t("smb_user"), value: values.user || "" },
+      { name: "domain", label: t("smb_domain"), value: values.domain || "" },
+      { name: "stream", label: t("smb_stream"), value: values.stream || "" },
+    );
+    return fields;
+  }
+
+  // Write hint values into the live inputs, skipping what the user typed.
+  function applySmbHintValues(values, touched) {
+    const written = [];
+    SMB3_HINT_FIELDS.forEach((name) => {
+      const input = $(`#modal-field-${name}`);
+      const value = String(values[name] || "").trim();
+      if (!input || !value || touched.has(name)) return;
+      input.value = value;
+      written.push(name);
+    });
+    return written;
+  }
+
+  // openModal has no change callback, so the account dropdown is wired up by
+  // hand once the body exists.
+  function bindSmbAccountPicker(accounts, touched) {
+    const select = $("#modal-field-account");
+    if (!select || accounts.length < 2) return;
+    select.addEventListener("change", () => {
+      const index = Number(select.value);
+      if (!select.value || index < 0 || index >= accounts.length) return;
+      const account = accounts[index];
+      const values = smbAccountValues(account);
+      ["user", "domain", "stream", "password", "nt_hash"].forEach((name) => {
+        const input = $(`#modal-field-${name}`);
+        if (!input) return;
+        const value = String(values[name] || "");
+        // A stream the account does not name keeps whatever is in the field.
+        if (!value && name === "stream") return;
+        input.value = value;
+        if (value) touched.add(name);
+      });
+    });
+  }
+
+  function smbKeyEntries(data) {
+    const raw = Array.isArray(data.keys) && data.keys.length
+      ? data.keys
+      : (Array.isArray(data.sessions) ? data.sessions : []);
+    const lines = [];
+    const seen = new Set();
+    raw.forEach((entry) => {
+      const item = typeof entry === "string" ? { key: entry }
+        : (typeof entry === "object" && entry ? entry : {});
+      const hex = String(item.key || item.session_key || "").trim();
+      if (!hex) return;
+      const stream = String(item.stream ?? "").trim();
+      const parts = [];
+      if (stream) parts.push(`${t("smb_stream_short")} ${stream}`);
+      if (item.cipher) parts.push(String(item.cipher));
+      parts.push(hex);
+      const line = parts.join(" · ");
+      if (seen.has(line)) return;
+      seen.add(line);
+      lines.push(line);
+    });
+    return lines;
+  }
+
+  async function openSmbDecryptDialog(item) {
+    const meta = state.meta && state.meta.smb;
+    if (!meta || !meta.available) {
+      toast(t("smb_no_tshark"), "warn", 6000);
+      return;
+    }
+    const job = packetJob();
+    if (!job) { toast(t("smb_need_job"), "warn"); return; }
+    const extra = (item && item.extra) || {};
+    const touched = new Set();
+    let payload = null;
+    let failed = false;
+    let failure = "";
+    let merged = mergeSmbHints(extra, null);
+    // `meta.hints` is missing on an old server: open the dialog as before.
+    if (meta.hints) {
+      const result = await loadSmbHints(job, String(extra.stream ?? "").trim());
+      payload = result.payload;
+      failed = result.failed;
+      failure = result.error;
+      merged = mergeSmbHints(extra, payload);
+    }
+    const accounts = Array.isArray(payload && payload.accounts)
+      ? payload.accounts.filter((account) => {
+        if (!account || typeof account !== "object" || Array.isArray(account))
+          return false;
+        const user = String(account.user || "").trim();
+        const domain = String(account.domain || "").trim();
+        const stream = String(account.stream || "").trim();
+        return Boolean(user || domain || stream);
+      })
+      : [];
+    let secretSeen = SMB3_SECRETS.some((name) => merged.values[name]);
+
+    async function recheckSmbHints(button) {
+      if (button) button.disabled = true;
+      try {
+        const streamInput = $("#modal-field-stream");
+        const stream = streamInput ? String(streamInput.value || "").trim()
+          : String(extra.stream ?? "").trim();
+        const result = await loadSmbHints(job, stream);
+        if (!alive()) return;
+        payload = result.payload;
+        failed = result.failed;
+        failure = result.error;
+        merged = mergeSmbHints(extra, payload);
+        const written = applySmbHintValues(merged.values, touched);
+        if (written.some((name) => SMB3_SECRETS.includes(name))) {
+          secretSeen = true;
+        }
+        textBlock.textContent = smbDialogText(payload, failed, failure,
+                                              merged.filled);
+        const fresh = merged.filled.filter((entry) =>
+          written.includes(entry.name));
+        const summary = smbFillSummary(fresh, t("smb_hints_saved"));
+        toast(summary || (failed ? t("smb_hints_failed") : t("smb_hints_none")),
+              summary ? "good" : "warn", 5000);
+      } finally {
+        if (button) button.disabled = false;
+      }
+    }
+
+    const options = {
+      title: t("smb_decrypt_title"),
+      text: smbDialogText(payload, failed, failure, merged.filled),
+      fields: smbDecryptFields(merged.values, accounts),
+      okText: t("smb_start"),
+      extraButtons: meta.hints
+        ? [{ name: "hints", label: t("smb_hints_recheck"),
+             onClick: recheckSmbHints }]
+        : [],
+    };
+    // openModal builds the body synchronously and only resolves on submit, so
+    // the live behaviour is wired up before awaiting the returned promise.
+    const pending = openModal(options);
+    const textBlock = $("#modal-body pre");
+    // A late answer must not touch a modal that the user already replaced.
+    const alive = () => $("#modal-body pre") === textBlock && textBlock;
+    $$("[id^=modal-field-]", $("#modal-body")).forEach((input) => {
+      if (input.tagName === "SELECT") return;
+      const name = input.id.replace("modal-field-", "");
+      input.addEventListener("input", () => touched.add(name));
+    });
+    bindSmbAccountPicker(accounts, touched);
+    const values = await pending;
+    if (!values) return;
+    if (!values.password && !values.nt_hash && !values.session_key
+        && !secretSeen) {
+      toast(t("smb_need_secret"), "warn", 5000);
+      return;
+    }
+    openModal({
+      title: `${t("smb_result_title")} · ${t("smb_running")}`,
+      text: t("smb_running"),
+      hideCancel: true,
+      okText: t("smb_close"),
+    });
+    try {
+      const data = await api("/api/smb/decrypt", {
+        method: "POST",
+        body: {
+          job,
+          password: values.password || "",
+          nt_hash: values.nt_hash || "",
+          session_key: values.session_key || "",
+          user: values.user || "",
+          domain: values.domain || "",
+          // 只发送纯数字的 TCP 流号，用户手工输入的非数字流号丢弃。
+          stream: /^\d+$/.test(String(values.stream || "")) ? values.stream : "",
+        },
+      });
+      renderSmbResult(data, job);
+    } catch (error) {
+      renderSmbResult({ ok: false, error: error.message, log: [] }, job);
+    }
+  }
+
+  function renderSmbResult(data, job) {
+    const body = $("#modal-body");
+    if (body) {
+      body.innerHTML = "";
+      const pre = document.createElement("pre");
+      const lines = (data.log || []).slice();
+      pre.textContent = lines.length
+        ? lines.join("\n")
+        : (data.text || data.error || t("smb_no_result"));
+      body.appendChild(pre);
+      const keys = smbKeyEntries(data);
+      if (keys.length) {
+        const title = document.createElement("h4");
+        title.textContent = t("smb_keys");
+        body.appendChild(title);
+        const box = document.createElement("div");
+        box.className = "smb-files";
+        box.innerHTML = keys.map(
+          (line) => `<div class="mono">${esc(line)}</div>`).join("");
+        body.appendChild(box);
+      }
+      if (data.flags && data.flags.length) {
+        const title = document.createElement("h4");
+        title.textContent = t("smb_flags");
+        body.appendChild(title);
+        const flags = document.createElement("div");
+        flags.className = "smb-flags";
+        flags.innerHTML = data.flags
+          .map((flag) => `<code class="mono">${esc(flag)}</code>`).join(" ");
+        body.appendChild(flags);
+      }
+      if (data.files && data.files.length) {
+        const title = document.createElement("h4");
+        title.textContent = t("smb_files");
+        body.appendChild(title);
+        const files = document.createElement("div");
+        files.className = "smb-files";
+        files.innerHTML = data.files.map((file) => `<div class="mono">${esc(file.name)}
+          <span class="muted">${fmtSize(file.size)}</span></div>`).join("");
+        body.appendChild(files);
+      }
+    }
+    setText("#modal-title",
+      `${t("smb_result_title")} · ${data.ok ? t("smb_ok") : t("smb_failed")}`);
+    if (data.ok) {
+      toast(t("smb_ok"), "good", 3000);
+      refreshJobArtifacts(job);
+    } else {
+      toast(data.error || t("smb_failed"), "error", 7000);
+    }
+  }
+
+  async function refreshJobArtifacts(job) {
+    if (!job) return;
+    try {
+      const data = await api(`/api/jobs/${encodeURIComponent(job)}?cursor=${state.cursor}`);
+      if (data.job && data.artifacts) updateJob(data.job, data.artifacts);
+      await loadFindings(job, { quiet: true });
+    } catch (error) {
+      /* artifact refresh is best-effort */
+    }
+  }
+
   function annotationLabel(status) {
     return { confirmed: t("ann_confirmed"),
              false_positive: t("ann_false_positive"),
              starred: t("ann_starred") }[status] || "";
+  }
+
+  /* ------------------------------------------------------------- hashcat */
+  const CRACK_STATUS_KEYS = {
+    running: "crack_running", cracked: "crack_cracked",
+    exhausted: "crack_exhausted", error: "crack_error",
+    cancelled: "crack_cancelled",
+  };
+
+  function crackStatusLabel(status) {
+    return t(CRACK_STATUS_KEYS[status] || "crack_running");
+  }
+
+  function stopCrackPoll() {
+    if (!state.crack) return;
+    if (state.crack.timer) clearInterval(state.crack.timer);
+    state.crack.timer = null;
+    state.crack.id = "";
+  }
+
+  function workloadOptions() {
+    const zh = ["1 - 低（桌面不卡顿）", "2 - 经济", "3 - 默认", "4 - 高（占满 GPU）"];
+    const en = ["1 - Low (desktop stays usable)", "2 - Economic", "3 - Default", "4 - High (uses the whole GPU)"];
+    const labels = state.language === "en" ? en : zh;
+    return labels.map((label, index) => ({ value: String(index + 1), label }));
+  }
+
+  async function openCrackDialog(item) {
+    const meta = state.meta && state.meta.crack;
+    if (!meta || !meta.available) {
+      toast(t("crack_no_hashcat"), "warn", 6000);
+      return;
+    }
+    const job = packetJob();
+    if (!job) {
+      toast(state.language === "en"
+        ? "No analysis job available" : "还没有可破解的分析任务", "warn");
+      return;
+    }
+    const settings = meta.settings || {};
+    const values = await openModal({
+      title: `${t("crack_title")} · ${findingValue(item, "kind")}`,
+      text: item.detail || "",
+      fields: [
+        {
+          name: "wordlist", label: t("crack_wordlist"),
+          value: settings.wordlist || "",
+          placeholder: "/usr/share/wordlists/rockyou.txt",
+        },
+        {
+          name: "workload", label: t("crack_workload"), type: "select",
+          value: String(settings.workload || "3"),
+          options: workloadOptions(),
+        },
+        {
+          name: "optimized", label: t("crack_optimized"), type: "checkbox",
+          value: settings.optimized !== false,
+        },
+        {
+          name: "force", label: t("crack_force"), type: "checkbox",
+          value: Boolean(settings.force),
+        },
+        {
+          name: "timeout", label: t("crack_timeout"), type: "number",
+          value: settings.timeout || 300,
+        },
+        {
+          name: "extra", label: t("crack_extra"),
+          value: settings.extra || "",
+          placeholder: "--username -r rules/best64.rule",
+        },
+      ],
+      okText: t("crack_start"),
+    });
+    if (!values) return;
+    try {
+      const data = await api("/api/crack", {
+        method: "POST",
+        body: {
+          job, seq: item.seq,
+          wordlist: values.wordlist,
+          workload: values.workload,
+          optimized: Boolean(values.optimized),
+          force: Boolean(values.force),
+          timeout: Number(values.timeout) || settings.timeout || 300,
+          extra: values.extra || "",
+        },
+      });
+      if (data.settings && state.meta.crack) {
+        state.meta.crack.settings = data.settings;
+      }
+      showCrackProgress(data.task);
+    } catch (error) {
+      toast(error.message, "error", 7000);
+    }
+  }
+
+  function showCrackProgress(task) {
+    const running = !task.finished;
+    openModal({
+      title: `${t("crack_title")} · ${crackStatusLabel(task.status)}`,
+      text: "",
+      hideCancel: true,
+      okText: t("crack_close"),
+      extraButtons: running
+        ? [{
+            name: "stop", label: t("crack_stop"),
+            onClick: (button) => { button.disabled = true; cancelCrack(task.id); },
+          }]
+        : [],
+    });
+    state.crack.id = task.id;
+    state.crack.password = "";
+    renderCrackProgress(task);
+    if (!running) return;
+    state.crack.timer = setInterval(async () => {
+      if (state.crack.id !== task.id) return;
+      try {
+        const data = await api(`/api/crack?id=${encodeURIComponent(task.id)}`);
+        if (state.crack.id !== task.id) return;
+        renderCrackProgress(data.task);
+      } catch (error) {
+        stopCrackPoll();
+        renderCrackProgress({ ...task, status: "error", error: error.message,
+                              finished: true });
+      }
+    }, 1000);
+  }
+
+  function renderCrackProgress(task) {
+    const body = $("#modal-body");
+    const nearBottom = !body
+      || body.scrollHeight - body.scrollTop - body.clientHeight < 60;
+    let pre = $("#modal-body pre");
+    if (!pre) {
+      pre = document.createElement("pre");
+      $("#modal-body").appendChild(pre);
+    }
+    const parts = [];
+    if (task.log) parts.push(task.log.trim());
+    if (task.password) parts.push(`${t("crack_password")}: ${task.password}`);
+    if (task.error) parts.push(task.error);
+    if (!parts.length) parts.push(crackStatusLabel(task.status));
+    pre.textContent = parts.join("\n\n");
+    if (nearBottom && body) body.scrollTop = body.scrollHeight;
+    setText("#modal-title",
+      `${t("crack_title")} · ${crackStatusLabel(task.status)}`);
+    const foot = $("#modal-ok").parentElement;
+    const stop = foot && foot.querySelector(".modal-extra");
+    if (stop) {
+      stop.disabled = Boolean(task.finished);
+      stop.style.display = task.finished ? "none" : "";
+    }
+    if (task.password && foot && !foot.querySelector(".modal-crack-copy")) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "ghost modal-extra modal-crack-copy";
+      button.textContent = `${t("crack_password")} ⧉`;
+      button.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(task.password);
+          toast(t("crack_copied"), "good", 1800);
+        } catch (error) {
+          toast(task.password, "info", 8000);
+        }
+      });
+      foot.insertBefore(button, $("#modal-cancel"));
+    }
+    if (task.password && state.crack.password !== task.password) {
+      state.crack.password = task.password;
+      toast(`${t("crack_cracked")}: ${task.password}`, "good", 10000);
+    }
+    if (task.finished) stopCrackPoll();
+  }
+
+  async function cancelCrack(id) {
+    try {
+      const data = await api("/api/crack/cancel", {
+        method: "POST", body: { id },
+      });
+      toast(data.text || t("crack_cancelled"), "good", 2000);
+    } catch (error) {
+      toast(error.message, "error", 6000);
+    }
+  }
+
+  /* -------------------------------------------- NetNTLMv2 local cracking */
+  const NTLMCRACK_STATUS_KEYS = {
+    running: "ntlmcrack_running", cracked: "ntlmcrack_cracked",
+    exhausted: "ntlmcrack_exhausted", error: "ntlmcrack_error",
+    cancelled: "ntlmcrack_cancelled",
+  };
+
+  function ntlmcrackStatusLabel(status) {
+    return t(NTLMCRACK_STATUS_KEYS[status] || "ntlmcrack_running");
+  }
+
+  function stopNtlmCrackPoll() {
+    if (!state.ntlm) return;
+    if (state.ntlm.timer) clearInterval(state.ntlm.timer);
+    state.ntlm.timer = null;
+    state.ntlm.id = "";
+  }
+
+  function isNtlmCrackable(item) {
+    const extra = (item && item.extra) || {};
+    const protocol = String(extra.protocol || "").toLowerCase();
+    // NTLM/SMB 协议结果，或任何携带 NetNTLMv2 哈希行的 kind=hash 结果
+    if (!["ntlm", "smb2"].includes(protocol) && item?.kind !== "hash") {
+      return false;
+    }
+    return Boolean(ntlmTargetFields(extra));
+  }
+
+  function ntlmTargetFields(extra) {
+    // hashcat -m 5600 行（user::domain:challenge:proof:blob）；响应长度
+    // 下限 25 字节可挡掉 NetNTLMv1 行（lm+nt 恒为 24 字节）。
+    const line = String(extra.hash || "").trim();
+    const parts = line.includes("::") ? line.split("::", 2)[1].split(":") : [];
+    if (parts.length === 4 && /^[0-9a-fA-F]{16}$/.test(parts[1])
+        && /^[0-9a-fA-F]{32}$/.test(parts[2])
+        && /^[0-9a-fA-F]{18,}$/.test(parts[3])
+        && (parts[2] + parts[3]).length >= 50) {
+      return { user: (line.split("::", 1)[0] || "").trim(),
+               domain: parts[0], challenge: parts[1],
+               nt_response: parts[2] + parts[3] };
+    }
+    // 结构化字段（user + challenge + ntproofstr/blob 或 nt_response）
+    const user = String(extra.user || extra.account || "").trim()
+      .split("\\").pop().split("@")[0].trim();
+    const proof = String(extra.ntproofstr || extra.proof || "").trim();
+    const blob = String(extra.blob || "").trim();
+    const response = String(extra.nt_response || "").trim() || proof + blob;
+    if (user && /^[0-9a-fA-F]{16}$/.test(String(extra.challenge || "").trim())
+        && /^[0-9a-fA-F]{50,}$/.test(response)) {
+      return { user, domain: String(extra.domain || ""),
+               challenge: String(extra.challenge).trim(), nt_response: response };
+    }
+    return null;
+  }
+
+  async function openNtlmCrackDialog(item) {
+    const job = packetJob();
+    if (!job) {
+      toast(state.language === "en"
+        ? "No analysis job available" : "还没有可破解的分析任务", "warn");
+      return;
+    }
+    const target = ntlmTargetFields((item && item.extra) || {});
+    if (!target) {
+      toast(t("ntlmcrack_error"), "warn", 6000);
+      return;
+    }
+    const values = await openModal({
+      title: `${t("ntlmcrack_title")} · ${target.user || "?"}`,
+      text: t("ntlmcrack_hint"),
+      fields: [
+        { name: "candidates", label: t("ntlmcrack_candidates"), type: "textarea",
+          value: "", placeholder: "Password123, admin, 123456" },
+        { name: "min_len", label: t("ntlmcrack_min_len"), type: "number",
+          value: 1, placeholder: "1" },
+        { name: "max_len", label: t("ntlmcrack_max_len"), type: "number",
+          value: 4, placeholder: "4" },
+        {
+          name: "alphabet", label: t("ntlmcrack_alphabet"),
+          value: "ascii_letters+digits",
+          placeholder: "ascii_letters+digits / digits / abc123",
+        },
+        { name: "max_attempts", label: t("ntlmcrack_max_attempts"), type: "number",
+          value: 200000 },
+        { name: "timeout", label: t("ntlmcrack_timeout"), type: "number",
+          value: 300 },
+      ],
+      okText: t("ntlmcrack_start"),
+    });
+    if (!values) return;
+    try {
+      const data = await api("/api/ntlmcrack", {
+        method: "POST",
+        body: {
+          job,
+          seq: item.seq,
+          candidates: values.candidates || "",
+          min_len: Number(values.min_len) || 1,
+          max_len: Number(values.max_len) || 4,
+          alphabet: values.alphabet || "",
+          max_attempts: Number(values.max_attempts) || 200000,
+          timeout: Number(values.timeout) || 300,
+        },
+      });
+      showNtlmCrackProgress(data.task);
+    } catch (error) {
+      toast(error.message, "error", 7000);
+    }
+  }
+
+  function showNtlmCrackProgress(task) {
+    const running = !task.finished;
+    openModal({
+      title: `${t("ntlmcrack_title")} · ${ntlmcrackStatusLabel(task.status)}`,
+      text: "",
+      hideCancel: true,
+      okText: t("ntlmcrack_close"),
+      extraButtons: running
+        ? [{
+            name: "stop", label: t("ntlmcrack_stop"),
+            onClick: (button) => { button.disabled = true; cancelNtlmCrack(task.id); },
+          }]
+        : [],
+    });
+    state.ntlm.id = task.id;
+    state.ntlm.password = "";
+    renderNtlmCrackProgress(task);
+    if (!running) return;
+    state.ntlm.timer = setInterval(async () => {
+      if (state.ntlm.id !== task.id) return;
+      try {
+        const data = await api(`/api/ntlmcrack?id=${encodeURIComponent(task.id)}`);
+        if (state.ntlm.id !== task.id) return;
+        renderNtlmCrackProgress(data.task);
+      } catch (error) {
+        stopNtlmCrackPoll();
+        renderNtlmCrackProgress({ ...task, status: "error", error: error.message,
+                                  finished: true });
+      }
+    }, 1000);
+  }
+
+  function renderNtlmCrackProgress(task) {
+    const body = $("#modal-body");
+    const nearBottom = !body
+      || body.scrollHeight - body.scrollTop - body.clientHeight < 60;
+    let pre = $("#modal-body pre");
+    if (!pre) {
+      pre = document.createElement("pre");
+      $("#modal-body").appendChild(pre);
+    }
+    const parts = [];
+    if (task.log) parts.push(task.log.trim());
+    parts.push(`${t("ntlmcrack_attempts")}: ${task.attempts ?? 0}`
+      + ` / ${task.max_attempts ?? "?"}`);
+    if (task.password) parts.push(`${t("ntlmcrack_password")}: ${task.password}`);
+    if (task.error) parts.push(task.error);
+    pre.textContent = parts.join("\n\n");
+    if (nearBottom && body) body.scrollTop = body.scrollHeight;
+    setText("#modal-title",
+      `${t("ntlmcrack_title")} · ${ntlmcrackStatusLabel(task.status)}`);
+    const foot = $("#modal-ok").parentElement;
+    const stop = foot && foot.querySelector(".modal-extra");
+    if (stop) {
+      stop.disabled = Boolean(task.finished);
+      stop.style.display = task.finished ? "none" : "";
+    }
+    if (task.password && foot && !foot.querySelector(".modal-ntlm-copy")) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "ghost modal-extra modal-ntlm-copy";
+      button.textContent = `${t("ntlmcrack_password")} ⧉`;
+      button.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(task.password);
+          toast(t("ntlmcrack_copied"), "good", 1800);
+        } catch (error) {
+          toast(task.password, "info", 8000);
+        }
+      });
+      foot.insertBefore(button, $("#modal-cancel"));
+    }
+    if (task.password && state.ntlm.password !== task.password) {
+      state.ntlm.password = task.password;
+      toast(`${t("ntlmcrack_cracked")}: ${task.password}`, "good", 10000);
+    }
+    if (task.finished) stopNtlmCrackPoll();
+  }
+
+  async function cancelNtlmCrack(id) {
+    try {
+      const data = await api("/api/ntlmcrack/cancel", {
+        method: "POST", body: { id },
+      });
+      toast(data.text || t("ntlmcrack_cancelled"), "good", 2000);
+    } catch (error) {
+      toast(error.message, "error", 6000);
+    }
   }
 
   /* ------------------------------------------------- findings timeline */
@@ -3166,19 +4148,56 @@
   /* --------------------------------------------------------------- modal */
   let modalResolve = null;
 
-  function openModal({ title, fields = [], text = "", okText = "确定", hideCancel = false }) {
+  function openModal({ title, fields = [], text = "", html = "",
+                       okText = "确定", hideCancel = false,
+                       extraButtons = [] }) {
+    // A new dialog supersedes any crack log that was being polled.
+    stopCrackPoll();
+    stopNtlmCrackPoll();
     const modal = $("#modal");
     setText("#modal-title", title);
     const body = $("#modal-body");
     body.innerHTML = "";
+    const foot = $("#modal-ok").parentElement;
+    $$(".modal-extra", foot).forEach((node) => node.remove());
+    extraButtons.forEach((spec) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "ghost modal-extra";
+      button.textContent = spec.label || spec.name;
+      button.addEventListener("click", () => {
+        if (typeof spec.onClick === "function") spec.onClick(button);
+        else closeModal({ __action: spec.name });
+      });
+      foot.insertBefore(button, $("#modal-cancel"));
+    });
     if (text) {
       const pre = document.createElement("pre");
       pre.textContent = text;
       body.appendChild(pre);
     }
+    if (html) {
+      const block = document.createElement("div");
+      block.className = "modal-detail";
+      block.innerHTML = html;
+      body.appendChild(block);
+    }
     fields.forEach((field) => {
       const wrap = document.createElement("div");
       wrap.className = "field";
+      if (field.type === "checkbox") {
+        const item = document.createElement("label");
+        item.className = "inline";
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.id = `modal-field-${field.name}`;
+        box.checked = Boolean(field.value);
+        item.appendChild(box);
+        item.appendChild(document.createTextNode(` ${field.label || field.name}`));
+        wrap.appendChild(item);
+        body.appendChild(wrap);
+        return;
+      }
       const label = document.createElement("label");
       label.textContent = field.label || field.name;
       wrap.appendChild(label);
@@ -3219,7 +4238,8 @@
         input.type = field.type || "text";
       }
       input.id = `modal-field-${field.name}`;
-      input.value = field.value ?? "";
+      if (input.type === "checkbox") input.checked = Boolean(field.value);
+      else input.value = field.value ?? "";
       if (field.placeholder) input.placeholder = field.placeholder;
       if (field.readonly) input.readOnly = true;
       wrap.appendChild(input);
@@ -3233,6 +4253,8 @@
   }
 
   function closeModal(result = null) {
+    stopCrackPoll();
+    stopNtlmCrackPoll();
     $("#modal").classList.add("hidden");
     const resolve = modalResolve;
     modalResolve = null;

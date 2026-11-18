@@ -328,7 +328,8 @@ def crack(ctx: FeatureContext) -> None:
                    f"AP {wifilib.mac_colon(bssid)}", "good")
         ctx.add_finding("hash", f"WPA PMKID {bssid or '-'} {ssid or ''}".strip(),
                         detail=line, level="good",
-                        extra={"protocol": "wifi", "hash": line})
+                        extra={"protocol": "wifi", "hash": line,
+                               "mode": "22000"})
     if pmkids:
         ctx.report(f"检测到 {len(pmkid_lines)} 个可用 PMKID（已去重）", "good")
         ctx.write_output("wifi_pmkid.hc22000", "\n".join(pmkid_lines) + "\n")
@@ -418,7 +419,8 @@ def crack(ctx: FeatureContext) -> None:
                 if line.startswith("WPA*"):
                     ctx.add_finding("hash", "WPA 22000 哈希", detail=line,
                                     level="good",
-                                    extra={"protocol": "wifi", "hash": line})
+                                    extra={"protocol": "wifi", "hash": line,
+                                           "mode": "22000"})
         else:
             ctx.report(f"{tool} 未生成哈希，可手动执行 wifi_hashcat.txt 中的命令",
                        "warn")

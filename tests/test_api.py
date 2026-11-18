@@ -1,6 +1,7 @@
 """HTTP API smoke tests (no browser, real tshark job)."""
 from __future__ import annotations
 
+import http.client
 import json
 import tempfile
 import threading
@@ -13,8 +14,10 @@ from unittest import mock
 
 from fnet.app import build
 from fnet.config import Config
+from fnet.crack import CrackTask
 from fnet.jobs import JobManager
-from fnet.webui.server import make_server
+from fnet.ntlmcrack_service import NtlmCrackTask
+from fnet.webui.server import SMB_HINT_FIELDS, empty_smb_hints, make_server
 
 DATA = Path(__file__).resolve().parent / "data"
 
@@ -75,6 +78,20 @@ class ApiTest(unittest.TestCase):
             headers={"Content-Type": "application/json"} if data else None)
         return status, json.loads(body.decode("utf-8"))
 
+    def run_job(self, pcap: str, features: list[str]) -> str:
+        """Submit a job through the shared app and wait until it is done."""
+        job = self.runtime.jobs.submit(pcap, features, {})
+        deadline = time.time() + 120
+        state = None
+        while time.time() < deadline:
+            status, payload = self.json_request(f"/api/jobs/{job.id}?cursor=0")
+            state = payload["job"]
+            if state["status"] in ("done", "error", "cancelled"):
+                break
+            time.sleep(0.1)
+        self.assertEqual(state["status"], "done", state and state["error"])
+        return job.id
+
     # -- tests ---------------------------------------------------------
     def test_health_is_public(self):
         status, body = self.request("/api/health", token=False)
@@ -88,7 +105,7 @@ class ApiTest(unittest.TestCase):
     def test_meta_payload(self):
         status, meta = self.json_request("/api/meta")
         self.assertEqual(status, 200)
-        self.assertEqual(len(meta["features"]), 46)
+        self.assertEqual(len(meta["features"]), 50)
         self.assertEqual(len(meta["categories"]), 13)
         self.assertEqual(meta["initial"], {"pcap": "", "features": []})
         self.assertIn("tshark", meta["tools"])
@@ -107,6 +124,178 @@ class ApiTest(unittest.TestCase):
             headers={"X-Filename": "evil.exe"})
         self.assertEqual(status, 400)
         self.assertIn("仅支持", json.loads(body)["error"])
+
+    def test_smb_decrypt_route(self):
+        status, meta = self.json_request("/api/meta")
+        self.assertEqual(status, 200)
+        self.assertIn("smb", meta)
+        self.assertIn("available", meta["smb"])
+
+        status, payload = self.json_request("/api/smb/decrypt",
+                                            {"job": "0123456789abcdef"})
+        self.assertEqual(status, 404)
+        self.assertFalse(payload["ok"])
+
+        job = self.runtime.jobs.submit(str(DATA / "smb2_deep.pcap"),
+                                       ["checkBox_49"], {})
+        deadline = time.time() + 120
+        state = None
+        while time.time() < deadline:
+            status, body = self.json_request(f"/api/jobs/{job.id}?cursor=0")
+            state = body["job"]
+            if state["status"] in ("done", "error", "cancelled"):
+                break
+            time.sleep(0.1)
+        self.assertEqual(state["status"], "done", state["error"])
+
+        status, payload = self.json_request("/api/smb/decrypt", {
+            "job": job.id, "password": "wrong", "nt_hash": "", "stream": "0"})
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(payload["error"])
+        self.assertEqual(payload["decrypted"], 0)
+
+    def test_smb_hints_route(self):
+        """GET /api/smb/hints answers with hints/sources/accounts/notes."""
+        job_id = self.run_job(str(DATA / "smb2_deep.pcap"), ["checkBox_49"])
+
+        status, meta = self.json_request("/api/meta")
+        self.assertEqual(status, 200)
+        self.assertIn("available", meta["smb"])
+        self.assertTrue(meta["smb"]["hints"])
+
+        status, payload = self.json_request(
+            f"/api/smb/hints?job={job_id}&stream=2")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["job"], job_id)
+        self.assertEqual(payload["stream"], "2")
+        for key in ("hints", "sources", "accounts", "notes", "cracked"):
+            self.assertIn(key, payload)
+        self.assertEqual(sorted(payload["hints"]), sorted(SMB_HINT_FIELDS))
+        self.assertEqual(sorted(payload["sources"]), sorted(SMB_HINT_FIELDS))
+        self.assertTrue(all(isinstance(value, str)
+                            for value in payload["hints"].values()))
+        self.assertTrue(all(isinstance(value, str)
+                            for value in payload["sources"].values()))
+        self.assertIsInstance(payload["accounts"], list)
+        self.assertIsInstance(payload["notes"], list)
+        self.assertIsInstance(payload["cracked"], list)
+
+        # The route sits behind the shared /api/ token check.
+        status, _ = self.request(f"/api/smb/hints?job={job_id}", token=False)
+        self.assertEqual(status, 403)
+
+        status, payload = self.json_request("/api/smb/hints")
+        self.assertEqual(status, 400)
+        self.assertIn("任务", payload["error"])
+
+        status, payload = self.json_request(
+            "/api/smb/hints?job=0123456789abcdef")
+        self.assertEqual(status, 404)
+        self.assertIn("任务不存在", payload["error"])
+
+    def test_smb_hints_lists_cracked_passwords(self):
+        """Cracked hashcat/NTLM tasks of the job are reported as plaintexts."""
+        job_id = self.run_job(str(DATA / "smb2_deep.pcap"), ["checkBox_49"])
+        hashcat = CrackTask(id="apicrack", job=job_id, seq=1, mode=5600,
+                            hash_line="winuser::LAB:4078a5505a450ffd:"
+                                      "fcb9156af9c94cf4c46d9110d09275b1:"
+                                      "0101000000000000",
+                            status="cracked", password="Passw0rd!")
+        running = CrackTask(id="apirun", job=job_id, seq=9, mode=5600,
+                            hash_line="guest::LAB:4078a5505a450ffd:"
+                                      "fcb9156af9c94cf4c46d9110d09275b1:"
+                                      "0101000000000000",
+                            status="running", password="still guessing")
+        local = NtlmCrackTask(id="apintlm", job=job_id, seq=2, user="svc",
+                              domain="CORP", challenge="4078a5505a450ffd",
+                              nt_response="ab" * 33, status="cracked",
+                              password="P@ssw0rd")
+        managers = ((hashcat, self.runtime.app.crack),
+                    (running, self.runtime.app.crack),
+                    (local, self.runtime.app.ntlmcrack))
+        for task, manager in managers:
+            with manager._lock:
+                manager._tasks[task.id] = task
+        try:
+            status, payload = self.json_request(f"/api/smb/hints?job={job_id}")
+            self.assertEqual(status, 200)
+            entries = {item["source"]: item for item in payload["cracked"]}
+            self.assertNotIn("still guessing",
+                             [item["password"] for item in payload["cracked"]])
+            self.assertEqual(sorted(item["seq"] for item in payload["cracked"]),
+                             [1, 2])
+            self.assertEqual(entries["hashcat -m 5600"]["password"],
+                             "Passw0rd!")
+            self.assertEqual(entries["hashcat -m 5600"]["user"], "winuser")
+            self.assertEqual(entries["hashcat -m 5600"]["domain"], "LAB")
+            self.assertEqual(entries["本地 NTLM 破解"]["password"], "P@ssw0rd")
+            self.assertEqual(entries["本地 NTLM 破解"]["user"], "svc")
+            self.assertEqual(entries["本地 NTLM 破解"]["domain"], "CORP")
+            self.assertEqual(entries["本地 NTLM 破解"]["mode"], 5600)
+            # ``stream`` mirrors the originating finding's ``extra.stream``.
+            _, findings = self.json_request(
+                f"/api/findings?job={job_id}&limit=1000000")
+            streams = {}
+            for item in findings["findings"]:
+                extra = item.get("extra") or {}
+                if isinstance(extra, dict) and extra.get("stream"):
+                    streams[item["seq"]] = str(extra["stream"])
+            for item in payload["cracked"]:
+                self.assertEqual(item["stream"],
+                                 streams.get(item["seq"], ""))
+        finally:
+            for _, manager in managers:
+                with manager._lock:
+                    for task_id in ("apicrack", "apirun", "apintlm"):
+                        manager._tasks.pop(task_id, None)
+
+    def test_smb_decrypt_without_any_secret_is_a_clean_error(self):
+        """An empty decrypt request never crashes: it is a 4xx JSON error."""
+        job_id = self.run_job(str(DATA / "smb2_deep.pcap"), ["checkBox_49"])
+        status, payload = self.json_request("/api/smb/decrypt", {"job": job_id})
+        self.assertIn(status, (200, 400))
+        self.assertIsInstance(payload["ok"], bool)
+        if not payload["ok"]:
+            self.assertTrue(payload["error"])
+
+        # With no clue to fall back on the message names the missing secret.
+        with mock.patch("fnet.webui.server.smb_hints_payload",
+                        return_value=empty_smb_hints()):
+            status, payload = self.json_request("/api/smb/decrypt",
+                                                {"job": job_id})
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertIn("缺少 NT 哈希、密码或会话密钥", payload["error"])
+
+    def test_smb_decrypt_autofills_hints_when_blank(self):
+        """A known plaintext is used (and logged) instead of asking the user."""
+        job_id = self.run_job(str(DATA / "smb2_deep.pcap"), ["checkBox_49"])
+        payload = empty_smb_hints()
+        payload["hints"]["password"] = "Passw0rd!"
+        payload["sources"]["password"] = "hashcat -m 5600"
+        payload["hints"]["user"] = "winuser"
+        payload["sources"]["user"] = "SMB NTLM 认证"
+        with mock.patch("fnet.webui.server.smb_hints_payload",
+                        return_value=payload):
+            status, body = self.json_request("/api/smb/decrypt", {"job": job_id})
+        self.assertEqual(status, 200)
+        self.assertIsInstance(body["ok"], bool)
+        self.assertIn("keys", body)
+        self.assertIsInstance(body["keys"], list)
+        self.assertIn("已自动填入：明文密码 来自 hashcat -m 5600", body["log"])
+        self.assertIn("已自动填入：账号 来自 SMB NTLM 认证", body["log"])
+
+        # A supplied secret keeps the old behaviour: hints are not consulted.
+        with mock.patch("fnet.webui.server.smb_hints_payload") as probe:
+            status, body = self.json_request("/api/smb/decrypt", {
+                "job": job_id, "password": "wrong", "stream": "0"})
+        probe.assert_not_called()
+        self.assertEqual(status, 200)
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["decrypted"], 0)
+        self.assertIn("keys", body)
 
     def test_upload_analyze_download(self):
         raw = (DATA / "http_ntlm.pcap").read_bytes()
@@ -140,11 +329,12 @@ class ApiTest(unittest.TestCase):
         self.assertIn("NetNTLMv1", logs)
         names = {item["name"] for item in payload["artifacts"]}
         self.assertIn("ntlm_hashes.txt", names)
-        self.assertIn("report.txt", names)
-        self.assertIn("report.md", names)
-        self.assertIn("report.html", names)
         self.assertIn("findings.json", names)
         self.assertIn("findings.csv", names)
+        # Reports are exported from the result view, not listed as artifacts.
+        self.assertNotIn("report.txt", names)
+        self.assertNotIn("report.md", names)
+        self.assertNotIn("report.html", names)
 
         status, payload = self.json_request(f"/api/findings?job={job['id']}")
         self.assertEqual(status, 200)
@@ -332,6 +522,34 @@ class ApiTest(unittest.TestCase):
 
         status, payload = self.json_request(f"/api/history/{job_id}")
         self.assertEqual(status, 404)
+
+    def test_bodyless_post_keeps_keepalive_clean(self):
+        """A POST answered without reading its body must not poison the next request.
+
+        ``protocol_version`` is HTTP/1.1, so the WebUI reuses one connection for
+        ``POST /api/history/<id>/delete`` (body ``{}``) followed by
+        ``GET /api/history``.  The unread ``{}`` used to be parsed as the next
+        request line (``{}GET /api/history``), which the server answered 501.
+        """
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=30)
+        try:
+            connection.request(
+                "POST", "/api/history/0123456789abcdef/delete", body=b"{}",
+                headers={"X-Fnet-Token": self.token,
+                         "Content-Type": "application/json"})
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 200)
+
+            connection.request("GET", "/api/history",
+                               headers={"X-Fnet-Token": self.token})
+            response = connection.getresponse()
+            body = response.read()
+            self.assertEqual(response.status, 200, body)
+            self.assertTrue(json.loads(body)["ok"])
+        finally:
+            connection.close()
 
     def test_batch_queue_and_jobs_listing(self):
         raw = (DATA / "http_ntlm.pcap").read_bytes()

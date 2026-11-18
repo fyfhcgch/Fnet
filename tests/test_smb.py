@@ -156,6 +156,36 @@ class SmbParseTest(unittest.TestCase):
         self.assertEqual(message.original_size, 4096)
         self.assertEqual(message.session_id, 7)
 
+    def test_transform_header_fields(self):
+        payload = (smb.SMB3_TRANSFORM + b"\x11" * 16 + b"\x22" * 16
+                   + (4096).to_bytes(4, "little") + b"\x00\x00"
+                   + b"\x01\x00" + (7).to_bytes(8, "little") + b"cipher")
+        message = smb.parse_messages(nbss(payload))[0]
+        self.assertEqual(message.signature, b"\x11" * 16)
+        self.assertEqual(message.nonce, b"\x22" * 16)
+        self.assertEqual(message.transform_flags, 1)
+        self.assertEqual(message.raw, payload)
+
+    def test_ntlm_type3_fields(self):
+        nt = b"\xaa" * 16 + b"\xbb" * 32
+        blob = bytearray(b"NTLMSSP\x00" + (3).to_bytes(4, "little")
+                         + b"\x00" * 52)
+        offset = 64
+        for (length_at, offset_at), value in zip(
+                ((36, 40), (28, 32), (20, 24)),
+                (b"a\x00l\x00", b"L\x00", nt)):
+            struct.pack_into("<HHI", blob, length_at, len(value), len(value),
+                             offset)
+            offset += len(value)
+        struct.pack_into("<I", blob, 60, 0x00088235)
+        message = smb.find_ntlm_type3(bytes(blob) + b"a\x00l\x00L\x00" + nt)
+        self.assertEqual(message["user"], "al")
+        self.assertEqual(message["domain"], "L")
+        self.assertEqual(message["nt"], nt)
+        self.assertEqual(message["nt_proof"], nt[:16])
+        self.assertEqual(message["flags"], 0x00088235)
+        self.assertEqual(smb.find_ntlm_type3(b"nothing"), {})
+
     def test_compressed_transform(self):
         payload = (smb.SMB3_COMPRESSED + (2048).to_bytes(4, "little")
                    + b"\x01\x00" + b"\x00\x00" + b"\x00" * 8)

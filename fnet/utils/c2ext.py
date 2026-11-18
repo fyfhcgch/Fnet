@@ -12,7 +12,8 @@ Sliver (BishopFox/sliver)
     * DNS beacon: messages are protobuf ``DNSMessage`` blobs encoded into
       subdomains with a modified Base32 (``ab1c2d3e4f5g6h7j8k9m0npqrtuvwxyz``)
       or the bitcoin Base58 alphabet;
-    * session payloads are AES-GCM (nonce = first 12 bytes of the blob);
+    * session payloads use AES-GCM in legacy <=1.4 builds; v1.5/v1.6 use
+      ChaCha20-Poly1305 (see :mod:`fnet.utils.sliver_c2`);
     * mTLS implants use ECDSA certificates with a CN-only subject and a
       clientAuth-only EKU — see :func:`sliver_mtls_cert_profile`.
 
@@ -27,16 +28,19 @@ Meterpreter (metasploit)
       use a 12-byte header without GUID/flags.  Encrypted packets are
       AES-CBC with a leading IV (flag 1 = AES-256, 2 = AES-128).
 
-Decryption is only attempted when the matching symmetric session key is
-supplied (handler parameter), mirroring the Cobalt Strike handler's fallback
-of keeping candidate blobs as artifacts.
+Meterpreter wire parsing/decryption is implemented in
+:mod:`fnet.utils.meterpreter_wire`; the compatibility functions in this module
+delegate to it.  Decryption is only attempted when the matching symmetric
+session key is supplied (handler parameter), mirroring the Cobalt Strike
+handler's fallback of keeping candidate blobs as artifacts.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
 
-from fnet.utils.crypto import aes_cbc_decrypt, aes_gcm_decrypt
+from fnet.utils import meterpreter_wire
+from fnet.utils.crypto import aes_gcm_decrypt
 
 # ---------------------------------------------------------------------------
 # Meterpreter staging
@@ -269,90 +273,25 @@ def _decode_at(data: bytes, offset: int) -> MPacket | None:
     return None
 
 
-def iter_packets(data: bytes, scan_limit: int = 4096) -> list[MPacket]:
-    """Walk concatenated XOR-obfuscated meterpreter packets.
-
-    Leading junk (staging banners, partial captures) is skipped by scanning
-    forward at most ``scan_limit`` bytes before the first packet.
-    """
-    packets: list[MPacket] = []
-    offset = 0
-    scanned = 0
-    while offset + LEGACY_HEADER_SIZE <= len(data):
-        packet = _decode_at(data, offset)
-        if packet is None:
-            if packets or scanned >= scan_limit:
-                break
-            offset += 1
-            scanned += 1
-            continue
-        packets.append(packet)
-        offset += packet.total
-        scanned = 0
-    return packets
-
-
 def iter_packets(data: bytes, key: bytes | None = None,
-                 scan_limit: int = 4096) -> list[MPacket]:
-    """Walk concatenated XOR-obfuscated meterpreter packets.
+                 scan_limit: int = 4096) -> list:
+    """兼容入口：解析结果由 :mod:`fnet.utils.meterpreter_wire` 提供。
 
-    Leading junk (staging banners, partial captures) is skipped by scanning
-    forward at most ``scan_limit`` bytes before the first packet.  When a
-    symmetric session ``key`` is supplied, AES-CBC encrypted packets (encrypt
-    flag 1/2, IV = first 16 bytes of the body) are decrypted and their nested
-    TLVs parsed; without a key they are kept as ciphertext candidates.
+    新代码应使用 ``meterpreter_wire.iter_packets``；这里保留旧模块的函数名，
+    避免历史调用方和单元测试继续依赖本文件中过时的重复解析器。
     """
-    packets: list[MPacket] = []
-    offset = 0
-    scanned = 0
-    while offset + LEGACY_HEADER_SIZE <= len(data):
-        packet = _decode_at(data, offset)
-        if packet is None:
-            if packets or scanned >= scan_limit:
-                break
-            offset += 1
-            scanned += 1
-            continue
-        if packet.encrypted and key:
-            plain = decrypt_packet_body(data, packet, key)
-            if plain is not None:
-                packet.plaintext = plain
-        if packet.plaintext:
-            packet.tlvs = _walk_tlvs(packet.plaintext, 0)
-            for tlv in packet.tlvs:
-                if tlv["name"] == "COMMAND_ID":
-                    packet.command_id = int.from_bytes(tlv["raw"][:4], "big")
-        packets.append(packet)
-        offset += packet.total
-        scanned = 0
-    return packets
+    return meterpreter_wire.iter_packets(data, key=key, scan_limit=scan_limit)
 
 
 def decrypt_packet_body(data: bytes, packet: MPacket,
                         key: bytes) -> bytes | None:
-    """AES-CBC decrypt one encrypted packet and return the TLV stream."""
-    if not packet.encrypted or not key:
-        return None
-    if packet.encrypt_flags == ENC_FLAG_AES256 and len(key) != 32:
-        return None
-    if packet.encrypt_flags == ENC_FLAG_AES128 and len(key) != 16:
-        return None
-    if packet.version == "modern":
-        start = packet.offset + MODERN_HEADER_SIZE
-    else:
-        start = packet.offset + LEGACY_HEADER_SIZE
-    body = _xor_bytes(data[start:packet.offset + packet.total],
-                      packet.xor_key)
-    if len(body) < 17:
-        return None
-    return aes_cbc_decrypt(body[16:], key, body[:16], unpad=False)
+    """兼容入口：AES-CBC 解密单个报文体，失败返回 ``None``。"""
+    return meterpreter_wire.decrypt_packet_body(data, packet, key)
 
 
 def looks_like_xor_meterpreter(data: bytes) -> bool:
-    """Detection callback for :func:`fnet.features.common.protocol_streams`."""
-    if not data or len(data) < MODERN_HEADER_SIZE:
-        return False
-    return bool(iter_packets(data))
+    """协议识别回调：由严格的新解析器判断是否存在合法 meterpreter 报文。"""
+    return meterpreter_wire.looks_like_xor_meterpreter(data)
 
 
 # ---------------------------------------------------------------------------

@@ -2,10 +2,10 @@
 layout: page
 title: 功能清单
 permalink: /manual/features/
-description: Fnet 46 项分析功能与附加处理器的用途、复选框编号和依赖。
+description: Fnet 50 项分析功能与附加处理器的用途、复选框编号和依赖。
 ---
 
-Fnet 有 **46 个复选框功能**，按 **13 个分类**组织；另有若干不带复选框的深度
+Fnet 有 **50 个复选框功能**，按 **13 个分类**组织；另有若干不带复选框的深度
 处理器，用 `--features` 或“专项功能”菜单调用。★ 表示默认勾选。
 
 想按赛题类型挑选功能，可以直接看文末的[选择建议](#选择建议)。
@@ -49,7 +49,7 @@ Webshell 解密（冰蝎 3.x/4.x、哥斯拉、蚁剑、菜刀、内存马）没
 | Cobalt Strike流量分析 | `checkBox_15` | beacon 元数据与任务解密，需要 `.cobaltstrike.beacon_keys` |
 | WINRM流量解密 | `checkBox_43` | 用 NTLM hash 或密码还原 WinRM 认证与命令 |
 | Meterpreter会话分析 | `checkBox_55` | Meterpreter/metsvc TCP TLV 会话识别，提取命令 ID、字符串参数与时间线 |
-| Sliver/meterpreter C2扩展 | `checkBox_56` | Sliver HTTP/DNS/mTLS beacon 识别与 meterpreter staging/加密传输分析；`sliver_session_key` / `meterpreter_symkey` 解密会话载荷，`sliver_dns_domain` 指定已知 DNS beacon 域名 |
+| Sliver/meterpreter C2扩展 | `checkBox_56` | Sliver HTTP/DNS/mTLS beacon 识别（v1.6 ChaCha20-Poly1305 与签名前缀/gzip、v1.5/旧版 AES-GCM 回退、密钥交换、流量编码器）与 meterpreter staging/AES-128/256-CBC wire 分析；`sliver_session_key`（32/16 字节 hex）/ `meterpreter_symkey`（16=AES-128、32=AES-256 hex）解密会话载荷，`sliver_dns_domain` 指定已知 DNS beacon 域名 |
 
 ## 认证与凭据（2）
 
