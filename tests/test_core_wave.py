@@ -452,7 +452,7 @@ class PathsEnvContractTest(unittest.TestCase):
             self.assertTrue(paths.DEFAULT_CONFIG.is_file())
 
     def test_ensure_dirs_creates_layout(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as base:
+        with tempfile.TemporaryDirectory() as base:
             home = Path(base) / "nested" / "home"
             with _EnvReloader(FNET_HOME=str(home)) as paths:
                 paths.ensure_dirs()

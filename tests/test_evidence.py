@@ -252,6 +252,10 @@ class ExtractTest(unittest.TestCase):
             evidence.parse_timestamp("2026-01-01 10:00:00"), base, delta=0.01)
         self.assertAlmostEqual(
             evidence.parse_timestamp("2026-01-01T10:00:00Z"), base, delta=0.01)
+        # Python 3.10 的 fromisoformat 不接受无冒号时区；带偏移的时间也必须按原偏移换算。
+        self.assertAlmostEqual(
+            evidence.parse_timestamp("2026-01-01T18:00:00+0800"), base,
+            delta=0.01)
         self.assertEqual(evidence.parse_timestamp("nonsense"), None)
         self.assertEqual(evidence.parse_timestamp(""), None)
         self.assertEqual(evidence.parse_timestamp(None), None)

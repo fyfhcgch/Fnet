@@ -67,8 +67,10 @@ def _as_port(value) -> int | None:
 
 
 def _epoch_from_naive(stamp: _dt.datetime) -> float:
-    """Treat naive timestamps as UTC so all epochs share one time base."""
-    return stamp.replace(tzinfo=_dt.timezone.utc).timestamp()
+    """Naive 时间按 UTC 处理；带时区的 datetime 保留其原始偏移。"""
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=_dt.timezone.utc)
+    return stamp.timestamp()
 
 
 def parse_timestamp(value) -> float | None:
@@ -90,7 +92,15 @@ def parse_timestamp(value) -> float | None:
         return float(text)
     except ValueError:
         pass
-    candidate = text.replace("Z", "+00:00")
+    candidate = text
+    if candidate[-1:] in ("Z", "z"):
+        candidate = candidate[:-1] + "+00:00"
+    # Python 3.10 的 datetime.fromisoformat 不接受 "+0000"/"+00" 这种紧凑偏移，
+    # 3.11+ 才放宽；这里统一补成 "+00:00"，仅在含时间（冒号）的字符串上处理，
+    # 避免把日期 "2026-01-01" 的 "-01" 误当成时区。
+    if ":" in candidate:
+        candidate = re.sub(r"([+-])(\d{2})(\d{2})$", r"\1\2:\3", candidate)
+        candidate = re.sub(r"([+-])(\d{2})$", r"\1\2:00", candidate)
     try:
         return _epoch_from_naive(_dt.datetime.fromisoformat(candidate))
     except ValueError:
