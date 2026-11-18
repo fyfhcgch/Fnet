@@ -32,6 +32,24 @@ from fnet.logger import logger
 from fnet.paths import USER_CONFIG
 
 
+def _ensure_utf8_streams() -> None:
+    """确保 CLI 的中文输出在 Windows/cp1252 控制台不 crash。
+
+    GitHub Actions 的 Windows runner 默认 stdout 编码是 cp1252；直接 ``print``
+    中文会抛 ``UnicodeEncodeError``。Python 3.7+ 的文本流支持 ``reconfigure``，
+    对 StringIO 等测试流则没有该属性，这里统一做兼容处理。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            # 某些被包裹/关闭的流无法重配；此时保持原样，不让诊断命令失败。
+            pass
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fnet",
@@ -387,6 +405,7 @@ def run_pcapoip(args, runtime) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _ensure_utf8_streams()
     parser = build_parser()
     args = parser.parse_args(argv)
 

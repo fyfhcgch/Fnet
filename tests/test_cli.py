@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import contextlib
 import io
+import sys
 import unittest
+from unittest import mock
 
 from fnet import __version__
 from fnet.cli import (
     _collect_params,
+    _ensure_utf8_streams,
     build_parser,
     list_features,
     main,
@@ -123,6 +126,34 @@ class ListFeaturesTest(unittest.TestCase):
             self.assertIn(feature.checkbox, output)
             self.assertIn(feature.title, output)
         self.assertIn("* = 默认勾选", output)
+
+
+class Utf8ConsoleTest(unittest.TestCase):
+    """Windows cp1252 控制台下中文输出不应触发 UnicodeEncodeError。"""
+
+    def test_main_reconfigures_stdout_and_stderr(self):
+        class Stream(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self.calls = []
+
+            def reconfigure(self, **kwargs):
+                self.calls.append(kwargs)
+
+        out, err = Stream(), Stream()
+        with mock.patch.object(sys, "stdout", out), \
+                mock.patch.object(sys, "stderr", err):
+            self.assertEqual(main(["--version"]), 0)
+        expected = {"encoding": "utf-8", "errors": "replace"}
+        self.assertIn(expected, out.calls)
+        self.assertIn(expected, err.calls)
+
+    def test_streams_without_reconfigure_are_tolerated(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["--version"]), 0)
+        self.assertIn(f"Fnet {__version__}", buffer.getvalue())
 
 
 class MainEarlyExitTest(unittest.TestCase):
