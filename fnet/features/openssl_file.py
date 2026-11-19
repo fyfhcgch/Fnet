@@ -67,6 +67,10 @@ def _file_candidates(ctx: FeatureContext) -> tuple[list[tuple[str, bytes]], list
     ``openssl_enc.looks_like_generated_text`` 负责识别 Fnet 自己写出的
     ``c2_README.txt`` / ``*_README.txt`` / ``findings.json`` / ``report*.md`` /
     ``job.json`` 等文件；这些文件绝不能混进“疑似加密文件”发现。
+
+    ``icmp_tunnel_*.bin`` 及其解密/解压产物（``*_decoded.*`` 等）由
+    ``flows.icmp`` 的载荷分层分析覆盖（解密尝试、命令指引都在那条
+    finding 里），这里跳过以免对同一密文重复告警。
     """
     candidates: list[tuple[str, bytes]] = []
     skipped: list[str] = []
@@ -77,6 +81,10 @@ def _file_candidates(ctx: FeatureContext) -> tuple[list[tuple[str, bytes]], list
                 continue
             data = _read_bytes(path)
             if not data:
+                continue
+            # ICMP 隧道载荷及其分析产物已由 flows.icmp 分层分析覆盖。
+            if path.name.startswith("icmp_tunnel_"):
+                skipped.append(path.name)
                 continue
             if openssl_enc.looks_like_generated_text(path.name, data):
                 skipped.append(path.name)
@@ -89,7 +97,10 @@ def _file_candidates(ctx: FeatureContext) -> tuple[list[tuple[str, bytes]], list
         if p.is_file():
             data = _read_bytes(p)
             if data:
-                if openssl_enc.looks_like_generated_text(p.name, data):
+                if p.name.startswith("icmp_tunnel_"):
+                    # 与落盘候选一致：ICMP 载荷分析已覆盖，不再重复告警。
+                    skipped.append(p.name)
+                elif openssl_enc.looks_like_generated_text(p.name, data):
                     skipped.append(p.name)
                 elif p.name not in {name for name, _ in candidates}:
                     candidates.append((p.name, data))

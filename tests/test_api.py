@@ -574,6 +574,43 @@ class ApiTest(unittest.TestCase):
         labels = {item["label"] for item in payload["candidates"]}
         self.assertIn("Base64", labels)
 
+    def test_payload_crack_endpoint(self):
+        from fnet.utils.crypto import aes_cbc_encrypt
+        from fnet.utils.openssl_enc import derive_key_iv
+
+        job_id = self.run_job(str(DATA / "http_ntlm.pcap"), ["checkBox_10"])
+        job = self.runtime.jobs.get(job_id)
+        plain = b"flag{payload_crack_endpoint}\n" * 4
+        key, iv = derive_key_iv("icmp", b"", key_len=16, iv_len=16,
+                                kdf="evp", digest="md5")
+        (job.output_dir / "icmp_tunnel_test.bin").write_bytes(
+            aes_cbc_encrypt(plain, key, iv))
+
+        status, payload = self.json_request("/api/payload/crack", {
+            "job": job_id, "path": "icmp_tunnel_test.bin",
+            "password": "icmp", "cipher": "aes-128-cbc",
+            "digest": "md5", "salted": False,
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["hit"])
+        self.assertIn("flag{payload_crack_endpoint}", payload["flags"])
+        self.assertEqual(payload["saved"], "icmp_tunnel_test_decoded.txt")
+        self.assertTrue((job.output_dir / payload["saved"]).is_file())
+
+        status, miss = self.json_request("/api/payload/crack", {
+            "job": job_id, "path": "icmp_tunnel_test.bin",
+            "password": "wrong", "cipher": "aes-128-cbc",
+            "digest": "md5", "salted": False,
+        })
+        self.assertEqual(status, 200)
+        self.assertFalse(miss["hit"])
+        self.assertEqual(miss["attempts"], 1)
+
+        status, denied = self.json_request("/api/payload/crack", {
+            "job": job_id, "path": "../config.ini",
+        })
+        self.assertEqual(status, 404)
+
     def test_config_save_and_read(self):
         status, payload = self.json_request("/api/config", {
             "section": "config", "values": {"winrm_port": "5986"}})

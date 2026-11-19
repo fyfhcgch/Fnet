@@ -300,6 +300,46 @@ class HandlerNoiseSuppressionTest(unittest.TestCase):
         self.assertEqual(ctx.findings, [])
 
 
+class HandlerIcmpTunnelSkipTest(unittest.TestCase):
+    """icmp_tunnel_*.bin 及其产物由 flows.icmp 载荷分析覆盖，这里必须跳过。"""
+
+    def test_icmp_tunnel_artifacts_are_skipped(self):
+        from fnet.features.openssl_file import detect_encrypted_files
+
+        blob = _pbkdf2_cbc_blob("pw", b"\x55" * 8, os.urandom(512))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "icmp_tunnel_1.2.3.4_5.6.7.8.bin").write_bytes(blob)
+            (root / "icmp_tunnel_1.2.3.4_5.6.7.8_decoded.txt").write_text(
+                "plain text artifact" * 20, encoding="utf-8")
+            (root / "secret.enc").write_bytes(blob)
+            ctx = _FakeCtx(output_dir=root, params={})
+            detect_encrypted_files(ctx)
+            summaries = ctx.summaries()
+            # 普通 secret.enc 仍然产生发现
+            self.assertTrue(any("secret.enc" in s for s in summaries),
+                            summaries)
+            # ICMP 隧道载荷及其产物不再重复告警
+            self.assertFalse(any("icmp_tunnel" in s for s in summaries),
+                             summaries)
+            # 跳过清单里有中文日志说明
+            self.assertTrue(any("icmp_tunnel" in text and "跳过" in text
+                                for text, _ in ctx.reports),
+                            ctx.log_text())
+
+    def test_icmp_tunnel_bin_via_path_param_is_skipped(self):
+        from fnet.features.openssl_file import detect_encrypted_files
+
+        blob = _pbkdf2_cbc_blob("pw", b"\x66" * 8, os.urandom(512))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bin_path = root / "icmp_tunnel_10.0.0.1_10.0.0.2.bin"
+            bin_path.write_bytes(blob)
+            ctx = _FakeCtx(output_dir=root / "out", params={"path": str(bin_path)})
+            detect_encrypted_files(ctx)
+            self.assertEqual(ctx.findings, [], ctx.summaries())
+
+
 class HandlerDecryptTest(unittest.TestCase):
     def _run(self, root: Path, params: dict) -> _FakeCtx:
         from fnet.features.openssl_file import detect_encrypted_files

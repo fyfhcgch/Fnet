@@ -75,6 +75,14 @@
       ann_status: "标注状态", ann_none: "无标注",
       ann_confirmed: "已确认", ann_false_positive: "误报", ann_starred: "星标",
       ann_note: "备注", ann_save: "保存标注", ann_saved: "标注已保存",
+      decode_panel_title: "检测到疑似编码串", decode_run: "一键解码",
+      decode_copy: "复制结果", decode_cyberchef: "在 CyberChef 中打开",
+      decode_cyberchef_opened: "已在浏览器中打开 CyberChef",
+      decode_running: "解码中…", decode_failed: "解码失败",
+      decode_no_result: "没有找到可读的解码结果。",
+      decode_copied: "解码结果已复制",
+      decode_copy_failed: "复制失败，请手动选择文本",
+      decode_chars: "字符",
       replay_button: "生成重放脚本", replay_title: "攻击重放脚本",
       replay_running: "正在生成重放脚本…", replay_copied: "重放脚本已复制到剪贴板",
       replay_close: "关闭",
@@ -142,6 +150,34 @@
       smb_field_original_size: "原始大小", smb_field_security_mode: "签名策略",
       smb_field_capabilities: "能力标志", smb_field_artifact: "产出文件",
       smb_encrypted_hint: "该结果来自加密流量；填入凭据后可还原明文、文件与 flag。",
+      flag_bar_title: "发现 {count} 个 Flag", flag_copy: "复制",
+      flag_copied: "Flag 已复制", flag_copy_failed: "复制失败，请手动选择文本",
+      flag_banner_title: "Flag", flag_banner_label: "Flag：",
+      payload_title: "载荷", payload_download: "下载载荷",
+      payload_preview_title: "载荷预览",
+      payload_preview_empty: "载荷为二进制，无文本预览",
+      payload_copied: "载荷预览已复制",
+      payload_crack: "破解", payload_crack_hide: "收起",
+      payload_password: "口令",
+      payload_password_ph: "题目给出的口令（留空则自动尝试常见口令）",
+      payload_passwords: "候选口令",
+      payload_passwords_ph: "候选口令，每行一个（可选）",
+      payload_cipher: "算法", payload_digest: "摘要", payload_salted: "盐",
+      payload_auto: "自动",
+      payload_salted_auto: "自动",
+      payload_salted_yes: "有盐（Salted__）",
+      payload_salted_no: "无盐（-nosalt）",
+      payload_base64: "载荷是 Base64 文本",
+      payload_run: "开始破解", payload_running: "破解中…",
+      payload_hit: "解密成功", payload_password_hit: "口令",
+      payload_recipe: "配方", payload_saved: "已保存",
+      payload_copy_plain: "复制明文",
+      payload_plain_copied: "明文已复制",
+      payload_download_decoded: "下载解密文件",
+      payload_plaintext: "明文预览",
+      payload_miss: "已尝试 {count} 种配方，未找到可读明文",
+      payload_failed: "破解失败",
+      payload_need_job: "还没有可破解的分析任务",
       topo_hint: "点击节点可按该端点过滤分析结果；连线按协议着色。",
     },
     en: {
@@ -165,6 +201,14 @@
       ann_confirmed: "Confirmed", ann_false_positive: "False positive",
       ann_starred: "Starred",
       ann_note: "Note", ann_save: "Save annotation", ann_saved: "Annotation saved",
+      decode_panel_title: "Suspected encoded strings", decode_run: "Decode",
+      decode_copy: "Copy result", decode_cyberchef: "Open in CyberChef",
+      decode_cyberchef_opened: "CyberChef opened in the browser",
+      decode_running: "Decoding…", decode_failed: "Decode failed",
+      decode_no_result: "No readable decoded result.",
+      decode_copied: "Decoded result copied",
+      decode_copy_failed: "Copy failed; select the text manually",
+      decode_chars: "chars",
       replay_button: "Replay script", replay_title: "Replay script",
       replay_running: "Generating replay script…",
       replay_copied: "Replay script copied to clipboard",
@@ -238,6 +282,34 @@
       smb_field_original_size: "Original size", smb_field_security_mode: "Signing policy",
       smb_field_capabilities: "Capabilities", smb_field_artifact: "Artifact",
       smb_encrypted_hint: "This finding comes from encrypted traffic; supply credentials to recover plaintext, files and flags.",
+      flag_bar_title: "Found {count} flag(s)", flag_copy: "Copy",
+      flag_copied: "Flag copied", flag_copy_failed: "Copy failed; select the text manually",
+      flag_banner_title: "Flag", flag_banner_label: "Flag: ",
+      payload_title: "Payload", payload_download: "Download payload",
+      payload_preview_title: "Payload preview",
+      payload_preview_empty: "Binary payload; no text preview",
+      payload_copied: "Payload preview copied",
+      payload_crack: "Crack", payload_crack_hide: "Hide",
+      payload_password: "Password",
+      payload_password_ph: "Password from the challenge (leave empty to try common ones)",
+      payload_passwords: "Candidate passwords",
+      payload_passwords_ph: "Candidate passwords, one per line (optional)",
+      payload_cipher: "Cipher", payload_digest: "Digest", payload_salted: "Salt",
+      payload_auto: "Auto",
+      payload_salted_auto: "Auto",
+      payload_salted_yes: "Salted (Salted__)",
+      payload_salted_no: "Unsalted (-nosalt)",
+      payload_base64: "Payload is Base64 text",
+      payload_run: "Start cracking", payload_running: "Cracking…",
+      payload_hit: "Decrypted", payload_password_hit: "Password",
+      payload_recipe: "Recipe", payload_saved: "Saved",
+      payload_copy_plain: "Copy plaintext",
+      payload_plain_copied: "Plaintext copied",
+      payload_download_decoded: "Download decrypted file",
+      payload_plaintext: "Plaintext preview",
+      payload_miss: "Tried {count} recipe(s), no readable plaintext found",
+      payload_failed: "Crack failed",
+      payload_need_job: "No analysis job available",
       topo_hint: "Click a node to filter findings by that endpoint; links are colored by protocol.",
     },
   };
@@ -2137,6 +2209,7 @@
   function renderFindings() {
     const box = $("#findings");
     if (!box) return;
+    renderFlagBar();
     state.findingsVisible = sortedFindings().filter(findingMatches);
     const total = state.findings.length;
     const page = pageSlice(state.findingsVisible);
@@ -2200,6 +2273,101 @@
       (match) => `<mark>${match}</mark>`);
   }
 
+  /* ------------------------------------------------------- flags & payload */
+  // findings.make() 会把 extra 的值统一 str()，列表会变成 "['flag{a}']" 这种
+  // Python repr；这里同时接受数组、`、`/`,` 分隔串和带引号的 repr。
+  function parseFlagValue(value) {
+    if (Array.isArray(value)) {
+      return value.map((entry) => String(entry ?? "").trim()).filter(Boolean);
+    }
+    let text = String(value ?? "").trim();
+    if (!text) return [];
+    if (/^[\[(].*[\])]$/.test(text)) text = text.slice(1, -1);
+    return text.split(/[、,，]/)
+      .map((entry) => entry.trim().replace(/^['"]+|['"]+$/g, "").trim())
+      .filter(Boolean);
+  }
+
+  function findingFlagList(item) {
+    const out = [];
+    const seen = new Set();
+    const push = (flag) => {
+      const text = String(flag ?? "").trim();
+      if (!text || seen.has(text)) return;
+      seen.add(text);
+      out.push(text);
+    };
+    if (item && item.kind === "flag") push(item.summary);
+    parseFlagValue(item && item.extra && item.extra.flags).forEach(push);
+    return out;
+  }
+
+  // 汇总条：kind=flag 的 summary 优先，extra.flags 兜底；去重保序，
+  // 有 seq 的 chip 可以打开对应结果，没有 seq 的只提供复制。
+  function collectFindingFlags() {
+    const seen = new Set();
+    const out = [];
+    const push = (flag, seq) => {
+      const text = String(flag ?? "").trim();
+      if (!text || seen.has(text)) return;
+      seen.add(text);
+      out.push({ flag: text, seq: seq == null ? "" : String(seq) });
+    };
+    const items = state.findings || [];
+    // kind=flag 的条目优先，保证同名 flag 的 chip 仍能打开对应结果。
+    items.forEach((item) => {
+      if (item.kind !== "flag") return;
+      const seq = item.seq == null ? "" : String(item.seq);
+      push(item.summary, seq);
+    });
+    items.forEach((item) => {
+      parseFlagValue(item.extra && item.extra.flags)
+        .forEach((flag) => push(flag, ""));
+    });
+    return out;
+  }
+
+  async function copyFlagText(text) {
+    try {
+      await navigator.clipboard.writeText(String(text || ""));
+      toast(t("flag_copied"), "good", 1600);
+    } catch (error) {
+      toast(t("flag_copy_failed"), "warn");
+    }
+  }
+
+  function renderFlagBar() {
+    const bar = $("#flag-bar");
+    if (!bar) return;
+    const flags = collectFindingFlags();
+    if (!flags.length) {
+      bar.classList.add("hidden");
+      bar.innerHTML = "";
+      return;
+    }
+    bar.classList.remove("hidden");
+    const title = t("flag_bar_title").replace("{count}", String(flags.length));
+    const items = flags.map((entry) => {
+      const seqAttr = entry.seq ? ` data-flag-seq="${esc(entry.seq)}"` : "";
+      return `<span class="flag-chip"${seqAttr}>${esc(entry.flag)}</span>`
+        + `<button type="button" class="ghost small flag-copy"`
+        + ` data-flag-copy="${esc(entry.flag)}">${esc(t("flag_copy"))}</button>`;
+    }).join("");
+    bar.innerHTML = `<div class="flag-bar-head">${esc(title)}</div>`
+      + `<div class="flag-bar-items">${items}</div>`;
+  }
+
+  function flagBannerHtml(flags) {
+    if (!flags || !flags.length) return "";
+    const rows = flags.map((flag) => `
+      <div class="flag-banner-row">
+        <span class="flag-banner-title">${esc(t("flag_banner_label"))}</span>
+        <code class="mono flag-banner-code">${highlightFlags(esc(flag))}</code>
+        <button type="button" class="ghost small" data-flag-copy="${esc(flag)}">${esc(t("flag_copy"))}</button>
+      </div>`).join("");
+    return `<div class="flag-banner">${rows}</div>`;
+  }
+
   const SMB_FIELD_ORDER = [
     "smb", "stream", "client", "server", "dialect", "session_id",
     "account", "user", "domain", "workstation", "auth", "hash", "mode",
@@ -2243,6 +2411,458 @@
     return Boolean(item && item.extra && item.extra.protocol === "smb2");
   }
 
+  /* ------------------------------------------------- encoded string probe */
+  // 从 finding 自由文本里找出疑似 Base64 / Hex / URL 编码的串，供结果详情
+  // 弹窗的“一键解码”使用。这里只做格式与可解码性判断，不发请求。
+  const DECODE_PROBE_TEXT_LIMIT = 8192; // 超过 8KB 的文本只取第一个命中
+  const DECODE_PROBE_MAX_HITS = 6;      // 弹窗里最多展示几组解码按钮
+  const DECODE_PROBE_MIN_TOKEN = 6;     // 短于 6 字符不值得出一个按钮
+
+  // 按字符集取“最大连续段”：天然排除两侧标点、中文括号等分隔符。
+  // 不用 lookbehind（老 Safari 会在解析阶段直接抛错），用捕获组 + 前瞻。
+  function decodeProbeRuns(source, charset, minLen) {
+    const re = new RegExp(
+      `(^|[^${charset}])([${charset}]{${minLen},})(?=[^${charset}]|$)`, "g");
+    const out = [];
+    let match;
+    while ((match = re.exec(source)) !== null) {
+      out.push(match[2]);
+    }
+    return out;
+  }
+
+  // Hex：≥16 位纯十六进制（charset 由 run 提取保证，这里补全量校验以供
+  // Base64 分支复用）且长度为偶数；要求至少出现一个 a-f，
+  // 否则一串手机号 / 快递单号也会被当成密文。
+  function decodeProbeHexLooksValid(token) {
+    return /^[0-9a-fA-F]+$/.test(token) && token.length % 2 === 0
+      && /[a-fA-F]/.test(token);
+  }
+
+  // Base64（含 URL-safe 变体）：必须真的能解出文本才算命中。两条标准：
+  // 1) 解码字节基本是合法 UTF-8（乱码表现为 U+FFFD，以此滤掉恰好落在
+  //    Base64 字符集里的普通长单词）；
+  // 2) 或 ≥85% 为可打印 ASCII（hexdump / 纯文本式二进制载荷）。
+  function decodeProbeBase64LooksValid(token) {
+    if (decodeProbeHexLooksValid(token)) return false; // 纯 hex 交给 Hex 分支
+    const body = token.replace(/=+$/, "");
+    if (body.length % 4 === 1) return false; // 去掉补位后长度不可能成立
+    let raw = "";
+    try {
+      const normalized = body.replace(/-/g, "+").replace(/_/g, "/");
+      raw = atob(normalized + "=".repeat((4 - normalized.length % 4) % 4));
+    } catch (error) {
+      return false;
+    }
+    if (raw.length < 6) return false;
+    try {
+      const bytes = Uint8Array.from(raw, (ch) => ch.charCodeAt(0) & 0xff);
+      let printable = 0;
+      for (let i = 0; i < bytes.length; i += 1) {
+        const b = bytes[i];
+        if (b === 0x09 || b === 0x0a || b === 0x0d
+          || (b >= 0x20 && b < 0x7f)) printable += 1;
+      }
+      if (printable / bytes.length >= 0.85) return true;
+      const decoded = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+      const bad = (decoded.match(/\uFFFD/g) || []).length;
+      return decoded.length > 0 && bad / decoded.length <= 0.05;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  // 对一段文本扫描，返回去重后的 { kind, token } 命中。
+  function decodeProbeScan(text) {
+    const source = String(text || "");
+    const hits = [];
+    const seen = new Set();
+    const consider = (kind, token) => {
+      if (token.length < DECODE_PROBE_MIN_TOKEN || seen.has(token)) return;
+      seen.add(token);
+      hits.push({ kind, token });
+    };
+    // URL 编码：连续非空白片段里出现 ≥2 个 %xx（单个 %20 多半只是空格转义）。
+    // 无 %xx 时直接跳过，避免对超长文本做昂贵的回溯匹配。
+    if ((source.match(/%[0-9a-fA-F]{2}/g) || []).length >= 2) {
+      (source.match(/(?:\S*%[0-9a-fA-F]{2}){2,}\S*/g) || [])
+        .forEach((token) => consider("url", token));
+    }
+    // Hex：≥16 位且为偶数长度（判偶交由 validator）。
+    decodeProbeRuns(source, "0-9a-fA-F", 16).forEach((token) => {
+      if (decodeProbeHexLooksValid(token)) consider("hex", token);
+    });
+    // Base64（含 URL-safe）：≥16 字符且能解出可读文本。run 里可能有
+    // "data=<base64>" 这类内嵌 '='，先按 '=' 切段再逐段尝试。
+    decodeProbeRuns(source, "A-Za-z0-9+/=_-", 16).forEach((run) => {
+      const parts = run.split(/=+/).filter((part) => part.length >= 16);
+      const tokens = parts.length ? parts : [run];
+      tokens.forEach((token) => {
+        if (decodeProbeBase64LooksValid(token)) consider("base64", token);
+      });
+    });
+    return hits;
+  }
+
+  function decodeKindLabel(kind) {
+    const labels = state.language === "en"
+      ? { base64: "Base64", hex: "Hex", url: "URL-encoded" }
+      : { base64: "Base64", hex: "Hex", url: "URL 编码" };
+    return labels[kind] || kind;
+  }
+
+  // 汇总一条 finding 的疑似编码串：只扫字符串类型的 summary/detail/extra
+  // （数组值逐项看），非字符串值一律跳过；任一文本超过 8KB 时只取第一个命中。
+  function findEncodedStrings(item) {
+    const texts = [];
+    if (item && typeof item === "object") {
+      [item.summary, item.detail].forEach((value) => {
+        if (typeof value === "string" && value) texts.push(value);
+      });
+      const extra = item.extra;
+      if (extra && typeof extra === "object" && !Array.isArray(extra)) {
+        Object.values(extra).forEach((value) => {
+          if (typeof value === "string" && value) texts.push(value);
+          else if (Array.isArray(value)) {
+            value.forEach((entry) => {
+              if (typeof entry === "string" && entry) texts.push(entry);
+            });
+          }
+        });
+      }
+    }
+    let overLimit = false;
+    const hits = [];
+    texts.forEach((text) => {
+      if (text.length > DECODE_PROBE_TEXT_LIMIT) overLimit = true;
+      decodeProbeScan(text).forEach((hit) => {
+        if (!hits.some((entry) => entry.token === hit.token)) hits.push(hit);
+      });
+    });
+    return overLimit ? hits.slice(0, 1) : hits.slice(0, DECODE_PROBE_MAX_HITS);
+  }
+
+  // 序号圈号 ①②③…超过 20 个回退成 "1."（正常最多 DECODE_PROBE_MAX_HITS 组）。
+  function decodeHitMark(index) {
+    return index < 20 ? String.fromCharCode(0x2460 + index) : `${index + 1}.`;
+  }
+
+  /* ------------------------------------------- finding decode（一键解码） */
+  // 结果详情弹窗里的编码串动作面板；命中列表在 showFinding 打开弹窗前写入。
+  let findingDecodeHits = [];
+  const findingDecodeResults = new Map();
+
+  function decodePanelHtml(hits) {
+    const groups = hits.map((hit, index) => `
+      <div class="decode-group">
+        <div class="decode-group-head">
+          <span class="decode-group-title">${esc(decodeHitMark(index))}
+            ${esc(decodeKindLabel(hit.kind))} · ${hit.token.length}
+            ${esc(t("decode_chars"))}</span>
+          <button type="button" class="ghost small" data-decode-action="run"
+            data-decode-index="${index}">${esc(t("decode_run"))}</button>
+        </div>
+        <pre class="decode-token">${esc(clip(hit.token, 300))}</pre>
+        <div class="decode-result-area" data-decode-result="${index}"></div>
+      </div>`).join("");
+    return `<div class="decode-panel">
+      <div class="decode-panel-head">
+        <h4>${esc(t("decode_panel_title"))}（${hits.length}）</h4>
+        <button type="button" class="ghost small" data-decode-action="cyberchef">
+          ${esc(t("decode_cyberchef"))}</button>
+      </div>
+      ${groups}
+    </div>`;
+  }
+
+  // /api/decode 返回 {ok, candidates:[{label,value}], flags}；“原始文本
+  // （未识别编码）”是服务端识别失败时的兜底项，按失败处理。
+  const DECODE_FALLBACK_LABEL = "原始文本（未识别编码）";
+
+  async function runFindingDecode(index) {
+    const hit = findingDecodeHits[index];
+    const area = $(`[data-decode-result="${index}"]`);
+    if (!hit || !area) return;
+    area.innerHTML = `<div class="muted small">${esc(t("decode_running"))}</div>`;
+    let data = null;
+    try {
+      data = await api("/api/decode", { method: "POST", body: { text: hit.token } });
+    } catch (error) {
+      area.innerHTML = `<div class="decode-error">${esc(t("decode_failed"))}：`
+        + `${esc(clip(String(error.message || error), 200))}</div>`;
+      return;
+    }
+    if (!data || data.ok === false) {
+      area.innerHTML = `<div class="decode-error">${esc(t("decode_failed"))}：`
+        + `${esc(clip(String((data && data.error) || ""), 200))}</div>`;
+      return;
+    }
+    const candidates = (Array.isArray(data.candidates)) ? data.candidates : [];
+    const real = candidates.filter((item) => item && item.value
+      && item.label !== DECODE_FALLBACK_LABEL);
+    if (!real.length) {
+      area.innerHTML = `<div class="decode-error">${esc(t("decode_no_result"))}</div>`;
+      return;
+    }
+    findingDecodeResults.set(index,
+      real.map((item) => `[${item.label}]\n${item.value}`).join("\n\n"));
+    area.innerHTML = `<div class="decode-result">`
+      + real.map((item) => `
+        <div class="decode-item">
+          <div class="decode-label">${esc(item.label)}</div>
+          <div class="decode-value">${highlightFlags(esc(String(item.value)))}</div>
+        </div>`).join("")
+      + `</div>
+      <button type="button" class="ghost small" data-decode-action="copy"
+        data-decode-index="${index}">${esc(t("decode_copy"))}</button>`;
+  }
+
+  async function copyFindingDecode(index) {
+    const text = findingDecodeResults.get(index) || "";
+    try {
+      await navigator.clipboard.writeText(text);
+      toast(t("decode_copied"), "good", 1600);
+    } catch (error) {
+      toast(t("decode_copy_failed"), "warn");
+    }
+  }
+
+  // CyberChef 是整页跳转（plugin_run 通道），无法携带载荷；行为与工具菜单一致。
+  async function openCyberChef() {
+    try {
+      await api("/api/action", {
+        method: "POST",
+        body: { action: "plugin_run", key: "cyberchef", target: state.pcap || "" },
+      });
+      toast(t("decode_cyberchef_opened"), "good", 1800);
+    } catch (error) {
+      toast(error.message, "error", 7000);
+    }
+  }
+
+  async function handleDecodeAction(button) {
+    const action = button.dataset.decodeAction;
+    if (action === "cyberchef") return openCyberChef();
+    const index = Number(button.dataset.decodeIndex) || 0;
+    if (action === "copy") return copyFindingDecode(index);
+    if (action === "run") return runFindingDecode(index);
+  }
+
+  /* ---------------------------------------- finding payload（载荷 / 破解） */
+  // 隧道类 finding 的 extra 带 artifact/bin（载荷文件）与 payload_preview
+  // （重组后的原始文本）。载荷面板内联在详情弹窗里，破解走
+  // POST /api/payload/crack，命中后服务端把明文写回任务目录。
+  let findingPayloadPlain = "";
+
+  function payloadArtifactName(item) {
+    const extra = (item && item.extra) || {};
+    const name = String(extra.artifact || extra.bin || "").trim();
+    if (!name) return "";
+    const encrypted = String(extra.encrypted ?? "").trim().toLowerCase();
+    if (!/\.bin$/i.test(name) && encrypted !== "true") return "";
+    return name;
+  }
+
+  function payloadOptions(pairs) {
+    return pairs.map(([value, label]) =>
+      `<option value="${esc(value)}">${esc(label)}</option>`).join("");
+  }
+
+  function payloadPanelHtml(item) {
+    const name = payloadArtifactName(item);
+    if (!name) return "";
+    const preview = String((item.extra && item.extra.payload_preview) || "");
+    const previewHtml = preview
+      ? `<pre class="payload-preview">${esc(preview)}</pre>
+        <button type="button" class="ghost small" data-payload-action="copy-preview">${esc(t("payload_copy"))}</button>`
+      : `<div class="payload-empty">${esc(t("payload_preview_empty"))}</div>`;
+    const ciphers = payloadOptions([
+      ["", t("payload_auto")],
+      ["aes-128-cbc", "aes-128-cbc"], ["aes-128-ctr", "aes-128-ctr"],
+      ["aes-128-ecb", "aes-128-ecb"], ["aes-256-cbc", "aes-256-cbc"],
+      ["aes-256-ctr", "aes-256-ctr"], ["aes-256-ecb", "aes-256-ecb"],
+    ]);
+    const digests = payloadOptions([
+      ["", t("payload_auto")], ["md5", "md5"], ["sha256", "sha256"],
+    ]);
+    const salts = payloadOptions([
+      ["auto", t("payload_salted_auto")],
+      ["true", t("payload_salted_yes")],
+      ["false", t("payload_salted_no")],
+    ]);
+    return `<div class="payload-panel" data-payload-artifact="${esc(name)}">
+      <div class="payload-head">
+        <h4>${esc(t("payload_title"))} <code class="mono">${esc(name)}</code></h4>
+        <div class="payload-actions">
+          <button type="button" class="ghost small" data-payload-action="download">${esc(t("payload_download"))}</button>
+          <button type="button" class="ghost small" data-payload-action="toggle">${esc(t("payload_crack"))}</button>
+        </div>
+      </div>
+      <div class="payload-preview-block">
+        <div class="payload-preview-title">${esc(t("payload_preview_title"))}</div>
+        ${previewHtml}
+      </div>
+      <div class="payload-crack-form hidden">
+        <div class="field full">
+          <label for="payload-password">${esc(t("payload_password"))}</label>
+          <input id="payload-password" type="text" spellcheck="false"
+            placeholder="${esc(t("payload_password_ph"))}">
+        </div>
+        <div class="field full">
+          <label for="payload-passwords">${esc(t("payload_passwords"))}</label>
+          <textarea id="payload-passwords" rows="3" spellcheck="false"
+            placeholder="${esc(t("payload_passwords_ph"))}"></textarea>
+        </div>
+        <div class="field">
+          <label for="payload-cipher">${esc(t("payload_cipher"))}</label>
+          <select id="payload-cipher">${ciphers}</select>
+        </div>
+        <div class="field">
+          <label for="payload-digest">${esc(t("payload_digest"))}</label>
+          <select id="payload-digest">${digests}</select>
+        </div>
+        <div class="field">
+          <label for="payload-salted">${esc(t("payload_salted"))}</label>
+          <select id="payload-salted">${salts}</select>
+        </div>
+        <div class="field">
+          <label class="inline"><input id="payload-base64" type="checkbox">
+            ${esc(t("payload_base64"))}</label>
+        </div>
+        <div class="field full payload-run-row">
+          <button type="button" class="ghost small" data-payload-action="run">${esc(t("payload_run"))}</button>
+        </div>
+      </div>
+      <div id="payload-result" class="payload-result hidden"></div>
+    </div>`;
+  }
+
+  function downloadJobFile(name) {
+    const job = state.findingsJob || state.jobId || "";
+    if (!job || !name) {
+      toast(t("payload_need_job"), "warn");
+      return;
+    }
+    const url = `/api/download?job=${encodeURIComponent(job)}`
+      + `&path=${encodeURIComponent(name)}&token=${encodeURIComponent(TOKEN)}`;
+    window.open(url, "_blank", "noopener");
+  }
+
+  async function copyPayloadText(text, okKey) {
+    try {
+      await navigator.clipboard.writeText(String(text || ""));
+      toast(t(okKey), "good", 1600);
+    } catch (error) {
+      toast(t("flag_copy_failed"), "warn");
+    }
+  }
+
+  function renderPayloadResult(box, data) {
+    if (!box) return;
+    const flags = parseFlagValue(data && data.flags);
+    if (data && data.hit) {
+      const preview = String(data.preview || "");
+      findingPayloadPlain = preview;
+      const saved = String(data.saved || "");
+      const password = String(data.password || "");
+      const chips = flags.map((flag) =>
+        `<span class="flag-chip">${highlightFlags(esc(flag))}</span>`).join(" ");
+      box.innerHTML = `<div class="payload-result-ok">
+        <div class="payload-result-head">${esc(t("payload_hit"))} ·
+          <code class="mono">${esc(data.cipher || "?")} / ${esc(data.digest || "?")}</code></div>
+        ${password ? `<div class="payload-result-line">${esc(t("payload_password_hit"))}:
+          <code class="mono">${esc(password)}</code></div>` : ""}
+        ${data.recipe ? `<div class="payload-result-line">${esc(t("payload_recipe"))}:
+          <code class="mono">${esc(data.recipe)}</code></div>` : ""}
+        ${chips ? `<div class="payload-result-flags">${chips}</div>` : ""}
+        <pre class="payload-plain">${highlightFlags(esc(preview))}</pre>
+        <div class="payload-result-actions">
+          ${saved ? `<span class="muted small">${esc(t("payload_saved"))}:
+            <code class="mono">${esc(saved)}</code></span>` : ""}
+          <button type="button" class="ghost small" data-payload-action="copy-plain">${esc(t("payload_copy_plain"))}</button>
+          ${saved ? `<button type="button" class="ghost small" data-payload-action="download-decoded"
+            data-payload-saved="${esc(saved)}">${esc(t("payload_download_decoded"))}</button>` : ""}
+        </div>
+      </div>`;
+      return;
+    }
+    const recipe = String((data && data.recipe) || "");
+    const attempts = Number(data && data.attempts) || 0;
+    box.innerHTML = `<div class="payload-result-miss">
+      <div class="payload-result-head">${esc(t("payload_miss").replace("{count}", String(attempts)))}</div>
+      ${recipe ? `<pre class="payload-recipe">${esc(recipe)}</pre>` : ""}
+      ${data && data.error ? `<div class="payload-result-line">${esc(clip(String(data.error), 300))}</div>` : ""}
+    </div>`;
+  }
+
+  async function runPayloadCrack(button) {
+    const panel = button.closest(".payload-panel");
+    const box = panel ? panel.querySelector("#payload-result") : null;
+    if (!panel || !box) return;
+    const job = state.findingsJob || state.jobId || "";
+    if (!job) {
+      box.classList.remove("hidden");
+      box.innerHTML = `<div class="payload-result-fail">${esc(t("payload_need_job"))}</div>`;
+      return;
+    }
+    const passwords = String(($("#payload-passwords") || {}).value || "")
+      .split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean);
+    const saltedRaw = val("payload-salted");
+    const body = {
+      job,
+      path: panel.dataset.payloadArtifact || "",
+      password: String(($("#payload-password") || {}).value || ""),
+      passwords,
+      cipher: val("payload-cipher"),
+      digest: val("payload-digest"),
+      salted: saltedRaw === "true" ? true : saltedRaw === "false" ? false : "auto",
+      base64: checked("payload-base64"),
+    };
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = t("payload_running");
+    box.classList.remove("hidden");
+    box.innerHTML = `<div class="muted small">${esc(t("payload_running"))}</div>`;
+    try {
+      const data = await api("/api/payload/crack", { method: "POST", body });
+      renderPayloadResult(box, data);
+    } catch (error) {
+      box.innerHTML = `<div class="payload-result-fail">${esc(t("payload_failed"))}：
+        ${esc(clip(String(error.message || error), 300))}</div>`;
+    } finally {
+      button.disabled = false;
+      button.textContent = label || t("payload_run");
+    }
+  }
+
+  async function handlePayloadAction(button) {
+    const action = button.dataset.payloadAction;
+    const panel = button.closest(".payload-panel");
+    if (action === "download") {
+      return downloadJobFile(panel && panel.dataset.payloadArtifact);
+    }
+    if (action === "copy-preview") {
+      const pre = panel && panel.querySelector(".payload-preview");
+      return copyPayloadText(pre ? pre.textContent : "", "payload_copied");
+    }
+    if (action === "copy-plain") {
+      const pre = panel && panel.querySelector(".payload-plain");
+      return copyPayloadText(pre ? pre.textContent : findingPayloadPlain,
+        "payload_plain_copied");
+    }
+    if (action === "download-decoded") {
+      return downloadJobFile(button.dataset.payloadSaved);
+    }
+    if (action === "toggle") {
+      const form = panel && panel.querySelector(".payload-crack-form");
+      if (!form) return;
+      const hidden = form.classList.toggle("hidden");
+      button.textContent = hidden ? t("payload_crack") : t("payload_crack_hide");
+      return;
+    }
+    if (action === "run") return runPayloadCrack(button);
+  }
+
   async function showFinding(seq) {
     const item = state.findings.find((entry) => String(entry.seq) === String(seq));
     if (!item) return;
@@ -2263,6 +2883,23 @@
       && Boolean(state.meta && state.meta.crack && state.meta.crack.available);
     const smb = isSmbFinding(item);
     const ntlmcrackable = isNtlmCrackable(item);
+    // 疑似编码串：命中时在详情区下方渲染“一键解码”面板（默认解码第一个）。
+    // 载荷预览里已经原样展示的编码串不再重复渲染一份解码面板。
+    findingDecodeHits = findEncodedStrings(item);
+    if (payloadArtifactName(item)) {
+      const payloadPreview = String((item.extra && item.extra.payload_preview) || "");
+      if (payloadPreview) {
+        findingDecodeHits = findingDecodeHits
+          .filter((hit) => !payloadPreview.includes(hit.token));
+      }
+    }
+    findingDecodeResults.clear();
+    findingPayloadPlain = "";
+    const flagBanner = flagBannerHtml(findingFlagList(item));
+    const payloadPanel = payloadPanelHtml(item);
+    const detailHtml = flagBanner + payloadPanel
+      + (smb ? smbDetailHtml(item) : "")
+      + (findingDecodeHits.length ? decodePanelHtml(findingDecodeHits) : "");
     const extraButtons = [];
     if (smb && state.meta && state.meta.smb && state.meta.smb.available) {
       extraButtons.push({ name: "smb", label: t("smb_decrypt_button") });
@@ -2271,10 +2908,10 @@
     if (ntlmcrackable) {
       extraButtons.push({ name: "ntlmcrack", label: t("ntlmcrack_button") });
     }
-    const values = await openModal({
+    const modalPromise = openModal({
       title: `结果详情 · ${findingValue(item, "kind")}`,
       text: lines.join("\n"),
-      html: smb ? smbDetailHtml(item) : "",
+      html: detailHtml,
       fields: [
         {
           name: "status", label: t("ann_status"), type: "select",
@@ -2291,6 +2928,11 @@
       okText: t("ann_save"),
       extraButtons,
     });
+    if (findingDecodeHits.length) {
+      // 默认自动解码第一处命中；失败只写进面板，不影响弹窗其余交互。
+      runFindingDecode(0).catch(() => {});
+    }
+    const values = await modalPromise;
     if (!values) return;
     if (values.__action === "crack") {
       await openCrackDialog(item);
@@ -3274,6 +3916,7 @@
     if (box) {
       box.innerHTML = '<div class="muted">任务结束后，凭据、哈希、flag、导出文件等会汇总在这里。</div>';
     }
+    renderFlagBar();
   }
 
   function restoreFindingsColumns() {
@@ -3937,6 +4580,22 @@
       event.preventDefault();
       showFinding(row.dataset.seq);
     });
+    // Flag 汇总条：复制按钮优先，其次点击 chip 打开对应 finding；
+    // 只有 extra.flags 兜底出来的 chip 没有 seq，点击时退化为复制。
+    const flagBar = $("#flag-bar");
+    if (flagBar) {
+      flagBar.addEventListener("click", (event) => {
+        const copy = event.target.closest("[data-flag-copy]");
+        if (copy) {
+          copyFlagText(copy.dataset.flagCopy);
+          return;
+        }
+        const chip = event.target.closest(".flag-chip");
+        if (!chip) return;
+        if (chip.dataset.flagSeq) showFinding(chip.dataset.flagSeq);
+        else copyFlagText(chip.textContent || "");
+      });
+    }
 
     $("#decode-btn").addEventListener("click", runDecode);
     $("#copy-decode").addEventListener("click", async () => {
@@ -4389,6 +5048,23 @@
     });
     $("#modal").addEventListener("click", (event) => {
       if (event.target === $("#modal")) closeModal(null);
+    });
+    // 结果详情弹窗的“一键解码”/载荷面板：按钮是动态注入的，走事件委托。
+    $("#modal-body").addEventListener("click", (event) => {
+      const copyFlag = event.target.closest("[data-flag-copy]");
+      if (copyFlag) {
+        event.preventDefault();
+        copyFlagText(copyFlag.dataset.flagCopy);
+        return;
+      }
+      const payloadButton = event.target.closest("[data-payload-action]");
+      if (payloadButton) {
+        event.preventDefault();
+        handlePayloadAction(payloadButton);
+        return;
+      }
+      const button = event.target.closest("[data-decode-action]");
+      if (button) handleDecodeAction(button);
     });
   }
 

@@ -137,7 +137,7 @@ hashcat -m 5500 ntlm_hashes.txt wordlist.txt   # NetNTLMv1
 | 复选框 | Handler | 功能 | 说明 |
 | --- | --- | --- | --- |
 | `checkBox_23` | `flows.dns` | DNS流量分析 | 查询/响应、长标签检测；按域名分块按序重组（Base64/Base32/Hex）、隧道时间线、解码数据落盘与 flag 提取 |
-| `checkBox_20` | `flows.icmp` | ICMP流量分析 | ICMP 载荷、长度分布；按源/目的/ID 重组分块隧道、时间线与解码落盘 |
+| `checkBox_20` | `flows.icmp` | ICMP流量分析 | ICMP 载荷、长度分布；按源/目的/ID 重组分块隧道、时间线与解码落盘；seq 恒定（echo 标识）时按帧序整包重组并整段二次解码；**载荷长度隐写**（长度即 ASCII → Base64/Hex → 文本/flag，正逆序都试，定长 ping 不误报）；对加密载荷自动做分层分析（编码剥离/加密识别/解密尝试/文件还原，`payload_bin`，口令候选含文件名 IP 与抓包中挖出的口令），每方向产出「载荷分析」发现（失败附 openssl 命令示例与参数指引），同方向已由长度隐写解出 flag 时自动标注密文为干扰项，加密外传告警收敛为一条并并入公网 IOC，每个会话输出 kind=`protocol` 的结构化发现 |
 | `checkBox_19` | `flows.telnet` | Telnet流量分析 | Telnet 会话内容还原 |
 | `checkBox_27` | `flows.ftp` | FTP流量分析 | USER/PASS、命令、数据通道与传输文件 |
 | `checkBox_28` | `flows.smtp` | SMTP流量分析 | SMTP/IMAP/POP3 命令与凭据、发件人/收件人/邮箱、MIME 头、正文与附件还原（附件落盘并计算 MD5/SHA256） |

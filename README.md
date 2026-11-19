@@ -207,7 +207,7 @@ python3 scripts/bench.py --sizes 10,100,1000 --features default
 
 - **文本 / HTTP**：关键字与编码识别、深度 flag 扫描（重组流/导出文件/二进制载荷，带来源与置信度）、HTTP 请求响应提取、登录凭据、Basic 认证。
 - **日志分析**：直接读取 `.log`/`.txt`/`.jsonl`/`.csv`，识别 Ceph、syslog、sshd、Apache 与通用 KV 格式；输出概览时间线、实体失败率、异常突增与 IOC/敏感信息，不依赖 `tshark`。
-- **会话 / 协议**：TCP/UDP 会话、DNS、ICMP、ARP、FTP、SMTP、Telnet、MySQL；
+- **会话 / 协议**：TCP/UDP 会话、DNS、ICMP（含载荷长度隐写与隧道重组）、ARP、FTP、SMTP、Telnet、MySQL；
   额外支持 Redis、MongoDB、PostgreSQL、LDAP、SMB2/3、WebSocket 与 HTTP/2。
   Redis/MongoDB/PostgreSQL 会先做 TCP 流重组，再解析 RESP3、OP_MSG/SCRAM/GridFS、
   扩展查询/COPY 等深层协议内容；HTTP/2 内置 HPACK 与 DATA 正文还原，SMB2/3

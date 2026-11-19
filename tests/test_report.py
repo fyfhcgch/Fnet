@@ -10,8 +10,9 @@ from unittest import mock
 from fnet.config import Config
 from fnet.jobs import JobManager
 from fnet.report import (
-    DEFAULT_SECTIONS, annotation_lines, normalise_sections, parse_report_text,
-    render_html, render_markdown, select_findings, write_reports,
+    DEFAULT_SECTIONS, annotation_lines, is_analysis_artifact,
+    normalise_sections, parse_report_text, render_html, render_markdown,
+    select_findings, write_reports,
 )
 
 DATA = Path(__file__).resolve().parent / "data"
@@ -148,6 +149,24 @@ class MarkdownTest(unittest.TestCase):
         self.assertNotIn("annotations.json", text)
         self.assertNotIn("log_entities.csv", text)
         self.assertNotIn("log_iocs.csv", text)
+
+    def test_artifacts_skip_generated_readme_files(self):
+        """处理器生成的 *_README.txt 指引文件不进产出列表（磁盘保留）。"""
+        self.assertTrue(is_analysis_artifact("cs_README.txt"))
+        self.assertTrue(is_analysis_artifact("c2_README.txt"))
+        self.assertTrue(is_analysis_artifact("logs/_README.txt"))
+        self.assertTrue(is_analysis_artifact("shard_2_cs_README.txt"))
+        self.assertFalse(is_analysis_artifact("README.txt"))
+        self.assertFalse(is_analysis_artifact("restored/admin.aspx"))
+        text = render_markdown(
+            sample_meta(), LOGS,
+            [{"name": "cs_README.txt", "size": 10},
+             {"name": "c2_README.txt", "size": 11},
+             {"name": "restored/admin.aspx", "size": 20}],
+            sections=["artifacts"])
+        self.assertIn("`restored/admin.aspx`", text)
+        self.assertNotIn("cs_README.txt", text)
+        self.assertNotIn("c2_README.txt", text)
 
     def test_section_selection_and_escaping(self):
         text = render_markdown(sample_meta(), LOGS, [], sections=["summary"])

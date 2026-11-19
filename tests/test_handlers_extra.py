@@ -1,7 +1,7 @@
 """Handler-level tests for features without a dedicated test file yet.
 
 Covers: ``rdp`` / ``sql`` / ``winrm`` / ``cs`` / ``usb`` / ``misc`` / ``ics``
-/ ``text_scan`` / ``ntlm`` / ``arp``.
+/ ``text_scan`` / ``ntlm`` / ``arp`` / ``flows.icmp``.
 
 The handlers are invoked through :class:`FeatureContext` with a fake tshark
 (canned rows keyed by display filter), following the pattern of
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import os
+import random
 import struct
 import tempfile
 import unittest
@@ -847,6 +848,210 @@ class RdpTest(CtxTestCase):
             log=lambda text, level="info": logs.append(text))
         self.assertIsNone(result)
         self.assertIn("输入 PCAP 不存在", "\n".join(logs))
+
+
+class FlowsIcmpTest(CtxTestCase):
+    """flows.icmp 隧道重组：罐装 tshark 行、载荷分层分析与告警收敛。"""
+
+    class FieldRoutedTshark:
+        """按字段路由罐装行：icmp handler 用不同字段列表查询三次。"""
+
+        def __init__(self, routes: dict[str, list]):
+            self.routes = routes
+            self.path = ""
+            self.calls: list[tuple[str, list]] = []
+
+        def fields(self, pcap, fields, display_filter="", extra=None,
+                   cancel=None):
+            self.calls.append((display_filter, list(fields)))
+            for key, value in self.routes.items():
+                if key in fields:
+                    return value
+            return []
+
+    @staticmethod
+    def _tunnel_rows(src: str, dst: str, blob: bytes, per: int = 90) -> list:
+        parts = [blob[i:i + per] for i in range(0, len(blob), per)]
+        return [[str(number), src, dst, "8", "0", part.hex(), f"17{number}.0"]
+                for number, part in enumerate(parts, 1)]
+
+    def _run_icmp(self, tunnel_rows: list):
+        from fnet.features import flows
+
+        fake = self.FieldRoutedTshark({
+            "frame.time_epoch": tunnel_rows,
+            "data.data": [[row[0], row[5], "8"] for row in tunnel_rows],
+            "data.len": [[row[0], str(len(row[5]) // 2)]
+                         for row in tunnel_rows],
+        })
+        ctx = make_ctx(self.tmp, fake)
+        flows.icmp(ctx)
+        return ctx
+
+    def test_encrypted_echo_id_tunnel(self):
+        """不可解密文：载荷分析 finding 给出命令示例，告警收敛为一条。"""
+        rng = random.Random(42)
+        cipher = bytes(rng.randrange(256) for _ in range(1024))
+        blob = base64.b64encode(cipher)
+        ctx = self._run_icmp(self._tunnel_rows(
+            "192.168.3.73", "54.199.175.227", blob))
+        log = self.lines(ctx)
+        self.assertIn("ICMP 隧道分块重组", log)
+        self.assertIn("疑似隐蔽外传", log)
+        self.assertIn("54.199.175.227", log)
+        self.assertIn("公网地址", log)
+        kinds = {finding["kind"] for finding in ctx.findings}
+        self.assertIn("protocol", kinds)
+        sessions = [f for f in ctx.findings
+                    if f["summary"] == "ICMP 隧道 192.168.3.73>54.199.175.227"]
+        self.assertEqual(len(sessions), 1)
+        session = sessions[0]
+        self.assertEqual(session["level"], "warn")
+        self.assertIn("包数", session["detail"])
+        self.assertIn("加密 是", session["detail"])
+        self.assertIn("帧范围", session["detail"])
+        self.assertIn("首帧时间戳", session["detail"])
+        self.assertIn("高熵密文", session["detail"])
+        self.assertEqual(session["extra"]["encrypted"], "True")
+        # 每个方向一条载荷分层分析 finding：失败路径带命令示例与参数指引
+        bin_name = "icmp_tunnel_192.168.3.73_54.199.175.227.bin"
+        analyses = [f for f in ctx.findings
+                    if f["summary"] == f"ICMP 隧道载荷分析 {bin_name}"]
+        self.assertEqual(len(analyses), 1)
+        detail = analyses[0]["detail"]
+        self.assertIn("自动解密失败", detail)
+        self.assertIn("openssl enc -d", detail)
+        self.assertIn("-nosalt", detail)
+        self.assertIn("openssl_file", detail)
+        self.assertIn("-a -A", detail)
+        self.assertEqual(analyses[0]["extra"]["decrypted"], "False")
+        # 加密外传告警收敛为一条，公网 IOC 信息并入 detail
+        alerts = [f for f in ctx.findings
+                  if f["summary"] == "ICMP 隧道载荷为加密数据（疑似隐蔽外传）"]
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("54.199.175.227", alerts[0]["detail"])
+        self.assertIn("公网地址", alerts[0]["detail"])
+        self.assertIn("载荷分析", alerts[0]["detail"])
+        # 独立的「外传目标 X」IOC finding 不再出现
+        self.assertFalse(any("外传目标" in f["summary"] for f in ctx.findings))
+        # 告警收敛：session + 载荷分析 + 汇总告警 = 3 条且互不重复
+        self.assertEqual(len(ctx.findings), 3,
+                         [f["summary"] for f in ctx.findings])
+        # 解码落盘：密文完整保存为 icmp_tunnel_*.bin
+        bins = list((self.tmp / "out").glob("icmp_tunnel_*.bin"))
+        self.assertTrue(bins)
+        self.assertEqual(bins[0].stat().st_size, 1024)
+
+    def test_encrypted_tunnel_auto_decrypt_success(self):
+        """常见配方命中：解密成功 finding + 明文落盘 + flag 单独 emit。"""
+        from fnet.utils.crypto import aes_cbc_encrypt
+        from fnet.utils.openssl_enc import derive_key_iv
+
+        plaintext = b"flag{icmp-auto-decrypt}\n" * 40
+        key, iv = derive_key_iv("icmp", b"", key_len=16, iv_len=16, digest="md5")
+        cipher = aes_cbc_encrypt(plaintext, key, iv)
+        blob = base64.b64encode(cipher)
+        ctx = self._run_icmp(self._tunnel_rows(
+            "192.168.3.73", "54.199.175.227", blob))
+        bin_name = "icmp_tunnel_192.168.3.73_54.199.175.227.bin"
+        analyses = [f for f in ctx.findings
+                    if f["summary"] == f"ICMP 隧道载荷分析 {bin_name}"]
+        self.assertEqual(len(analyses), 1)
+        finding = analyses[0]
+        self.assertEqual(finding["level"], "good")
+        self.assertIn("解密成功", finding["detail"])
+        self.assertIn("aes-128-cbc", finding["detail"])
+        self.assertIn("md5", finding["detail"])
+        self.assertIn("flag{icmp-auto-decrypt}", finding["detail"])
+        out_name = "icmp_tunnel_192.168.3.73_54.199.175.227_decoded.txt"
+        self.assertIn(out_name, finding["detail"])
+        self.assertEqual(finding["extra"]["decrypted"], "True")
+        # 明文落盘为真交付物
+        decoded = self.tmp / "out" / out_name
+        self.assertEqual(decoded.read_bytes(), plaintext)
+        # flag 以 kind=flag 单独 emit
+        self.assertTrue(any(f["kind"] == "flag" and
+                            f["summary"] == "flag{icmp-auto-decrypt}"
+                            for f in ctx.findings))
+        # 收敛后：session + 载荷分析 + 汇总告警 + flag = 4 条
+        self.assertEqual(len(ctx.findings), 4,
+                         [f["summary"] for f in ctx.findings])
+        # 汇总告警注明已解密成功
+        alerts = [f for f in ctx.findings
+                  if f["summary"] == "ICMP 隧道载荷为加密数据（疑似隐蔽外传）"]
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("已自动解密成功", alerts[0]["detail"])
+
+    def test_plain_session_finding(self):
+        parts = [b"flag{icmp_plain", b"_session}"]
+        blob = b"".join(parts)
+        tunnel_rows = [[str(number), "10.0.0.5", "10.0.0.6", "8",
+                        str(number), part.hex(), f"17{number}.0"]
+                       for number, part in enumerate(parts, 1)]
+        ctx = self._run_icmp(tunnel_rows)
+        session = [f for f in ctx.findings
+                   if f["summary"] == "ICMP 隧道 10.0.0.5>10.0.0.6"]
+        self.assertEqual(len(session), 1)
+        self.assertEqual(session[0]["level"], "info")
+        self.assertIn("加密 否", session[0]["detail"])
+        self.assertIn("首帧时间戳", session[0]["detail"])
+        self.assertIn("载荷未见加密特征", session[0]["detail"])
+        self.assertTrue(any(f["kind"] == "flag" and
+                            f["summary"] == "flag{icmp_plain_session}"
+                            for f in ctx.findings))
+
+
+    def test_length_channel_finds_embedded_flag(self):
+        """长度隐写：每个请求包长度就是 ASCII 码（fetus_pcap 考点）。"""
+        shadow = ("ubuntu:$6$LhHRomTE$M7C4n84UcFLAG{length_channel}::")
+        encoded = base64.b64encode(shadow.encode()).decode()
+        rows = [[str(number), "192.168.3.73", "54.199.175.227", "8", "0",
+                 (b"A" * ord(char)).hex(), f"17{number}.0"]
+                for number, char in enumerate(encoded, 1)]
+        ctx = self._run_icmp(rows)
+        log = self.lines(ctx)
+        self.assertIn("ICMP 载荷长度隐写", log)
+        finding = [f for f in ctx.findings
+                   if f["summary"].startswith("ICMP 载荷长度隐写")]
+        self.assertEqual(len(finding), 1)
+        self.assertEqual(finding[0]["level"], "good")
+        self.assertIn("ubuntu", finding[0]["detail"])
+        self.assertIn("FLAG{length_channel}", finding[0]["detail"])
+        self.assertEqual(finding[0]["extra"]["encoding"], "length-ascii")
+        self.assertTrue(any(f["kind"] == "flag" and
+                            f["summary"] == "FLAG{length_channel}"
+                            for f in ctx.findings))
+        # finding 的「帧」列要能直接跳到长度序列的第一帧。
+        self.assertEqual(finding[0]["frame"], "1")
+        outputs = list((self.tmp / "out").glob("*_length.txt"))
+        self.assertTrue(outputs)
+        self.assertIn("ubuntu", outputs[0].read_text("utf-8"))
+
+    def test_length_channel_hint_marks_ciphertext_as_decoy(self):
+        """同方向已由长度隐写解出 flag 时，载荷分析要提示密文是干扰项。"""
+        import base64 as b64
+        import random
+
+        shadow = "ubuntu:$6$LhHRomTE$M7C4n84UcFLAG{decoy_hint}::"
+        encoded = b64.b64encode(shadow.encode()).decode()
+        rng = random.Random(7)
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        # fetus 同款：载荷本身是可打印的 base64 文本（拼起来解码后是随机
+        # 字节 → 判为密文），而每包长度恰好是消息字符的 ASCII 码。
+        rows = []
+        for number, char in enumerate(encoded, 1):
+            body = "".join(rng.choice(alphabet) for _ in range(ord(char)))
+            rows.append([str(number), "192.168.3.73", "54.199.175.227", "8",
+                         str(number), body.encode().hex(), f"17{number}.0"])
+        ctx = self._run_icmp(rows)
+        analyses = [f for f in ctx.findings
+                    if f["summary"].startswith("ICMP 隧道载荷分析")]
+        self.assertTrue(analyses)
+        self.assertIn("干扰项", analyses[0]["detail"])
+        alert = [f for f in ctx.findings
+                 if f["summary"].startswith("ICMP 隧道载荷为加密数据")]
+        self.assertEqual(len(alert), 1)
+        self.assertIn("长度隐写", alert[0]["detail"])
 
 
 if __name__ == "__main__":

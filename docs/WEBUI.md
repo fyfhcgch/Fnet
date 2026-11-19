@@ -65,7 +65,9 @@ python3 -m fnet access.log --features checkBox_61,checkBox_64
 - **分析结果**：凭据、哈希、flag、导出的文件等会进入可排序表格；支持按
   类别/级别筛选、关键字搜索、点击表头排序、分页与每页条数、列显示/隐藏
   （保存在浏览器本地）、复制本页/选中行、按帧号跳转与 CSV 导出。旧任务
-  没有 `findings.json` 时会从日志推断，并在标题旁标注。
+  没有 `findings.json` 时会从日志推断，并在标题旁标注。表格上方的 Flag
+  汇总条直接列出本任务发现的全部 flag，点击可复制或跳到对应结果；隧道类
+  载荷结果的详情弹窗内还有载荷预览与“破解”表单，见下文。
 - **产出**：任务结束后列出文件，可单文件下载或一键打包 ZIP。分析结果类文件
   （`findings.json`、`findings.csv`、`annotations.json`、`log_*.csv` 等）
   不出现在产出列表，详细发现在"分析结果"与"统计图表"查看；文件仍在磁盘上，
@@ -164,6 +166,8 @@ python3 -m fnet access.log --features checkBox_61,checkBox_64
 | GET | `/api/download?job=<id>&path=<file>` | 下载单个产出 |
 | GET | `/api/download?job=<id>` | 打包下载全部产出（无 `path` 时） |
 | POST | `/api/decode` | 文本解码（Base64/Hex/URL/XOR/解压/解码链） |
+| POST | `/api/payload/crack` | 结果详情「破解」按钮：对任务产物（如 `icmp_tunnel_*.bin`）按口令/算法/摘要/盐做定向 openssl 解密；命中返回明文预览、flag 与落盘文件名 |
+| POST | `/api/payload/crack` | 对任务产物做定向 openssl 解密（`job`、`path`、口令/候选口令/算法/摘要/盐/`base64`） |
 | POST | `/api/action` | 菜单动作（统计、分离、修复、插件等） |
 | POST | `/api/shutdown` | 关闭服务 |
 
@@ -342,6 +346,38 @@ WPA 22000 等，模式由功能写入 `extra.mode`，旧任务按摘要推断）
 
 破解在后台线程运行，弹窗实时显示 hashcat 日志、进度与最终状态；命中后直接
 显示密码并可一键复制。所有设置都会写回 `config.ini`，下次打开沿用。
+
+#### 一键解码编码串
+
+详情弹窗会自动检测摘要 / 详情 / `extra` 里的疑似编码串（Base64、Hex、URL
+编码，判定规则见前端 `app.js` 的 `findEncodedStrings`），命中时在详情区
+下方显示“一键解码”面板：每处命中一组按钮，默认自动解码第一处；解码结果
+（含多步解码链）以等宽块逐行展示在弹窗内，可复制，`flag{...}` 自动高亮。
+面板还提供“在 CyberChef 中打开”（浏览器整页打开，复用工具菜单的
+CyberChef 入口）。解码失败的原因只显示在面板内，不影响弹窗其余交互。
+
+#### Flag 汇总条与载荷破解
+
+“分析结果”表格上方的 Flag 汇总条收集 `kind=flag` 的条目，并扫描其它结果
+`extra.flags` 里的 flag 作为兜底；去重保序，显示“发现 N 个 Flag”。每个 chip
+带一个“复制”按钮；来自 `kind=flag` 的 chip 点击后打开对应结果详情，只有
+`extra.flags` 兜底出来的 chip 点击即复制。详情弹窗里 `kind=flag` 或带
+`extra.flags` 的结果顶部也会显示同样的 Flag 横幅。
+
+隧道类结果（`extra.artifact`/`extra.bin` 以 `.bin` 结尾，或 `extra.encrypted`
+为真）的详情弹窗内联“载荷”面板：
+
+- 头部显示载荷文件名，可下载原文件
+- “载荷预览”展示重组后的原始文本（最多约 180px 高的等宽滚动块），可复制；
+  没有文本预览时提示载荷为二进制
+- “破解”展开内联表单：题目口令、候选口令（每行一个）、算法、摘要、盐
+  （自动 / `Salted__` / `-nosalt`）以及“载荷是 Base64 文本”开关；留空算法、
+  摘要、盐即自动跑常见配方
+- “开始破解”调用 `POST /api/payload/crack`，请求体为
+  `{job, path, password?, passwords?, cipher?, digest?, salted?, base64?}`；
+  命中时面板内显示算法/摘要、口令、配方、高亮的 flag、明文预览与“已保存”
+  文件名，并可直接下载解密文件；未命中时显示尝试次数、命令配方与失败原因，
+  不会弹全局 toast。载荷面板排在“一键解码”面板之前。
 
 #### SMB3 解密对话框
 

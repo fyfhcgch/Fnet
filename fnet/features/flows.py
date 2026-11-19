@@ -1,6 +1,7 @@
 """Generic flow / protocol summaries extracted with tshark display filters."""
 from __future__ import annotations
 
+import ipaddress
 from collections import Counter
 from pathlib import Path
 
@@ -11,6 +12,17 @@ from fnet.features.registry import FeatureContext
 from fnet.utils.pcap import conversations, hex_to_bytes, payload_text, printable_ratio
 
 MAX_ROWS = 300
+
+
+def _is_public_ip(value: str) -> bool:
+    """Simple RFC1918/public test for IOC hints (mirrors features.logs)."""
+    try:
+        address = ipaddress.ip_address(str(value or "").strip())
+    except ValueError:
+        return False
+    return not (address.is_private or address.is_loopback
+                or address.is_link_local or address.is_multicast
+                or address.is_reserved)
 
 
 def _rows(ctx: FeatureContext, fields: list[str], display_filter: str,
@@ -219,9 +231,242 @@ def icmp(ctx: FeatureContext) -> None:
     _icmp_tunnel(ctx)
 
 
+def _icmp_bin_name(session: str) -> str:
+    """载荷落盘文件名，命名与 tunnel.write_decoded/_sanitise_session 一致。"""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(session or "")).strip("._")[:80]
+    return f"icmp_tunnel_{safe or 'session'}.bin"
+
+
+def _session_time_span(result: dict, session: str) -> tuple[float, float]:
+    """从 analyse_icmp 的会话分组取首/末帧的 epoch 时间戳。"""
+    pairs = (result.get("sessions") or {}).get(session) or []
+    times = [float(getattr(chunk, "time", 0.0) or 0.0) for chunk, _ in pairs]
+    times = [value for value in times if value > 0]
+    if not times:
+        return (0.0, 0.0)
+    return (min(times), max(times))
+
+
+def _report_payload_analysis(ctx: FeatureContext, session: str, bin_name: str,
+                             first_frame: str, analysis: dict,
+                             seen_flags: set[str], preview: str = "",
+                             length_hit: bool = False) -> bool:
+    """把 payload_bin 的分层分析结果写成一条高信息密度 finding。
+
+    返回是否解密成功；flag 以 kind=flag 单独 emit（全局去重）。
+    """
+    prof = analysis.get("profile") or {}
+    layers = analysis.get("layers") or []
+    decrypt = analysis.get("decrypt") or {}
+    content = analysis.get("content") or {}
+    alignment = "16 字节对齐" if prof.get("aligned_16") else "未按 16 字节对齐"
+    magic_text = f"，magic {prof.get('magic')}" if prof.get("magic") else ""
+    picture = (f"熵 {prof.get('entropy') or 0}，"
+               f"可打印率 {prof.get('printable_ratio') or 0}，"
+               f"{alignment}{magic_text}")
+    if layers:
+        pieces = []
+        for item in layers:
+            pieces.append(f"{item.get('encoding')}({item.get('out_bytes')}B)")
+        layers_text = "→".join(pieces)
+    else:
+        layers_text = "无"
+    extra = {"bin": bin_name, "session": session,
+             "artifact": bin_name,
+             "payload_preview": (preview or "")[:1200],
+             "entropy": prof.get("entropy") or 0,
+             "layers": [item.get("encoding") for item in layers]}
+
+    if decrypt.get("hit"):
+        plain = bytes(decrypt.get("plaintext") or b"")
+        flags = list(content.get("flags") or [])
+        stem = bin_name[:-4] if bin_name.endswith(".bin") else bin_name
+        out_name = f"{stem}_decoded{content.get('suggested_ext') or '.txt'}"
+        ctx.write_output(out_name, plain)
+        preview = clean_cell(plain.decode("utf-8", "replace"), 400)
+        detail = (f"{bin_name} 载荷分层分析：画像（{picture}）；"
+                  f"编码层 {layers_text}；解密成功："
+                  f"cipher={decrypt.get('cipher')} digest={decrypt.get('digest')}"
+                  f"（口令已脱敏），配方 `{decrypt.get('recipe')}`；"
+                  f"明文预览：{preview}；"
+                  f"内容：flag={'、'.join(flags) if flags else '无'}；"
+                  f"明文已保存: {out_name}")
+        ctx.report(f"ICMP 隧道载荷自动解密成功: {bin_name} "
+                   f"({decrypt.get('cipher')} / {decrypt.get('digest')}, 口令已脱敏)",
+                   "good")
+        if content.get("text"):
+            ctx.report("  " + clean_cell(str(content["text"]), 160), "good")
+        ctx.add_finding("protocol", f"ICMP 隧道载荷分析 {bin_name}",
+                        detail=detail, frame=first_frame, level="good",
+                        extra=dict(extra, decrypted=True,
+                                   cipher=decrypt.get("cipher") or "",
+                                   digest=decrypt.get("digest") or "",
+                                   output=out_name, flags=flags))
+        for flag in flags:
+            if flag in seen_flags:
+                continue
+            seen_flags.add(flag)
+            ctx.report(f"  发现 flag: {flag}", "good")
+            ctx.add_finding("flag", flag,
+                            detail=f"ICMP 隧道载荷解密 {bin_name}",
+                            level="good")
+        return True
+
+    attempts = int(decrypt.get("attempts") or 0)
+    example = str(decrypt.get("example_command") or "")
+    skipped = str(decrypt.get("skipped") or "")
+    if skipped:
+        fail_text = f"未进入解密尝试（{skipped}）"
+    else:
+        fail_text = (f"已尝试 {attempts} 种配方"
+                     "（常见口令 × AES-128/256 cbc/ctr/ecb × md5/sha256，EVP 派生）")
+    detail = (f"{bin_name} 载荷分层分析：画像（{picture}）；"
+              f"编码层 {layers_text}；"
+              f"载荷预览（前 240 字）：{clean_cell(preview, 240) or '无'}；"
+              f"自动解密失败：{fail_text}；"
+              f"命令示例：`{example}`（<口令> 请替换为真实口令，"
+              "-a -A 仅当载荷为 Base64 文本时适用）；"
+              "也可在结果详情里点「破解」填入口令重试，或用 WebUI/CLI 参数 "
+              "password/cipher/digest 配合「OpenSSL加密文件分析」"
+              "（openssl_file）重跑")
+    if length_hit:
+        # 同一方向的长度隐写已经解出 flag：这里的密文很可能是幌子，
+        # 直接告诉用户不用再纠结解密。
+        detail += ("；注意：同一方向的「ICMP 载荷长度隐写」已解出 flag，"
+                   "本密文可能只是干扰项，优先看长度隐写结果")
+    ctx.report(f"会话 {session} 载荷自动解密未命中，"
+               "已生成 openssl 命令示例与参数指引", "warn")
+    ctx.add_finding("protocol", f"ICMP 隧道载荷分析 {bin_name}",
+                    detail=detail, frame=first_frame, level="warn",
+                    extra=dict(extra, decrypted=False, attempts=attempts,
+                               example=example))
+    return False
+
+
+def _report_exfil_alert(ctx: FeatureContext, exfil: list[dict],
+                        length_sessions: set[str] | None = None) -> None:
+    """汇总加密外传告警（一次），公网 IOC 并入 detail，指向载荷分析结论。"""
+    if not exfil:
+        return
+    public = sorted({item["dst"] for item in exfil if item["public"]})
+    if public:
+        ctx.report("隧道目标 " + ", ".join(public)
+                   + " 为公网地址，已并入加密外传告警", "warn")
+    lines = []
+    for item in exfil:
+        line = (f"{item['session']} → {item['dst']}"
+                + ("（公网地址）" if item["public"] else "")
+                + f"，密文 {item['bytes']} 字节，熵 {item['entropy']}")
+        line += "，已自动解密成功" if item["decrypted"] else "，未自动解密"
+        lines.append(line)
+    detail = ("内网主机经 ICMP 隧道外传加密载荷：" + "；".join(lines)
+              + "。每个方向的画像/编码剥离/解密尝试与命令指引"
+                "见对应「ICMP 隧道载荷分析」finding")
+    hinted = sorted((length_sessions or set())
+                    & {item["session"] for item in exfil})
+    if hinted:
+        detail += ("。注意：方向 " + "、".join(hinted)
+                   + " 的「ICMP 载荷长度隐写」已解出 flag，"
+                     "该方向的密文大概率是干扰项，结论以长度隐写为准")
+    ctx.add_finding(
+        "protocol", "ICMP 隧道载荷为加密数据（疑似隐蔽外传）",
+        detail=detail,
+        frame=exfil[0]["first_frame"], level="warn",
+        extra={"targets": [item["dst"] for item in exfil],
+               "public": public,
+               "sessions": [item["session"] for item in exfil]})
+
+
+def _report_length_channel(ctx: FeatureContext, rows: list[list[str]],
+                           seen_flags: set[str]) -> set[str]:
+    """ICMP 载荷长度隐写：长度即 ASCII（fetus_pcap.pcap 类题目）。
+
+    载荷内容可能完全无意义（随机长度），消息藏在每个请求包的**长度**
+    里：长度映射 ASCII → Base64 → ``/etc/shadow`` 片段 → flag。这里只
+    看 type=8 的请求包，按方向分组后交给
+    :func:`fnet.utils.tunnel.length_channel`。
+
+    返回解出 flag 的方向集合，供后续载荷分析提示“flag 在长度通道里”。
+    """
+    from fnet.utils import tunnel
+
+    hit_sessions: set[str] = set()
+    groups: dict[str, list[int]] = {}
+    #: 每个方向的首帧，供 finding 的「帧」列直接跳转（长度序列从它开始）。
+    first_frames: dict[str, str] = {}
+    for row in rows:
+        row = list(row) + [""] * (7 - len(row))
+        if str(row[3] or "") != "8":
+            continue
+        raw = hex_to_bytes(row[5])
+        if not raw:
+            continue
+        key = f"{row[1]}>{row[2]}"
+        groups.setdefault(key, []).append(len(raw))
+        first_frames.setdefault(key, str(row[0] or ""))
+
+    for session, lengths in groups.items():
+        first_frame = first_frames.get(session, "")
+        channel = tunnel.length_channel(lengths)
+        if not channel.get("channel"):
+            continue
+        decoded = str(channel.get("decoded_text") or "")
+        flags = list(channel.get("flags") or [])
+        if not decoded and not flags:
+            continue
+        raw_text = str(channel.get("text") or "")
+        layers = channel.get("decodings") or []
+        layer_text = "、".join(str(item.get("encoding") or "")
+                               for item in layers) or "无"
+        stem = _icmp_bin_name(session)
+        if stem.endswith(".bin"):
+            stem = stem[:-4]
+        out_name = f"{stem}_length.txt"
+        ctx.write_output(out_name,
+                         (decoded or raw_text).encode("utf-8", "replace"))
+        order = "（逆序）" if channel.get("order") == "reversed" else ""
+        flag_note = ""
+        if any(str(flag)[:4].lower() == "flag" and not str(flag).startswith("flag")
+               for flag in flags):
+            flag_note = "（原文 flag 前缀为大写，提交时按题目要求改写为 flag{...}）"
+        detail = (f"方向 {session}，{len(lengths)} 个 ICMP 请求包的载荷长度"
+                  f"映射为 ASCII{order}（可打印占比 "
+                  f"{channel.get('printable_ratio'):.2f}），"
+                  f"得到文本 {clean_cell(raw_text, 120)}；"
+                  f"编码层 {layer_text}；"
+                  f"解码文本预览：{clean_cell(decoded, 400)}；"
+                  f"flag：{'、'.join(flags) if flags else '无'}{flag_note}；"
+                  f"解码结果已保存: {out_name}")
+        ctx.report(f"ICMP 载荷长度隐写 {session}: "
+                   f"{len(lengths)} 个长度映射 ASCII，编码层 {layer_text}"
+                   + (f"，发现 flag {flags[0]}" if flags else ""),
+                   "good" if flags else "warn")
+        ctx.add_finding("protocol", f"ICMP 载荷长度隐写 {session}",
+                        detail=detail, frame=first_frame,
+                        level="good" if flags else "warn",
+                        extra={"session": session, "packets": len(lengths),
+                               "encoding": "length-ascii",
+                               "order": channel.get("order") or "forward",
+                               "layers": layer_text,
+                               "decoded": clean_cell(decoded, 1200),
+                               "output": out_name,
+                               "flags": "、".join(flags)})
+        for flag in flags:
+            if flag in seen_flags:
+                continue
+            seen_flags.add(flag)
+            ctx.report(f"  发现 flag: {flag}", "good")
+            ctx.add_finding("flag", flag, frame=first_frame,
+                            detail=f"ICMP 载荷长度隐写 {session}",
+                            level="good")
+        if flags:
+            hit_sessions.add(session)
+    return hit_sessions
+
+
 def _icmp_tunnel(ctx: FeatureContext) -> None:
     """Reassemble chunked ICMP echo tunnels and export the decoded data."""
-    from fnet.utils import tunnel
+    from fnet.utils import payload_bin, tunnel
 
     rows = _rows(ctx, ["frame.number", "ip.src", "ip.dst", "icmp.type",
                        "icmp.seq", "data.data", "frame.time_epoch"],
@@ -250,27 +495,98 @@ def _icmp_tunnel(ctx: FeatureContext) -> None:
         peak = max((item["bytes"] for item in timeline), default=0)
         ctx.report(f"隧道时间线: {len(timeline)} 个区间，峰值 {peak} 字节/区间",
                    "info")
+    seen_flags: set[str] = set()
+    # 长度隐写与载荷内容无关，先单独检查（载荷可能全是随机密文）。
+    length_sessions = _report_length_channel(ctx, rows, seen_flags)
+    # 从抓包正文挖 password=/Basic 头里的候选口令，供载荷自动解密追加尝试。
+    mined: list[str] = []
+    try:
+        with open(ctx.pcap, "rb") as handle:
+            mined = payload_bin.mine_passwords(
+                handle.read(payload_bin.MAX_MINE_BYTES))
+    except OSError:
+        mined = []
+    exfil: list[dict] = []
     for entry in decoded:
+        session = str(entry.get("session") or "")
+        encrypted = bool(entry.get("encrypted"))
         text = clean_cell(entry.get("text") or "", 400)
+        bin_name = _icmp_bin_name(session)
+        payload_preview = str(entry.get("raw_text") or "")[:1200]
         state = "完整" if entry.get("complete") else \
             f"缺块 {len(entry.get('missing') or [])}"
-        ctx.report(f"会话 {entry.get('session')}: {entry.get('chunks')} 块，{state}",
+        ctx.report(f"会话 {session}: {entry.get('chunks')} 块，{state}",
                    "good")
         if text:
             ctx.report("  " + text, "good")
-            ctx.add_finding("icmp", f"ICMP 隧道重组 {entry.get('session')}",
+            ctx.add_finding("icmp", f"ICMP 隧道重组 {session}",
                             detail=text, level="good",
                             extra={"complete": bool(entry.get("complete")),
                                    "chunks": entry.get("chunks")})
+        # 每个隧道 session 一条结构化 finding（kind protocol）。
+        encodings = "+".join(entry.get("encodings") or []) or "raw"
+        frame_range = str(entry.get("frame_range") or "")
+        first_frame = frame_range.split("-")[0] if frame_range else ""
+        packets = entry.get("packets") or entry.get("chunks") or 0
+        t0, t1 = _session_time_span(result, session)
+        uniform = ("高熵密文，标准 base64 解码后非文本" if encrypted
+                   else "载荷未见加密特征")
+        detail = (f"方向 {session}，包数 {packets}，"
+                  f"载荷总长 {entry.get('payload_bytes') or 0} 字节，"
+                  f"编码 {encodings}，加密 {'是' if encrypted else '否'}，"
+                  f"帧范围 {frame_range or '未知'}，"
+                  f"首帧时间戳 {t0:.3f}，末帧时间戳 {t1:.3f}（epoch 秒），"
+                  f"{uniform}")
+        if session in length_sessions:
+            detail += ("；该方向的「ICMP 载荷长度隐写」已解出 flag，"
+                       "载荷密文很可能只是干扰项")
+        ctx.add_finding("protocol", f"ICMP 隧道 {session}",
+                        detail=detail,
+                        frame=first_frame,
+                        level="warn" if encrypted else "info",
+                        extra={"session": session,
+                               "packets": packets,
+                               "payload_bytes": entry.get("payload_bytes") or 0,
+                               "encodings": encodings,
+                               "encrypted": encrypted,
+                               "artifact": bin_name,
+                               "payload_preview": payload_preview,
+                               "frames": frame_range,
+                               "first_epoch": f"{t0:.3f}",
+                               "last_epoch": f"{t1:.3f}",
+                               "complete": bool(entry.get("complete"))})
+        if encrypted:
+            # 加密外传：交给 payload_bin 做分层分析（画像/编码剥离/解密尝试）。
+            ctx.report(
+                f"会话 {session} 的隧道载荷为加密数据（疑似隐蔽外传），"
+                "开始载荷分层分析", "warn")
+            data = entry.get("data") or b""
+            analysis = payload_bin.analyse_payload(
+                data, name=bin_name, password_candidates=mined)
+            decrypted = _report_payload_analysis(
+                ctx, session, bin_name, first_frame, analysis, seen_flags,
+                preview=payload_preview,
+                length_hit=session in length_sessions)
+            dst = session.split(">")[-1].split("#")[0] if ">" in session else ""
+            cipher = entry.get("cipher") or {}
+            exfil.append({"session": session, "dst": dst,
+                          "public": _is_public_ip(dst),
+                          "bytes": cipher.get("length") or len(data),
+                          "entropy": cipher.get("entropy") or 0,
+                          "bin": bin_name, "decrypted": decrypted,
+                          "first_frame": first_frame})
         for flag in entry.get("flags") or []:
             ctx.report(f"  发现 flag: {flag}", "good")
-            ctx.add_finding("flag", flag,
-                            detail=f"ICMP 隧道 {entry.get('session')}",
-                            level="good")
+            if flag not in seen_flags:
+                seen_flags.add(flag)
+                ctx.add_finding("flag", flag,
+                                detail=f"ICMP 隧道 {session}",
+                                level="good")
     for item in tunnel.write_decoded(decoded, ctx.output_dir or ".",
                                      "icmp_tunnel"):
         ctx.report(f"隧道数据已保存: {item['path']} ({item['size']} 字节)",
                    "info")
+    _report_exfil_alert(ctx, exfil, length_sessions)
 
 
 def telnet(ctx: FeatureContext) -> None:

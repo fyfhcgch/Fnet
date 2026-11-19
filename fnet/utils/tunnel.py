@@ -9,15 +9,19 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import math
 import re
 import urllib.parse
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 __all__ = [
-    "Chunk", "decode_chunk", "parse_sequence", "reassemble", "group_sessions",
-    "analyse_dns", "analyse_icmp", "find_flags", "write_decoded", "timeline",
+    "Chunk", "decode_chunk", "byte_profile", "decode_assembled",
+    "parse_sequence", "reassemble", "group_sessions",
+    "analyse_dns", "analyse_icmp", "find_flags", "find_flags_loose",
+    "write_decoded", "timeline",
 ]
 
 #: Upper bound for everything :func:`write_decoded` writes in one call.
@@ -35,6 +39,10 @@ FLAG_PREFIXES = (
 _FLAG_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:" + "|".join(FLAG_PREFIXES) + r")"
     r"\{[^{}\r\n]{1,300}\}", re.IGNORECASE)
+#: 宽松版：不要求前缀前是边界。解码后的可信文本（如 /etc/shadow 片段里
+#: ``...UcFLAG{...}`` 这种粘在哈希字段中的 flag）用它可以兜底命中。
+_FLAG_LOOSE_RE = re.compile(
+    r"(?:" + "|".join(FLAG_PREFIXES) + r")\{[^{}\r\n]{1,300}\}", re.IGNORECASE)
 _PREFIXES = set(FLAG_PREFIXES)
 
 _B64_STD = re.compile(r"[A-Za-z0-9+/]+")
@@ -183,6 +191,204 @@ def decode_chunk(label: str) -> list[tuple[str, bytes]]:
     return results
 
 
+def byte_profile(data: bytes) -> dict:
+    """Describe a byte blob: length, printable ratio, entropy and alignment.
+
+    Pure helper used to mark reassembled tunnel payloads that decode fine
+    but carry unreadable, evenly distributed bytes — the signature of an
+    encrypted carrier rather than text.
+    """
+    data = bytes(data or b"")
+    n = len(data)
+    printable = (sum(32 <= b < 127 or b in (9, 10, 13) for b in data) / n
+                 if n else 0.0)
+    entropy = (-sum((count / n) * math.log2(count / n)
+                    for count in Counter(data).values()) if n else 0.0)
+    return {
+        "length": n,
+        "printable_ratio": round(printable, 4),
+        "entropy": round(entropy, 4),
+        "aligned_16": n > 0 and n % 16 == 0,
+    }
+
+
+def _looks_encrypted(data: bytes) -> bool:
+    """Heuristic: unreadable and evenly distributed bytes == ciphertext.
+
+    均匀随机的 256 值字节的期望可打印率约为 98/256 ≈ 0.38，所以只看
+    ``printable < 0.3`` 会漏掉真实样本；这里联合判定：可打印率 < 0.5 且
+    熵 ≥ 7.5（接近满熵 8.0）且长度足够，才判为加密载荷。
+    """
+    profile = byte_profile(data)
+    return (profile["length"] >= 32
+            and profile["printable_ratio"] < 0.5
+            and profile["entropy"] >= 7.5)
+
+
+def _decode_raw(label: str) -> list[tuple[str, bytes]]:
+    """Whole-payload candidate decodings without the readability filter.
+
+    Same encoding family as :func:`decode_chunk` (base64 / base64url /
+    base32 / hex / URL percent) but keeps unreadable results so callers can
+    tell an encrypted carrier apart from a failed decode.
+    """
+    label = (label or "").strip()
+    if not label:
+        return []
+    core = re.sub(r"\s+", "", label)
+    results: list[tuple[str, bytes]] = []
+    seen: set[bytes] = set()
+
+    def add(encoding: str, raw: bytes | None) -> None:
+        if not raw or raw in seen or len(raw) > MAX_TOTAL_BYTES:
+            return
+        seen.add(raw)
+        results.append((encoding, raw))
+
+    body = core.rstrip("=")
+    if len(body) >= 4 and _B64_STD.fullmatch(body):
+        padded = body + "=" * (-len(body) % 4)
+        try:
+            add("base64", base64.b64decode(padded, validate=True))
+        except (binascii.Error, ValueError):
+            pass
+    if len(body) >= 4 and _B64_URL.fullmatch(body):
+        padded = body.replace("-", "+").replace("_", "/")
+        padded += "=" * (-len(padded) % 4)
+        try:
+            add("base64url", base64.b64decode(padded, validate=True))
+        except (binascii.Error, ValueError):
+            pass
+    if _B32.fullmatch(core) and len(core.rstrip("=")) >= 8:
+        upper = core.upper()
+        upper += "=" * (-len(upper.rstrip("=")) % 8)
+        try:
+            add("base32", base64.b32decode(upper))
+        except (binascii.Error, ValueError):
+            pass
+    if len(core) >= 8 and len(core) % 2 == 0 and _HEX.fullmatch(core):
+        add("hex", _hex_bytes(core))
+    if "%" in label:
+        try:
+            add("url", urllib.parse.unquote_to_bytes(label))
+        except (UnicodeDecodeError, ValueError):
+            pass
+    return results
+
+
+def decode_assembled(text: str) -> dict:
+    """Decode a fully reassembled tunnel text in one piece.
+
+    ICMP/DNS tunnels often split one large base64 payload across packets;
+    per-chunk decoding then fails on every fragment and only raw bytes
+    survive reassembly.  This second pass over the joined text:
+
+    1. adopts a decoding that carries a flag or is readable;
+    2. marks a base64 result that decodes fine but is unreadable and evenly
+       distributed as ``encrypted`` (with entropy / printable ratio in
+       ``cipher``) instead of discarding it.
+
+    Returns ``{"data", "encoding", "text", "flags", "encrypted", "cipher"}``;
+    ``data`` is empty when no candidate decoding exists.
+    """
+    result: dict = {"data": b"", "encoding": "", "text": "", "flags": [],
+                    "encrypted": False, "cipher": None}
+    for encoding, raw in _decode_raw(text or ""):
+        found = find_flags(raw)
+        if found:
+            result.update(data=raw, encoding=encoding, text=_text_of(raw),
+                          flags=found)
+            return result
+        if _plausible(raw):
+            result.update(data=raw, encoding=encoding, text=_text_of(raw))
+            return result
+        # 加密判定只看 base64 家族：hex/url 解出的“均匀不可读字节”通常是
+        # 误匹配（任何短文本都能 hex 解码），base64 整段命中才有代表性。
+        if encoding in ("base64", "base64url") and _looks_encrypted(raw):
+            cipher = dict(byte_profile(raw), encoding=encoding)
+            result.update(data=raw, encoding=encoding, encrypted=True,
+                          cipher=cipher)
+            return result
+    return result
+
+
+#: 长度隐写的 ASCII 可打印区间（空格 ``0x20`` 到 ``~``）。
+LENGTH_MIN = 32
+LENGTH_MAX = 126
+#: 至少多少个包才认为长度序列可能承载文本。
+LENGTH_MIN_PACKETS = 8
+#: 可打印长度占比阈值。
+LENGTH_MIN_RATIO = 0.9
+#: 长度序列至少要有的不同取值数（正常 ping 的定长载荷只有 1 种）。
+LENGTH_MIN_DISTINCT = 6
+
+
+def length_channel(values: Iterable[int]) -> dict:
+    """Detect an ASCII-in-length covert channel (payload length == ord(char)).
+
+    有些 ICMP 隧道根本不把数据放进载荷：每个请求包的载荷长度随机，而
+    **长度本身**就是消息的一个字符（2019 工业信息安全技能大赛山东站
+    ``fetus_pcap.pcap`` 即此考点：124 个请求包的长度映射 ASCII 得到
+    Base64，解码后是 ``/etc/shadow`` 片段并带 flag）。
+
+    纯函数：把长度序列映射为字符，剥离 base64/hex/URL 编码并扫描 flag。
+    正常 ping（定长载荷）因不同取值太少直接排除，避免误报。
+
+    返回 ``{"channel", "values", "text", "printable_ratio", "decodings",
+    "decoded_text", "flags", "order"}``。
+    """
+    result: dict = {"channel": False, "values": [], "text": "",
+                    "printable_ratio": 0.0, "decodings": [], "decoded_text": "",
+                    "flags": [], "order": "forward"}
+    numbers: list[int] = []
+    for value in values or []:
+        try:
+            numbers.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    result["values"] = numbers
+    if len(numbers) < LENGTH_MIN_PACKETS:
+        return result
+    printable = [v for v in numbers if LENGTH_MIN <= v <= LENGTH_MAX]
+    ratio = len(printable) / len(numbers)
+    result["printable_ratio"] = round(ratio, 4)
+    if ratio < LENGTH_MIN_RATIO or len(set(printable)) < LENGTH_MIN_DISTINCT:
+        return result
+
+    def peel(sequence: str) -> tuple[str, list[dict], list[str]]:
+        """剥离编码层，返回 (最佳文本, 各层结果, flags)。"""
+        layers: list[dict] = []
+        best = ""
+        found: list[str] = find_flags(sequence) or find_flags_loose(sequence)
+        if found:
+            best = sequence
+        decoded = decode_assembled(sequence)
+        if decoded.get("text") or decoded.get("flags"):
+            decoded_text = decoded.get("text") or ""
+            decoded_flags = (list(decoded.get("flags") or [])
+                             or find_flags_loose(decoded_text))
+            layers.append({"encoding": decoded.get("encoding") or "text",
+                           "text": decoded_text,
+                           "flags": decoded_flags})
+            if decoded_flags or not found:
+                best = decoded_text or sequence
+                found = decoded_flags or found
+        return best, layers, found
+
+    text = "".join(chr(v) for v in printable)
+    best, layers, flags = peel(text)
+    order = "forward"
+    if not flags:
+        # 少量题目按逆序写入长度；只有逆序能解出 flag 时才采用。
+        reversed_best, reversed_layers, reversed_flags = peel(text[::-1])
+        if reversed_flags:
+            best, layers, flags = reversed_best, reversed_layers, reversed_flags
+            order = "reversed"
+    result.update(channel=True, text=text, decodings=layers,
+                  decoded_text=best, flags=flags, order=order)
+    return result
+
+
 def parse_sequence(label: str) -> tuple[int | None, int | None]:
     """Parse a sequence number (and optional total) from a label/chunk name.
 
@@ -212,32 +418,51 @@ def parse_sequence(label: str) -> tuple[int | None, int | None]:
 
 # -- reassembly --------------------------------------------------------
 def reassemble(chunks: Iterable[Chunk]) -> dict:
-    """Stitch chunks into one message, reporting gaps and duplicates."""
+    """Stitch chunks into one message, reporting gaps and duplicates.
+
+    ``result["index_mode"]`` explains how the indices were treated:
+
+    - ``"fragmented"``: real chunk indices, deduplicated with gap detection;
+    - ``"echo_id"``: every indexed chunk shares one index (ICMP echo tunnels
+      keep ``seq`` constant as a session identifier, e.g. ``seq == 0``), so
+      the index carries no fragmentation information and all chunks are
+      stitched in arrival (frame) order without de-duplication;
+    - ``"none"``: chunks had no index at all.
+    """
     items = [c for c in (chunks or []) if c is not None]
     indexed = [c for c in items if _field(c, "index") is not None]
     unindexed = [c for c in items if _field(c, "index") is None]
 
+    totals = [int(_field(c, "total")) for c in items
+              if _field(c, "total") is not None]
+    total = max(totals) if totals else None
+
     ordered: list[Any] = []
     seen: dict[int, Any] = {}
     duplicate_indices: set[int] = set()
-    if indexed:
+    # 非分片隧道判定：已索引分片多于一个、全部共享同一 index 且没有声明
+    # total（例如 124 个 echo request 的 seq 全为 "0"）。此时按 index 去重
+    # 会把第一个分片之外的全部载荷误判为重复而丢弃，因此回退为按到达顺序
+    # （即帧序）拼接全部未去重的分片，missing 置空、complete 仅看是否有载荷。
+    echo_id_mode = bool(
+        indexed and len(indexed) > 1 and not totals
+        and len({int(_field(c, "index")) for c in indexed}) == 1)
+    if echo_id_mode:
+        ordered = list(indexed) + list(unindexed)
+    else:
         for chunk in sorted(indexed, key=lambda c: (_field(c, "index"),
-                                                   _field(c, "time", 0.0))):
+                                                    _field(c, "time", 0.0))):
             index = int(_field(chunk, "index"))
             if index in seen:
                 duplicate_indices.add(index)
                 continue
             seen[index] = chunk
             ordered.append(chunk)
-    ordered.extend(unindexed)
-
-    totals = [int(_field(c, "total")) for c in items
-              if _field(c, "total") is not None]
-    total = max(totals) if totals else None
+        ordered.extend(unindexed)
 
     indices = sorted(seen)
     missing: list[int] = []
-    if indices:
+    if indices and not echo_id_mode:
         start = 0 if indices[0] == 0 else 1
         end = max(indices)
         if total is not None:
@@ -258,7 +483,9 @@ def reassemble(chunks: Iterable[Chunk]) -> dict:
         "duplicates": sorted(duplicate_indices),
         "encodings": encodings,
         "text": _text_of(data),
-        "complete": bool(ordered) and not missing,
+        "complete": bool(ordered) and (echo_id_mode or not missing),
+        "index_mode": "echo_id" if echo_id_mode else (
+            "fragmented" if seen else "none"),
     }
 
 
@@ -295,11 +522,16 @@ def group_sessions(entries: Iterable[Sequence[Any]]) -> dict[str, list]:
     return groups
 
 
-def _refine(data: bytes, flags: list[str]) -> tuple[bytes, str, list[str]]:
-    """Decode an assembled blob once more when it does not carry a flag."""
+def _refine(data: bytes, flags: list[str],
+            encrypted: bool = False) -> tuple[bytes, str, list[str]]:
+    """Decode an assembled blob once more when it does not carry a flag.
+
+    ``encrypted=True`` means the blob is ciphertext of a covert channel;
+    keep it byte-for-byte and never pretend it is readable text.
+    """
+    if encrypted or flags:
+        return data, "" if encrypted else _text_of(data), flags
     text = _text_of(data)
-    if flags:
-        return data, text, flags
     for _, decoded in (decode_chunk(text[:1_048_576]) if text else []):
         found = find_flags(decoded)
         if found:
@@ -475,20 +707,52 @@ def analyse_icmp(rows: Iterable[Sequence[Any]]) -> dict:
         chunks = [chunk for chunk, _ in chosen]
         result = reassemble(chunks)
         flags = find_flags(result["text"])
-        data, text, flags = _refine(result["data"], flags)
+        data = result["data"]
+        text = result["text"]
+        encrypted = False
+        cipher = None
+        # 双保险：reassemble() 已把“全部 index 相同”的会话按未索引处理
+        # （见其 echo_id 分支的注释），这里对整段重组文本再做一次候选解码
+        # （base64/base64url/hex/URL）：可读或带 flag 则采用；解出均匀
+        # 不可读字节则标记 encrypted，密文字节原样保留、不强行当文本。
+        second = decode_assembled(result["text"])
+        if second.get("encrypted"):
+            data, text, flags = _refine(second["data"], [], encrypted=True)
+            encrypted = True
+            cipher = second["cipher"]
+        elif second.get("data"):
+            data = second["data"]
+            text = second["text"]
+            flags = second["flags"] or flags
+            data, text, flags = _refine(data, flags)
+        else:
+            data, text, flags = _refine(data, flags)
         for flag in flags:
             if flag not in all_flags:
                 all_flags.append(flag)
+        frames = [str(_field(c, "frame", "") or "")
+                  for c in result["ordered"]]
+        frames = [frame for frame in frames if frame]
         decoded.append({
             "session": key,
             "data": data,
             "text": text,
+            #: 重组后的原始文本（加密载荷的 text 会被清空，预览仍需要它）。
+            "raw_text": (result["text"] or "")[:8000],
             "flags": flags,
             "complete": result["complete"],
             "missing": result["missing"],
             "duplicates": result["duplicates"],
             "encodings": result["encodings"],
             "chunks": len(result["ordered"]),
+            "index_mode": result.get("index_mode", ""),
+            "packets": len(result["ordered"]),
+            "payload_bytes": sum(len(_field(c, "data", b"") or b"")
+                                 for c in result["ordered"]),
+            "frame_range": (f"{frames[0]}-{frames[-1]}" if len(frames) > 1
+                            else (frames[0] if frames else "")),
+            "encrypted": encrypted,
+            "cipher": cipher,
         })
 
     return {
@@ -525,6 +789,25 @@ def find_flags(data: bytes | str) -> list[str]:
             pass
 
     for match in _FLAG_RE.finditer(text):
+        value = match.group(0)
+        if value not in found:
+            found.append(value)
+    return found
+
+
+def find_flags_loose(data: bytes | str) -> list[str]:
+    """Like :func:`find_flags` but tolerates a flag embedded inside a token.
+
+    解码后的可信文本里，flag 常粘在别的字段中（``/etc/shadow`` 的哈希
+    ``...UcFLAG{...}``、路径 ``/tmp/flag{...}`` 等），保守正则的边界断言
+    会漏掉；仅在“已经确认可读/已解码”的文本上使用这个宽松版本。
+    """
+    text = (_text_of(bytes(data)) if isinstance(data, (bytes, bytearray))
+            else str(data or ""))
+    if not text:
+        return []
+    found: list[str] = []
+    for match in _FLAG_LOOSE_RE.finditer(text):
         value = match.group(0)
         if value not in found:
             found.append(value)

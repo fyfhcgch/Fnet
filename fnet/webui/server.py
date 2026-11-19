@@ -405,6 +405,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._action()
             if path == "/api/decode":
                 return self._decode()
+            if path == "/api/payload/crack":
+                return self._payload_crack()
             if path == "/api/config":
                 return self._set_config()
             if path == "/api/shutdown":
@@ -982,6 +984,77 @@ class Handler(BaseHTTPRequestHandler):
             return self._error("文本过长")
         return self._json(decode_text(text))
 
+    def _payload_crack(self) -> None:
+        """结果详情「破解」按钮：对任务产物做定向 openssl 解密。
+
+        请求 ``{job, path, password?, passwords?, cipher?, digest?, salted?,
+        base64?}``；``cipher``/``digest`` 留空则跑常见配方电池。命中时把
+        明文写入任务目录并返回预览与 flag，未命中返回尝试次数与命令示例。
+        """
+        from fnet.utils import payload_bin
+
+        data = self._json_body()
+        job = self.app.jobs.get(str(data.get("job") or ""))
+        if job is None:
+            return self._error("任务不存在", 404)
+        relative = str(data.get("path") or data.get("artifact") or "").strip()
+        if not relative:
+            return self._error("缺少载荷文件名")
+        base = job.output_dir.resolve()
+        target = (base / relative).resolve()
+        if not target.is_relative_to(base) or not target.is_file():
+            return self._error("载荷文件不存在", 404)
+        if target.stat().st_size > 64 * 1024 * 1024:
+            return self._error("载荷文件过大（上限 64MB）", 400)
+
+        raw_passwords = data.get("passwords") or []
+        if not isinstance(raw_passwords, list):
+            return self._error("passwords 必须是数组")
+        passwords = [str(item) for item in raw_passwords]
+        password = str(data.get("password") or "")
+        if password:
+            passwords = [password] + [item for item in passwords
+                                      if item != password]
+        salted_raw = data.get("salted")
+        salted = (None if salted_raw in (None, "", "auto")
+                  else bool(salted_raw))
+        result = payload_bin.crack_payload(
+            target.read_bytes(), name=target.name,
+            passwords=passwords or None,
+            cipher=str(data.get("cipher") or "").strip() or None,
+            digest=str(data.get("digest") or "").strip() or None,
+            salted=salted, base64_input=bool(data.get("base64")))
+        hit = bool(result.get("hit"))
+        response = {
+            "ok": True,
+            "hit": hit,
+            "attempts": result.get("attempts") or 0,
+            "exhausted": bool(result.get("exhausted")),
+            "cipher": result.get("cipher") or "",
+            "digest": result.get("digest") or "",
+            "salted": bool(result.get("salted")),
+            "recipe": (result.get("recipe")
+                       or result.get("example_command") or ""),
+            "password": result.get("password") or "",
+            "error": result.get("error") or "",
+            "flags": result.get("flags") or [],
+        }
+        if not hit:
+            return self._json(response)
+        plain = bytes(result.get("plaintext") or b"")
+        magic = payload_bin.detect_magic(plain)
+        ext = payload_bin.EXT_BY_MAGIC.get(magic, ".txt")
+        out_name = f"{target.stem}_decoded{ext}"
+        (base / out_name).write_bytes(plain)
+        response.update(
+            preview=plain.decode("utf-8", "replace")[:4000],
+            saved=out_name,
+            size=len(plain),
+            magic=magic,
+            printable_ratio=result.get("printable_ratio") or 0,
+        )
+        return self._json(response)
+
     def _set_config(self) -> None:
         data = self._json_body()
         section = str(data.get("section") or "config")
@@ -1007,7 +1080,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             base = job.output_dir.resolve()
             target = (base / relative).resolve()
-            if not str(target).startswith(str(base)) or not target.is_file():
+            if not target.is_relative_to(base) or not target.is_file():
                 return self._error("文件不存在", 404)
         data = target.read_bytes()
         name = urllib.parse.quote(target.name)
