@@ -111,7 +111,7 @@ def dns(ctx: FeatureContext) -> None:
     long_names = [name for name in names if len(name) > 40]
     if long_names:
         ctx.report("疑似 DNS 隐蔽隧道（长域名）:", "warn")
-        for name in dict.fromkeys(long_names)[:50]:
+        for name in list(dict.fromkeys(long_names))[:50]:
             ctx.report("  " + name, "warn")
             ctx.add_finding("dns", name, detail="长域名，疑似 DNS 隐蔽隧道",
                             level="warn")
@@ -159,10 +159,13 @@ def _dns_tunnel(ctx: FeatureContext) -> None:
     """Ordered chunk reassembly, timeline and decoded output for DNS tunnels."""
     from fnet.utils import tunnel
 
-    rows = _rows(ctx, ["frame.number", "dns.qry.name", "frame.time_epoch"],
-                 "dns", limit=200_000)
+    rows = _rows(ctx, ["frame.number", "dns.qry.name", "frame.time_epoch",
+                       "dns.flags.response"], "dns", limit=200_000)
     if not rows:
         return
+    seen_flags: set[str] = set()
+    # 长度/时序隐蔽信道与载荷内容无关，先单独检查（载荷可能是随机填充）。
+    _report_dns_channels(ctx, rows, seen_flags)
     result = tunnel.analyse_dns(rows)
     decoded = result.get("decoded") or []
     if not decoded:
@@ -170,14 +173,13 @@ def _dns_tunnel(ctx: FeatureContext) -> None:
     ctx.report("===== DNS 隧道分块重组 =====", "good")
     chunks = []
     for row in rows:
-        row += [""] * (3 - len(row))
+        row += [""] * (4 - len(row))
         qname = row[1]
         if not qname:
             continue
         chunks.append({
             "frame": row[0],
-            "time": float(row[2]) if (row[2] or "").replace(".", "", 1).isdigit()
-            else 0.0,
+            "time": _epoch(row[2]) or float(row[0] or 0),
             "data": qname.encode("utf-8", "replace"),
         })
     timeline = tunnel.timeline(chunks, buckets=20)
@@ -206,16 +208,27 @@ def _dns_tunnel(ctx: FeatureContext) -> None:
                             extra={"complete": bool(entry.get("complete")),
                                    "chunks": entry.get("chunks")})
         for flag in entry.get("flags") or []:
-            ctx.report(f"  发现 flag: {flag}", "good")
+            canonical = tunnel.canonical_flag(flag)
+            if canonical in seen_flags:
+                continue
+            seen_flags.add(canonical)
+            ctx.report(f"  发现 flag: {canonical}", "good")
+            extra = {"raw_flag": flag} if flag != canonical else None
             ctx.add_finding("flag", flag,
                             detail=f"DNS 隧道 {entry.get('session')}",
-                            level="good")
+                            level="good", extra=extra)
     for item in tunnel.write_decoded(decoded, ctx.output_dir or ".",
                                      "dns_tunnel"):
         ctx.report(f"隧道数据已保存: {item['path']} ({item['size']} 字节)",
                    "info")
     for flag in result.get("flags") or []:
-        ctx.add_finding("flag", flag, detail="DNS 隧道重组", level="good")
+        canonical = tunnel.canonical_flag(flag)
+        if canonical in seen_flags:
+            continue
+        seen_flags.add(canonical)
+        extra = {"raw_flag": flag} if flag != canonical else None
+        ctx.add_finding("flag", flag, detail="DNS 隧道重组", level="good",
+                        extra=extra)
 
 
 def icmp(ctx: FeatureContext) -> None:
@@ -250,7 +263,7 @@ def _session_time_span(result: dict, session: str) -> tuple[float, float]:
 def _report_payload_analysis(ctx: FeatureContext, session: str, bin_name: str,
                              first_frame: str, analysis: dict,
                              seen_flags: set[str], preview: str = "",
-                             length_hit: bool = False) -> bool:
+                             channel_hit: bool = False) -> bool:
     """把 payload_bin 的分层分析结果写成一条高信息密度 finding。
 
     返回是否解密成功；flag 以 kind=flag 单独 emit（全局去重）。
@@ -329,11 +342,11 @@ def _report_payload_analysis(ctx: FeatureContext, session: str, bin_name: str,
               "也可在结果详情里点「破解」填入口令重试，或用 WebUI/CLI 参数 "
               "password/cipher/digest 配合「OpenSSL加密文件分析」"
               "（openssl_file）重跑")
-    if length_hit:
+    if channel_hit:
         # 同一方向的长度隐蔽信道已经解出 flag：这里的密文很可能是幌子，
         # 直接告诉用户不用再纠结解密。
-        detail += ("；注意：同一方向的「ICMP 载荷长度隐蔽信道」已解出 flag，"
-                   "本密文可能只是干扰项，优先看长度信道结果")
+        detail += ("；注意：同一方向的「ICMP 长度/时序隐蔽信道」已解出 flag，"
+                   "本密文可能只是干扰项，优先看信道结果")
     ctx.report(f"会话 {session} 载荷自动解密未命中，"
                "已生成 openssl 命令示例与参数指引", "warn")
     ctx.add_finding("protocol", f"ICMP 隧道载荷分析 {bin_name}",
@@ -344,7 +357,7 @@ def _report_payload_analysis(ctx: FeatureContext, session: str, bin_name: str,
 
 
 def _report_exfil_alert(ctx: FeatureContext, exfil: list[dict],
-                        length_sessions: set[str] | None = None) -> None:
+                        channel_sessions: set[str] | None = None) -> None:
     """汇总加密外传告警（一次），公网 IOC 并入 detail，指向载荷分析结论。"""
     if not exfil:
         return
@@ -362,12 +375,12 @@ def _report_exfil_alert(ctx: FeatureContext, exfil: list[dict],
     detail = ("内网主机经 ICMP 隧道外传加密载荷：" + "；".join(lines)
               + "。每个方向的画像/编码剥离/解密尝试与命令指引"
                 "见对应「ICMP 隧道载荷分析」finding")
-    hinted = sorted((length_sessions or set())
+    hinted = sorted((channel_sessions or set())
                     & {item["session"] for item in exfil})
     if hinted:
         detail += ("。注意：方向 " + "、".join(hinted)
-                   + " 的「ICMP 载荷长度隐蔽信道」已解出 flag，"
-                     "该方向的密文大概率是干扰项，结论以长度信道为准")
+                   + " 的「ICMP 长度/时序隐蔽信道」已解出 flag，"
+                     "该方向的密文大概率是干扰项，结论以信道结果为准")
     ctx.add_finding(
         "protocol", "ICMP 隧道载荷为加密数据（疑似隐蔽外传）",
         detail=detail,
@@ -377,13 +390,150 @@ def _report_exfil_alert(ctx: FeatureContext, exfil: list[dict],
                "sessions": [item["session"] for item in exfil]})
 
 
-#: 长度序列的读法标签（展示用）。
-_LENGTH_VARIANT_LABELS = {
-    "printable": "可打印长度",
-    "raw": "原始字节长度",
-    "dedup": "去重后可打印长度",
-    "dedup_raw": "去重后原始字节长度",
+#: 隐蔽信道的读法标签（展示用）。
+_CHANNEL_VARIANT_LABELS = {
+    "printable": "可打印取值",
+    "raw": "原始字节",
+    "dedup": "去重后可打印取值",
+    "dedup_raw": "去重后原始字节",
+    "b64-index": "取值作 Base64 索引",
+    "b64-index-dedup": "去重后取值作 Base64 索引",
+    "b64-index-1": "取值-1 作 Base64 索引",
+    "b64-index-1-dedup": "去重后取值-1 作 Base64 索引",
 }
+#: 时序二值化读法的单位标签。
+_TIMING_UNITS = {"ms": "毫秒", "cs": "厘秒", "ds": "分秒"}
+#: 隐蔽信道最多分析多少个方向/流，避免大抓包拖慢分析。
+MAX_CHANNEL_GROUPS = 40
+#: 每个方向最多取多少个样本。
+MAX_CHANNEL_SAMPLES = 4000
+
+
+def _epoch(value) -> float:
+    """把 tshark 的 epoch 字段转成正浮点，非法值返回 0。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return number if number >= 0 else 0.0
+
+
+def _has_epoch(value) -> bool:
+    """字段非空且可解析为数值（epoch 0 也是合法时间戳）。"""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    try:
+        float(text)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _safe_stem(prefix: str, name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name or "")).strip("._")[:80]
+    return f"{prefix}_{safe or 'session'}"
+
+
+def _channel_variant_label(variant: str) -> str:
+    """把检测器的 variant 标识翻成可读文案。"""
+    text = str(variant or "")
+    if text.startswith("bits/"):
+        parts = text.split("/")
+        polarity = parts[1] if len(parts) > 1 else ""
+        order = "MSB" if len(parts) > 2 and parts[2] == "msb" else "LSB"
+        offset = parts[3].lstrip("+") if len(parts) > 3 else "0"
+        return f"间隔二值化（{polarity}，{order}，位偏移 {offset}）"
+    if "/" in text:
+        base, unit = text.rsplit("/", 1)
+        return (f"{_CHANNEL_VARIANT_LABELS.get(base, base)}"
+                f"（{_TIMING_UNITS.get(unit, unit)}）")
+    return _CHANNEL_VARIANT_LABELS.get(text, text or "可打印取值")
+
+
+def _top_groups(buckets: dict) -> dict:
+    """样本最多的前 N 组（大抓包里只深挖最可疑的方向/流）。"""
+    if len(buckets) <= MAX_CHANNEL_GROUPS:
+        return buckets
+
+    def weight(item):
+        bucket = item[1]
+        return max(len(bucket.get("request") or []),
+                   len(bucket.get("reply") or []))
+
+    return dict(sorted(buckets.items(), key=weight, reverse=True)
+                [:MAX_CHANNEL_GROUPS])
+
+
+def _detect_side(bucket: dict, detector) -> tuple[str, list, dict]:
+    """请求方向优先，失败回退应答；返回 (方向, 样本, 检测结果)。"""
+    for side in ("request", "reply"):
+        values = bucket.get(side) or []
+        if len(values) < 2:
+            continue
+        result = detector(values)
+        if result.get("channel"):
+            return side, values, result
+    return "", [], {}
+
+
+def _emit_channel(ctx: FeatureContext, *, protocol: str, session: str,
+                  kind: str, kind_label: str, encoding: str, channel: dict,
+                  samples: int, sample_label: str, first_frame: str,
+                  seen_flags: set[str], out_name: str,
+                  extra_note: str = "") -> bool:
+    """把一次信道检测结果写成日志 + 结构化 finding（flag 单独 emit）。"""
+    from fnet.utils import tunnel
+
+    decoded = str(channel.get("decoded_text") or "")
+    raw_flags = [str(flag) for flag in (channel.get("flags") or [])]
+    flags = list(dict.fromkeys(tunnel.canonical_flag(flag)
+                               for flag in raw_flags))
+    if not decoded and not flags:
+        return False
+    raw_text = str(channel.get("text") or "")
+    layers = channel.get("decodings") or []
+    layer_text = "、".join(str(item.get("encoding") or "")
+                           for item in layers) or "无"
+    variant = _channel_variant_label(str(channel.get("variant") or ""))
+    order = "（逆序）" if channel.get("order") == "reversed" else ""
+    ctx.write_output(out_name,
+                     (decoded or raw_text).encode("utf-8", "replace"))
+    detail = (f"{protocol} 方向 {session}，{samples} 个{sample_label}"
+              f"按「{variant}」读法映射为字符{order}（可打印占比 "
+              f"{float(channel.get('printable_ratio') or 0):.2f}），"
+              f"得到文本 {clean_cell(raw_text, 120)}；"
+              f"编码层 {layer_text}；"
+              f"解码文本预览：{clean_cell(decoded, 400)}；"
+              f"flag：{'、'.join(flags) if flags else '无'}；"
+              f"解码结果已保存: {out_name}{extra_note}")
+    summary = f"{protocol} {kind_label}隐蔽信道 {session}"
+    ctx.report(f"{summary}: {samples} 个{sample_label}按「{variant}」映射，"
+               f"编码层 {layer_text}"
+               + (f"，发现 flag {flags[0]}" if flags else ""),
+               "good" if flags else "warn")
+    ctx.add_finding("protocol", summary, detail=detail, frame=first_frame,
+                    level="good" if flags else "warn",
+                    extra={"session": session, "protocol": protocol,
+                           "kind": kind, "samples": samples,
+                           "encoding": encoding,
+                           "order": channel.get("order") or "forward",
+                           "variant": channel.get("variant") or "",
+                           "layers": layer_text,
+                           "decoded": clean_cell(decoded, 1200),
+                           "output": out_name,
+                           "flags": "、".join(flags)})
+    for flag in flags:
+        if flag in seen_flags:
+            continue
+        seen_flags.add(flag)
+        ctx.report(f"  发现 flag: {flag}", "good")
+        raw_flag = next((item for item in raw_flags
+                         if tunnel.canonical_flag(item) == flag), flag)
+        extra = {"raw_flag": raw_flag} if raw_flag != flag else None
+        ctx.add_finding("flag", flag, frame=first_frame, detail=summary,
+                        level="good", extra=extra)
+    return bool(flags)
 
 
 def _report_length_channel(ctx: FeatureContext, rows: list[list[str]],
@@ -399,10 +549,7 @@ def _report_length_channel(ctx: FeatureContext, rows: list[list[str]],
     """
     from fnet.utils import tunnel
 
-    hit_sessions: set[str] = set()
-    buckets: dict[str, dict[str, list[int]]] = {}
-    #: 每个方向的首帧，供 finding 的「帧」列直接跳转。
-    first_frames: dict[str, str] = {}
+    buckets: dict[str, dict] = {}
     for row in rows:
         row = list(row) + [""] * (7 - len(row))
         icmp_type = str(row[3] or "")
@@ -413,79 +560,189 @@ def _report_length_channel(ctx: FeatureContext, rows: list[list[str]],
             continue
         key = f"{row[1]}>{row[2]}"
         side = "request" if icmp_type == "8" else "reply"
-        buckets.setdefault(key, {"request": [], "reply": []})[side].append(
-            len(raw))
-        first_frames.setdefault(key, str(row[0] or ""))
+        bucket = buckets.setdefault(
+            key, {"request": [], "reply": [], "frame": str(row[0] or "")})
+        if len(bucket[side]) < MAX_CHANNEL_SAMPLES:
+            bucket[side].append(len(raw))
 
-    for session, sides in buckets.items():
-        first_frame = first_frames.get(session, "")
-        used_side = "request" if sides["request"] else "reply"
-        lengths = sides[used_side]
-        channel = tunnel.length_channel(lengths)
-        if not channel.get("channel") and sides["reply"]:
-            # 请求方向缺失或被裁剪时，应答长度可能才是完整序列。
-            channel = tunnel.length_channel(sides["reply"])
-            if channel.get("channel"):
-                lengths, used_side = sides["reply"], "reply"
+    hit_sessions: set[str] = set()
+    for session, bucket in _top_groups(buckets).items():
+        ctx.check_cancel()
+        side, lengths, channel = _detect_side(bucket, tunnel.length_channel)
         if not channel.get("channel"):
             continue
-        decoded = str(channel.get("decoded_text") or "")
-        raw_flags = [str(flag) for flag in (channel.get("flags") or [])]
-        flags = list(dict.fromkeys(tunnel.canonical_flag(flag)
-                                   for flag in raw_flags))
-        if not decoded and not flags:
-            continue
-        raw_text = str(channel.get("text") or "")
-        layers = channel.get("decodings") or []
-        layer_text = "、".join(str(item.get("encoding") or "")
-                               for item in layers) or "无"
-        variant = _LENGTH_VARIANT_LABELS.get(
-            str(channel.get("variant") or ""), "可打印长度")
-        side_text = "请求" if used_side == "request" else "应答"
         stem = _icmp_bin_name(session)
         if stem.endswith(".bin"):
             stem = stem[:-4]
-        out_name = f"{stem}_length.txt"
-        ctx.write_output(out_name,
-                         (decoded or raw_text).encode("utf-8", "replace"))
-        order = "（逆序）" if channel.get("order") == "reversed" else ""
-        detail = (f"方向 {session}，{len(lengths)} 个 ICMP {side_text}包的长度"
-                  f"按「{variant}」读法映射为字符{order}（可打印占比 "
-                  f"{channel.get('printable_ratio'):.2f}），"
-                  f"得到文本 {clean_cell(raw_text, 120)}；"
-                  f"编码层 {layer_text}；"
-                  f"解码文本预览：{clean_cell(decoded, 400)}；"
-                  f"flag：{'、'.join(flags) if flags else '无'}；"
-                  f"解码结果已保存: {out_name}")
-        ctx.report(f"ICMP 载荷长度隐蔽信道 {session}: "
-                   f"{len(lengths)} 个{side_text}包长度按「{variant}」映射，"
-                   f"编码层 {layer_text}"
-                   + (f"，发现 flag {flags[0]}" if flags else ""),
-                   "good" if flags else "warn")
-        ctx.add_finding("protocol", f"ICMP 载荷长度隐蔽信道 {session}",
-                        detail=detail, frame=first_frame,
-                        level="good" if flags else "warn",
-                        extra={"session": session, "packets": len(lengths),
-                               "encoding": "length-ascii",
-                               "order": channel.get("order") or "forward",
-                               "variant": channel.get("variant") or "",
-                               "layers": layer_text,
-                               "decoded": clean_cell(decoded, 1200),
-                               "output": out_name,
-                               "flags": "、".join(flags)})
-        for flag in flags:
-            if flag in seen_flags:
-                continue
-            seen_flags.add(flag)
-            ctx.report(f"  发现 flag: {flag}", "good")
-            raw_flag = next((item for item in raw_flags
-                             if tunnel.canonical_flag(item) == flag), flag)
-            extra = {"raw_flag": raw_flag} if raw_flag != flag else None
-            ctx.add_finding("flag", flag, frame=first_frame,
-                            detail=f"ICMP 载荷长度隐蔽信道 {session}",
-                            level="good", extra=extra)
-        if flags:
+        side_text = "请求" if side == "request" else "应答"
+        if _emit_channel(
+                ctx, protocol="ICMP", session=session, kind="length",
+                kind_label="载荷长度", encoding="length-ascii",
+                channel=channel, samples=len(lengths),
+                sample_label=f"{side_text}包的长度",
+                first_frame=bucket.get("frame", ""), seen_flags=seen_flags,
+                out_name=f"{stem}_length.txt"):
             hit_sessions.add(session)
+    return hit_sessions
+
+
+def _report_timing_channel(ctx: FeatureContext, rows: list[list[str]],
+                           seen_flags: set[str]) -> set[str]:
+    """ICMP 包间隔时序隐蔽信道：间隔长短承载字符/比特。"""
+    from fnet.utils import tunnel
+
+    buckets: dict[str, dict] = {}
+    for row in rows:
+        row = list(row) + [""] * (7 - len(row))
+        if str(row[3] or "") not in ("8", "0"):
+            continue
+        if not _has_epoch(row[6]):
+            continue
+        when = _epoch(row[6])
+        key = f"{row[1]}>{row[2]}"
+        side = "request" if str(row[3]) == "8" else "reply"
+        bucket = buckets.setdefault(
+            key, {"request": [], "reply": [], "frame": str(row[0] or "")})
+        if len(bucket[side]) < MAX_CHANNEL_SAMPLES:
+            bucket[side].append(when)
+
+    hit_sessions: set[str] = set()
+    for session, bucket in _top_groups(buckets).items():
+        ctx.check_cancel()
+        side, times, channel = _detect_side(bucket, tunnel.timing_channel)
+        if not channel.get("channel"):
+            continue
+        stem = _icmp_bin_name(session)
+        if stem.endswith(".bin"):
+            stem = stem[:-4]
+        side_text = "请求" if side == "request" else "应答"
+        if _emit_channel(
+                ctx, protocol="ICMP", session=session, kind="timing",
+                kind_label="包间隔时序", encoding="timing-interval",
+                channel=channel, samples=len(times),
+                sample_label=f"{side_text}包间隔",
+                first_frame=bucket.get("frame", ""), seen_flags=seen_flags,
+                out_name=f"{stem}_timing.txt"):
+            hit_sessions.add(session)
+    return hit_sessions
+
+
+def _report_dns_channels(ctx: FeatureContext, rows: list[list[str]],
+                         seen_flags: set[str]) -> set[str]:
+    """DNS 隐蔽信道：查询名标签长度 / 查询名总长度 / 查询间隔时序。
+
+    行格式 ``[frame, qname, epoch, response]``；只分析查询（响应里的
+    qname 与查询重复），按父域分组，避免把不同隧道的序列混在一起。
+    """
+    from fnet.utils import tunnel
+
+    buckets: dict[str, dict] = {}
+    for row in rows:
+        row = list(row) + [""] * (4 - len(row))
+        qname = str(row[1] or "").strip(".")
+        if not qname:
+            continue
+        if str(row[3] or "").strip() in ("1", "True", "true"):
+            continue
+        labels = [part for part in qname.split(".") if part]
+        if not labels:
+            continue
+        parent = ".".join(labels[-2:]) if len(labels) > 2 else qname
+        bucket = buckets.setdefault(parent, {"label": [], "qname": [],
+                                             "times": [],
+                                             "frame": str(row[0] or "")})
+        if len(bucket["label"]) < MAX_CHANNEL_SAMPLES:
+            bucket["label"].append(len(labels[0]))
+            bucket["qname"].append(len(qname))
+        if _has_epoch(row[2]) and len(bucket["times"]) < MAX_CHANNEL_SAMPLES:
+            when = _epoch(row[2])
+            bucket["times"].append(when)
+
+    hit_sessions: set[str] = set()
+    for session, bucket in _top_groups(buckets).items():
+        ctx.check_cancel()
+        for series, label in (("label", "查询名首标签长度"),
+                              ("qname", "查询名总长度")):
+            channel = tunnel.length_channel(bucket.get(series) or [])
+            if not channel.get("channel"):
+                continue
+            if _emit_channel(
+                    ctx, protocol="DNS", session=session, kind="length",
+                    kind_label=label, encoding="length-ascii",
+                    channel=channel, samples=len(bucket.get(series) or []),
+                    sample_label=label,
+                    first_frame=bucket.get("frame", ""),
+                    seen_flags=seen_flags,
+                    out_name=f"{_safe_stem('dns_tunnel', session)}_length.txt"):
+                hit_sessions.add(session)
+            break
+        channel = tunnel.timing_channel(bucket.get("times") or [])
+        if channel.get("channel"):
+            if _emit_channel(
+                    ctx, protocol="DNS", session=session, kind="timing",
+                    kind_label="查询间隔时序", encoding="timing-interval",
+                    channel=channel, samples=len(bucket.get("times") or []),
+                    sample_label="查询间隔",
+                    first_frame=bucket.get("frame", ""),
+                    seen_flags=seen_flags,
+                    out_name=f"{_safe_stem('dns_tunnel', session)}_timing.txt"):
+                hit_sessions.add(session)
+    return hit_sessions
+
+
+def _report_flow_channels(ctx: FeatureContext, protocol: str,
+                          display_filter: str,
+                          seen_flags: set[str]) -> set[str]:
+    """TCP/UDP 流级隐蔽信道：载荷长度与包间隔（按五元组方向分组）。"""
+    from fnet.utils import tunnel
+
+    rows = _rows(ctx, ["frame.number", "ip.src", "ip.dst",
+                       f"{display_filter}.srcport",
+                       f"{display_filter}.dstport", "data.len",
+                       "frame.time_epoch"],
+                 display_filter, limit=200_000)
+    buckets: dict[str, dict] = {}
+    for row in rows:
+        row = list(row) + [""] * (7 - len(row))
+        size = str(row[5] or "")
+        if not size.isdigit() or int(size) <= 0:
+            continue
+        key = f"{row[1]}:{row[3]}>{row[2]}:{row[4]}"
+        bucket = buckets.setdefault(
+            key, {"request": [], "times": [], "frame": str(row[0] or "")})
+        if len(bucket["request"]) < MAX_CHANNEL_SAMPLES:
+            bucket["request"].append(int(size))
+        if _has_epoch(row[6]) and len(bucket["times"]) < MAX_CHANNEL_SAMPLES:
+            when = _epoch(row[6])
+            bucket["times"].append(when)
+
+    hit_sessions: set[str] = set()
+    for session, bucket in _top_groups(buckets).items():
+        ctx.check_cancel()
+        channel = tunnel.length_channel(bucket.get("request") or [])
+        if channel.get("channel"):
+            if _emit_channel(
+                    ctx, protocol=protocol, session=session, kind="length",
+                    kind_label="载荷长度", encoding="length-ascii",
+                    channel=channel, samples=len(bucket.get("request") or []),
+                    sample_label="载荷长度",
+                    first_frame=bucket.get("frame", ""),
+                    seen_flags=seen_flags,
+                    out_name=f"{_safe_stem(protocol.lower() + '_flow', session)}"
+                             "_length.txt"):
+                hit_sessions.add(session)
+        channel = tunnel.timing_channel(bucket.get("times") or [])
+        if channel.get("channel"):
+            if _emit_channel(
+                    ctx, protocol=protocol, session=session, kind="timing",
+                    kind_label="包间隔时序", encoding="timing-interval",
+                    channel=channel, samples=len(bucket.get("times") or []),
+                    sample_label="包间隔",
+                    first_frame=bucket.get("frame", ""),
+                    seen_flags=seen_flags,
+                    out_name=f"{_safe_stem(protocol.lower() + '_flow', session)}"
+                             "_timing.txt"):
+                hit_sessions.add(session)
     return hit_sessions
 
 
@@ -521,8 +778,9 @@ def _icmp_tunnel(ctx: FeatureContext) -> None:
         ctx.report(f"隧道时间线: {len(timeline)} 个区间，峰值 {peak} 字节/区间",
                    "info")
     seen_flags: set[str] = set()
-    # 长度隐蔽信道与载荷内容无关，先单独检查（载荷可能全是随机密文）。
-    length_sessions = _report_length_channel(ctx, rows, seen_flags)
+    # 长度/时序隐蔽信道与载荷内容无关，先单独检查（载荷可能全是随机密文）。
+    channel_sessions = _report_length_channel(ctx, rows, seen_flags)
+    channel_sessions |= _report_timing_channel(ctx, rows, seen_flags)
     # 从抓包正文挖 password=/Basic 头里的候选口令，供载荷自动解密追加尝试。
     mined: list[str] = []
     try:
@@ -562,8 +820,8 @@ def _icmp_tunnel(ctx: FeatureContext) -> None:
                   f"帧范围 {frame_range or '未知'}，"
                   f"首帧时间戳 {t0:.3f}，末帧时间戳 {t1:.3f}（epoch 秒），"
                   f"{uniform}")
-        if session in length_sessions:
-            detail += ("；该方向的「ICMP 载荷长度隐蔽信道」已解出 flag，"
+        if session in channel_sessions:
+            detail += ("；该方向的「ICMP 长度/时序隐蔽信道」已解出 flag，"
                        "载荷密文很可能只是干扰项")
         ctx.add_finding("protocol", f"ICMP 隧道 {session}",
                         detail=detail,
@@ -591,7 +849,7 @@ def _icmp_tunnel(ctx: FeatureContext) -> None:
             decrypted = _report_payload_analysis(
                 ctx, session, bin_name, first_frame, analysis, seen_flags,
                 preview=payload_preview,
-                length_hit=session in length_sessions)
+                channel_hit=session in channel_sessions)
             dst = session.split(">")[-1].split("#")[0] if ">" in session else ""
             cipher = entry.get("cipher") or {}
             exfil.append({"session": session, "dst": dst,
@@ -611,7 +869,7 @@ def _icmp_tunnel(ctx: FeatureContext) -> None:
                                      "icmp_tunnel"):
         ctx.report(f"隧道数据已保存: {item['path']} ({item['size']} 字节)",
                    "info")
-    _report_exfil_alert(ctx, exfil, length_sessions)
+    _report_exfil_alert(ctx, exfil, channel_sessions)
 
 
 def telnet(ctx: FeatureContext) -> None:
@@ -859,6 +1117,8 @@ def udp(ctx: FeatureContext) -> None:
         if line.strip():
             ctx.report(line, "info")
     _payload_rows(ctx, "UDP 载荷", "udp", ["udp.payload"], max_lines=400)
+    # 流级隐蔽信道：载荷长度或包间隔承载数据（与载荷内容无关）。
+    _report_flow_channels(ctx, "UDP", "udp", set())
 
 
 def tcp(ctx: FeatureContext) -> None:
@@ -870,6 +1130,8 @@ def tcp(ctx: FeatureContext) -> None:
         if line.strip():
             ctx.report(line, "info")
     _payload_rows(ctx, "TCP 载荷", "tcp", ["tcp.payload"], max_lines=500)
+    # 流级隐蔽信道：载荷长度或包间隔承载数据（与载荷内容无关）。
+    _report_flow_channels(ctx, "TCP", "tcp", set())
 
 
 def gtp(ctx: FeatureContext) -> None:

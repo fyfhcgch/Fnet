@@ -1057,7 +1057,179 @@ class FlowsIcmpTest(CtxTestCase):
         alert = [f for f in ctx.findings
                  if f["summary"].startswith("ICMP 隧道载荷为加密数据")]
         self.assertEqual(len(alert), 1)
-        self.assertIn("长度隐蔽信道", alert[0]["detail"])
+        self.assertIn("隐蔽信道", alert[0]["detail"])
+
+
+class ChannelFlowsTest(CtxTestCase):
+    """DNS / TCP / UDP / ICMP 隐蔽信道：长度与包间隔读法。"""
+
+    ALPHABET = ("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                "abcdefghijklmnopqrstuvwxyz0123456789+/")
+
+    class RoutedTshark:
+        """按字段路由罐装行：每个 handler 用不同字段列表查询多次。"""
+
+        def __init__(self, routes: dict[str, list]):
+            self.routes = routes
+            self.path = ""
+            self.calls: list[tuple[str, list]] = []
+
+        def fields(self, pcap, fields, display_filter="", extra=None,
+                   cancel=None):
+            self.calls.append((display_filter, list(fields)))
+            for key, value in self.routes.items():
+                if key in fields:
+                    return value
+            return []
+
+    def _b64_indexes(self, message: str) -> list[int]:
+        encoded = base64.b64encode(message.encode()).decode().rstrip("=")
+        return [self.ALPHABET.index(char) for char in encoded]
+
+    def _epochs(self, message: str) -> list[float]:
+        """间隔 = 字符 ASCII 码（毫秒）；n 个字符需要 n+1 个时间戳。"""
+        times, now = [0.0], 0.0
+        for char in base64.b64encode(message.encode()).decode():
+            now += ord(char) / 1000.0
+            times.append(now)
+        return times
+
+    # -- DNS -----------------------------------------------------------
+    def _dns_rows(self, qnames: list[str],
+                  epochs: list[float] | None = None) -> tuple[list, list]:
+        channel = []
+        for number, qname in enumerate(qnames, 1):
+            when = epochs[number - 1] if epochs else float(number)
+            channel.append([str(number), qname, f"{when:.6f}", ""])
+        dump = [[row[0], row[1], "1", "1.2.3.4", "", "0"] for row in channel]
+        return channel, dump
+
+    def _run_dns(self, channel_rows: list, dump_rows: list):
+        from fnet.features import flows
+
+        fake = self.RoutedTshark({
+            "dns.qry.type": dump_rows,
+            "dns.flags.response": channel_rows,
+        })
+        ctx = make_ctx(self.tmp, fake)
+        flows.dns(ctx)
+        return ctx
+
+    def test_dns_label_length_channel(self):
+        """DNS 首标签长度承载 6 bit 数据块（1–64 → Base64 索引）。"""
+        message = "flag{dns_label_len}"
+        qnames = [("a" * (value + 1)) + ".example.com"
+                  for value in self._b64_indexes(message)]
+        ctx = self._run_dns(*self._dns_rows(qnames))
+        log = self.lines(ctx)
+        self.assertIn("DNS 查询名首标签长度隐蔽信道", log)
+        findings = [f for f in ctx.findings
+                    if f["summary"].startswith("DNS 查询名首标签长度隐蔽信道")]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["level"], "good")
+        self.assertIn(message, findings[0]["detail"])
+        self.assertTrue(findings[0]["extra"]["variant"].startswith("b64-index-1"))
+        self.assertTrue(any(f["kind"] == "flag" and f["summary"] == message
+                            for f in ctx.findings))
+
+    def test_dns_timing_channel(self):
+        """DNS 查询间隔承载字符码。"""
+        message = "flag{dns_timing_chan}"
+        qnames = ["q%d.example.com" % number
+                  for number in range(len(self._epochs(message)))]
+        ctx = self._run_dns(*self._dns_rows(qnames, self._epochs(message)))
+        log = self.lines(ctx)
+        self.assertIn("DNS 查询间隔时序隐蔽信道", log)
+        self.assertTrue(any(f["kind"] == "flag" and f["summary"] == message
+                            for f in ctx.findings))
+
+    def test_normal_dns_has_no_channel(self):
+        """普通域名（定长标签、固定间隔）不应误报。"""
+        qnames = ["www%d.example.com" % (index % 5) for index in range(40)]
+        ctx = self._run_dns(*self._dns_rows(qnames))
+        log = self.lines(ctx)
+        self.assertNotIn("隐蔽信道", log)
+
+    # -- TCP / UDP -----------------------------------------------------
+    @staticmethod
+    def _flow_rows(protocol: str, lengths: list[int],
+                   epochs: list[float]) -> list:
+        return [[str(number), "10.0.0.5", "10.0.0.9", "51000", "8080",
+                 str(length), f"{epochs[number - 1]:.6f}"]
+                for number, length in enumerate(lengths, 1)]
+
+    def test_tcp_payload_length_channel(self):
+        message = "flag{tcp_len_channel}"
+        encoded = base64.b64encode(message.encode()).decode()
+        rows = self._flow_rows("tcp", [ord(char) for char in encoded],
+                               [float(index) for index in range(1, 40)])
+        from fnet.features import flows
+
+        ctx = make_ctx(self.tmp, self.RoutedTshark({
+            "tcp.payload": [],
+            "tcp.srcport": rows,
+        }))
+        flows.tcp(ctx)
+        log = self.lines(ctx)
+        self.assertIn("TCP 载荷长度隐蔽信道", log)
+        self.assertTrue(any(f["kind"] == "flag" and f["summary"] == message
+                            for f in ctx.findings))
+        outputs = list((self.tmp / "out").glob("tcp_flow_*_length.txt"))
+        self.assertTrue(outputs)
+
+    def test_udp_timing_channel(self):
+        message = "flag{udp_timing_chan}"
+        epochs = self._epochs(message)
+        rows = self._flow_rows("udp", [40] * len(epochs), epochs)
+        from fnet.features import flows
+
+        ctx = make_ctx(self.tmp, self.RoutedTshark({
+            "udp.payload": [],
+            "udp.srcport": rows,
+        }))
+        flows.udp(ctx)
+        log = self.lines(ctx)
+        self.assertIn("UDP 包间隔时序隐蔽信道", log)
+        self.assertTrue(any(f["kind"] == "flag" and f["summary"] == message
+                            for f in ctx.findings))
+
+    def test_normal_flow_has_no_channel(self):
+        """定长载荷 + 等间隔的正常 TCP 流不应误报。"""
+        rows = self._flow_rows("tcp", [120] * 40,
+                               [float(index) for index in range(1, 41)])
+        from fnet.features import flows
+
+        ctx = make_ctx(self.tmp, self.RoutedTshark({
+            "tcp.payload": [],
+            "tcp.srcport": rows,
+        }))
+        flows.tcp(ctx)
+        self.assertNotIn("隐蔽信道", self.lines(ctx))
+
+    # -- ICMP 时序 -----------------------------------------------------
+    def test_icmp_timing_channel(self):
+        """ICMP 包间隔承载字符码（载荷本身是普通明文）。"""
+        message = "flag{icmp_timing_chan}"
+        epochs = self._epochs(message)
+        blob = base64.b64encode(b"plain icmp payload for reassembly.\n" * 40)
+        per = max(1, len(blob) // len(epochs))
+        parts = [blob[index:index + per]
+                 for index in range(0, len(blob), per)][:len(epochs)]
+        rows = [[str(number), "10.0.0.5", "10.0.0.9", "8", "0", part.hex(),
+                 f"{epochs[number - 1]:.6f}"]
+                for number, part in enumerate(parts, 1)]
+        from fnet.features import flows
+
+        ctx = make_ctx(self.tmp, self.RoutedTshark({
+            "frame.time_epoch": rows,
+            "data.data": [[row[0], row[5], "8"] for row in rows],
+            "data.len": [[row[0], str(len(row[5]) // 2)] for row in rows],
+        }))
+        flows.icmp(ctx)
+        log = self.lines(ctx)
+        self.assertIn("ICMP 包间隔时序隐蔽信道", log)
+        self.assertTrue(any(f["kind"] == "flag" and f["summary"] == message
+                            for f in ctx.findings))
 
 
 if __name__ == "__main__":

@@ -21,7 +21,8 @@ __all__ = [
     "Chunk", "decode_chunk", "byte_profile", "decode_assembled",
     "parse_sequence", "reassemble", "group_sessions",
     "analyse_dns", "analyse_icmp", "find_flags", "find_flags_loose",
-    "canonical_flag", "length_channel", "write_decoded", "timeline",
+    "canonical_flag", "length_channel", "timing_channel", "write_decoded",
+    "timeline",
 ]
 
 #: Upper bound for everything :func:`write_decoded` writes in one call.
@@ -312,19 +313,34 @@ def decode_assembled(text: str) -> dict:
     return result
 
 
-#: 长度隐蔽信道的 ASCII 可打印区间（空格 ``0x20`` 到 ``~``）。
-LENGTH_MIN = 32
-LENGTH_MAX = 126
-#: 至少多少个包才认为长度序列可能承载文本。
-LENGTH_MIN_PACKETS = 8
-#: 可打印长度占比阈值（低于此值说明长度里混入了非文本值）。
-LENGTH_MIN_RATIO = 0.9
-#: 长度序列至少要有的不同取值数（正常 ping 的定长载荷只有 1 种）。
-LENGTH_MIN_DISTINCT = 6
+#: 长度/时序隐蔽信道的 ASCII 可打印区间（空格 ``0x20`` 到 ``~``）。
+CHANNEL_MIN = 32
+CHANNEL_MAX = 126
+#: 至少多少个样本才认为序列可能承载文本。
+CHANNEL_MIN_SAMPLES = 8
+#: 可打印取值占比阈值（低于此值说明序列里混入了非文本值）。
+CHANNEL_MIN_RATIO = 0.9
+#: 序列至少要有的不同取值数（正常定长载荷只有 1 种）。
+CHANNEL_MIN_DISTINCT = 6
 #: 解码文本的可读性下限：低于此值不认为解出了消息，避免把随机字节当文本。
-LENGTH_MIN_QUALITY = 0.9
+CHANNEL_MIN_QUALITY = 0.9
 #: 解码文本的最小长度。
-LENGTH_MIN_TEXT = 8
+CHANNEL_MIN_TEXT = 8
+#: 时序通道至少需要的间隔样本数（二进制读法每 8 个样本才 1 字节）。
+TIMING_MIN_SAMPLES = 24
+#: 时序二值化后，短/长两簇各自至少要占的比例。
+TIMING_MIN_SPLIT = 0.2
+#: 时序两簇的中位数比值下限（低于此值说明间隔没有被清晰量化）。
+TIMING_MIN_SEPARATION = 1.5
+
+#: 旧名兼容（长度信道即“可打印取值序列”）。
+LENGTH_MIN = CHANNEL_MIN
+LENGTH_MAX = CHANNEL_MAX
+LENGTH_MIN_PACKETS = CHANNEL_MIN_SAMPLES
+LENGTH_MIN_RATIO = CHANNEL_MIN_RATIO
+LENGTH_MIN_DISTINCT = CHANNEL_MIN_DISTINCT
+LENGTH_MIN_QUALITY = CHANNEL_MIN_QUALITY
+LENGTH_MIN_TEXT = CHANNEL_MIN_TEXT
 
 
 def _printable_ratio(text: str) -> float:
@@ -334,18 +350,18 @@ def _printable_ratio(text: str) -> float:
     return good / len(text)
 
 
-def _length_variants(numbers: list[int]) -> list[tuple[str, list[int]]]:
-    """长度序列的候选读法：可打印过滤、原始字节、去连续重复。
+def _numeric_variants(numbers: list[int]) -> list[tuple[str, list[int]]]:
+    """数值序列的候选读法：可打印过滤、原始字节、去连续重复。
 
-    不同隧道实现会把长度写成 ASCII、原始字节，或因重传出现连续重复；
-    这里给出有界候选，由 :func:`length_channel` 统一打分选择，避免针对
-    单个样本写死一种读法。
+    不同隧道实现会把字符写成 ASCII 码、原始字节，或因重传出现连续重复；
+    这里给出有界候选，由 :func:`length_channel` / :func:`timing_channel`
+    统一打分选择，避免针对单个样本写死一种读法。
     """
     out: list[tuple[str, list[int]]] = []
     if not numbers:
         return out
-    printable = [v for v in numbers if LENGTH_MIN <= v <= LENGTH_MAX]
-    if printable and len(printable) / len(numbers) >= LENGTH_MIN_RATIO:
+    printable = [v for v in numbers if CHANNEL_MIN <= v <= CHANNEL_MAX]
+    if printable and len(printable) / len(numbers) >= CHANNEL_MIN_RATIO:
         out.append(("printable", printable))
     if all(0 <= v <= 255 for v in numbers):
         out.append(("raw", list(numbers)))
@@ -354,11 +370,103 @@ def _length_variants(numbers: list[int]) -> list[tuple[str, list[int]]]:
         if not dedup or dedup[-1] != value:
             dedup.append(value)
     if dedup and dedup != numbers:
-        if all(LENGTH_MIN <= v <= LENGTH_MAX for v in dedup):
+        if all(CHANNEL_MIN <= v <= CHANNEL_MAX for v in dedup):
             out.append(("dedup", dedup))
         if all(0 <= v <= 255 for v in dedup):
             out.append(("dedup_raw", dedup))
     return out
+
+
+#: 旧名兼容。
+_length_variants = _numeric_variants
+
+#: Base64 标准字母表，供「取值即 Base64 索引」读法使用。
+_B64_ALPHABET = ("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                 "abcdefghijklmnopqrstuvwxyz0123456789+/")
+
+
+def _b64_index_variants(numbers: list[int]) -> list[tuple[str, str]]:
+    """把 0–63 / 1–64 的取值当作 Base64 索引还原成文本。
+
+    DNS 标签长度上限是 63，放不下 ASCII 码（最大 122），所以这类隧道
+    常把 6 bit 数据块映射成标签长度（``0–63`` 或 ``1–64``）。这里把取值
+    还原成 Base64 字符序列，交给统一打分流程再做一次 Base64 解码。
+    """
+    out: list[tuple[str, str]] = []
+    if not numbers:
+        return out
+    dedup = [value for index, value in enumerate(numbers)
+             if index == 0 or value != numbers[index - 1]]
+    for suffix, sequence in (("", numbers), ("-dedup", dedup)):
+        if suffix and sequence == numbers:
+            continue
+        if all(0 <= value <= 63 for value in sequence):
+            out.append((f"b64-index{suffix}",
+                        "".join(_B64_ALPHABET[value] for value in sequence)))
+        if all(1 <= value <= 64 for value in sequence):
+            out.append((f"b64-index-1{suffix}",
+                        "".join(_B64_ALPHABET[value - 1]
+                                for value in sequence)))
+    return out
+
+
+def _peel_layers(sequence: str) -> tuple[str, list[dict], list[str]]:
+    """剥离编码层，返回 (最佳文本, 各层结果, flags)。"""
+    layers: list[dict] = []
+    best = ""
+    found: list[str] = find_flags(sequence) or find_flags_loose(sequence)
+    if found:
+        best = sequence
+    decoded = decode_assembled(sequence)
+    if decoded.get("text") or decoded.get("flags"):
+        decoded_text = decoded.get("text") or ""
+        decoded_flags = (list(decoded.get("flags") or [])
+                         or find_flags_loose(decoded_text))
+        layers.append({"encoding": decoded.get("encoding") or "text",
+                       "text": decoded_text,
+                       "flags": decoded_flags})
+        if decoded_flags or not found:
+            best = decoded_text or sequence
+            found = decoded_flags or found
+    if not found and len(sequence) % 4:
+        # 序列被截断（丢包/少一个间隔）时 Base64 尾字符缺失，flag 的 `}`
+        # 会落在最后一个不完整块里。这里只补一个字符并只采纳带 flag 的
+        # 结果，避免把普通短文本猜成完整消息。
+        for char in _B64_ALPHABET:
+            probe = decode_assembled(sequence + char)
+            flags = (list(probe.get("flags") or [])
+                     or find_flags_loose(probe.get("text") or ""))
+            if not flags:
+                continue
+            layers.append({"encoding": (probe.get("encoding") or "base64")
+                           + "+尾部补全",
+                           "text": probe.get("text") or "",
+                           "flags": flags})
+            best = probe.get("text") or sequence
+            found = flags
+            break
+    return best, layers, found
+
+
+def _score_readings(candidates: list[tuple[str, str, str]]) -> tuple | None:
+    """给候选读法打分，返回最可信的一种。
+
+    ``candidates`` 每项为 ``(variant, order, text)``；得分优先看是否带
+    flag，其次看解码文本的可读性与长度。解不出可读文本且没有 flag 的
+    候选直接丢弃，避免随机序列被误报成信道。
+    """
+    best: tuple | None = None
+    for variant, order, text in candidates:
+        decoded_text, layers, flags = _peel_layers(text)
+        quality = _printable_ratio(decoded_text)
+        if not flags and (quality < CHANNEL_MIN_QUALITY
+                          or len(decoded_text) < CHANNEL_MIN_TEXT):
+            continue
+        score = ((1000 if flags else 0) + quality * 100
+                 + min(len(decoded_text), 400) / 10)
+        if best is None or score > best[0]:
+            best = (score, variant, order, text, decoded_text, layers, flags)
+    return best
 
 
 def length_channel(values: Iterable[int]) -> dict:
@@ -385,57 +493,134 @@ def length_channel(values: Iterable[int]) -> dict:
         except (TypeError, ValueError):
             continue
     result["values"] = numbers
-    if len(numbers) < LENGTH_MIN_PACKETS:
+    if len(numbers) < CHANNEL_MIN_SAMPLES:
         return result
 
-    def peel(sequence: str) -> tuple[str, list[dict], list[str]]:
-        """剥离编码层，返回 (最佳文本, 各层结果, flags)。"""
-        layers: list[dict] = []
-        best = ""
-        found: list[str] = find_flags(sequence) or find_flags_loose(sequence)
-        if found:
-            best = sequence
-        decoded = decode_assembled(sequence)
-        if decoded.get("text") or decoded.get("flags"):
-            decoded_text = decoded.get("text") or ""
-            decoded_flags = (list(decoded.get("flags") or [])
-                             or find_flags_loose(decoded_text))
-            layers.append({"encoding": decoded.get("encoding") or "text",
-                           "text": decoded_text,
-                           "flags": decoded_flags})
-            if decoded_flags or not found:
-                best = decoded_text or sequence
-                found = decoded_flags or found
-        return best, layers, found
-
-    best: tuple | None = None
-    for variant, sequence in _length_variants(numbers):
-        distinct = len({v for v in sequence if LENGTH_MIN <= v <= LENGTH_MAX})
-        if distinct < LENGTH_MIN_DISTINCT:
+    candidates: list[tuple[str, str, str]] = []
+    ratios: dict[str, float] = {}
+    for variant, sequence in _numeric_variants(numbers):
+        distinct = len({v for v in sequence
+                        if CHANNEL_MIN <= v <= CHANNEL_MAX})
+        if distinct < CHANNEL_MIN_DISTINCT:
             continue
-        for order, ordered in (("forward", sequence),
-                               ("reversed", list(reversed(sequence)))):
-            text = "".join(chr(v) for v in ordered)
-            decoded_text, layers, flags = peel(text)
-            quality = _printable_ratio(decoded_text)
-            if not flags and (quality < LENGTH_MIN_QUALITY
-                              or len(decoded_text) < LENGTH_MIN_TEXT):
-                continue
-            score = ((1000 if flags else 0) + quality * 100
-                     + min(len(decoded_text), 400) / 10)
-            if best is None or score > best[0]:
-                best = (score, variant, order, text, decoded_text, layers,
-                        flags, sequence)
+        ratios[variant] = round(
+            sum(CHANNEL_MIN <= v <= CHANNEL_MAX for v in sequence)
+            / max(len(sequence), 1), 4)
+        candidates.append((variant, "forward",
+                           "".join(chr(v) for v in sequence)))
+        candidates.append((variant, "reversed",
+                           "".join(chr(v) for v in reversed(sequence))))
+    # 小取值序列（如 DNS 标签长度 0–63/1–64）放不下 ASCII，按 Base64 索引读。
+    if len({v for v in numbers}) >= CHANNEL_MIN_DISTINCT:
+        for variant, sequence in _b64_index_variants(numbers):
+            ratios[variant] = 1.0
+            candidates.append((variant, "forward", sequence))
+            candidates.append((variant, "reversed", sequence[::-1]))
+    best = _score_readings(candidates)
     if best is None:
         return result
 
-    _, variant, order, text, decoded_text, layers, flags, sequence = best
+    _, variant, order, text, decoded_text, layers, flags = best
     result.update(
         channel=True, text=text, decodings=layers, decoded_text=decoded_text,
         flags=flags, order=order, variant=variant,
-        printable_ratio=round(
-            sum(LENGTH_MIN <= v <= LENGTH_MAX for v in sequence)
-            / max(len(sequence), 1), 4))
+        printable_ratio=ratios.get(variant, 0.0))
+    return result
+
+
+def _bits_to_text(bits: str, bit_order: str = "msb") -> str:
+    """把 ``0101...`` 位流按 8 位一组还原成字节文本（两种位序）。"""
+    usable = len(bits) - len(bits) % 8
+    if usable < 16:
+        return ""
+    raw = bytearray()
+    for index in range(0, usable, 8):
+        chunk = bits[index:index + 8]
+        if bit_order == "lsb":
+            chunk = chunk[::-1]
+        raw.append(int(chunk, 2))
+    return _text_of(bytes(raw))
+
+
+def timing_channel(times: Iterable[float]) -> dict:
+    """Detect a covert timing channel (inter-packet gap carries data).
+
+    两种通用读法：
+
+    1. **数值读法**：间隔（秒 × 10/100/1000）直接就是字符码；
+    2. **二值读法**：以中位数把间隔分成短/长两簇（两种极性、MSB/LSB 两种
+       位序、8 种位偏移都试），每 8 个间隔还原 1 字节。
+
+    两种读法都复用 :func:`_score_readings` 的“flag 优先、其次可读文本”
+    打分，恒定间隔或抖动无规律的流量不会误报。
+
+    返回结构与 :func:`length_channel` 相同，另加 ``unit`` 字段。
+    """
+    result: dict = {"channel": False, "values": [], "text": "",
+                    "printable_ratio": 0.0, "decodings": [], "decoded_text": "",
+                    "flags": [], "order": "forward", "variant": "",
+                    "unit": "s"}
+    numbers: list[float] = []
+    for value in times or []:
+        try:
+            numbers.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    deltas: list[float] = []
+    for before, after in zip(numbers, numbers[1:]):
+        if after >= before:
+            deltas.append(after - before)
+    result["values"] = [round(item, 6) for item in deltas]
+    if len(deltas) < TIMING_MIN_SAMPLES:
+        return result
+
+    candidates: list[tuple[str, str, str]] = []
+    ratios: dict[str, float] = {}
+    # 1) 间隔直接当字符码：秒 → 毫秒/厘秒/分秒。
+    for unit, scale in (("ms", 1000.0), ("cs", 100.0), ("ds", 10.0)):
+        numbers_i = [int(round(item * scale)) for item in deltas]
+        for variant, sequence in _numeric_variants(numbers_i):
+            distinct = len({v for v in sequence
+                            if CHANNEL_MIN <= v <= CHANNEL_MAX})
+            if distinct < CHANNEL_MIN_DISTINCT:
+                continue
+            key = f"{variant}/{unit}"
+            ratios[key] = round(
+                sum(CHANNEL_MIN <= v <= CHANNEL_MAX for v in sequence)
+                / max(len(sequence), 1), 4)
+            candidates.append((key, "forward",
+                               "".join(chr(v) for v in sequence)))
+            candidates.append((key, "reversed",
+                               "".join(chr(v) for v in reversed(sequence))))
+
+    # 2) 二值化：中位数分短/长两簇，短=0/长=1（两种极性都试）。
+    ordered = sorted(deltas)
+    median = ordered[len(ordered) // 2]
+    if median > 0 and max(deltas) / median >= TIMING_MIN_SEPARATION:
+        for polarity, invert in (("high=1", False), ("high=0", True)):
+            bits = "".join("1" if (item > median) != invert else "0"
+                           for item in deltas)
+            high = bits.count("1")
+            low = len(bits) - high
+            if min(high, low) < len(bits) * TIMING_MIN_SPLIT:
+                continue
+            for offset in range(8):
+                trimmed = bits[offset:]
+                for bit_order in ("msb", "lsb"):
+                    text = _bits_to_text(trimmed, bit_order)
+                    if text:
+                        key = f"bits/{polarity}/{bit_order}/+{offset}"
+                        ratios[key] = 1.0
+                        candidates.append((key, "forward", text))
+    best = _score_readings(candidates)
+    if best is None:
+        return result
+
+    _, variant, order, text, decoded_text, layers, flags = best
+    result.update(
+        channel=True, text=text, decodings=layers, decoded_text=decoded_text,
+        flags=flags, order=order, variant=variant,
+        printable_ratio=ratios.get(variant, 0.0))
     return result
 
 

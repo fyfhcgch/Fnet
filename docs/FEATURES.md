@@ -136,15 +136,15 @@ hashcat -m 5500 ntlm_hashes.txt wordlist.txt   # NetNTLMv1
 
 | 复选框 | Handler | 功能 | 说明 |
 | --- | --- | --- | --- |
-| `checkBox_23` | `flows.dns` | DNS流量分析 | 查询/响应、长标签检测；按域名分块按序重组（Base64/Base32/Hex）、隧道时间线、解码数据落盘与 flag 提取 |
-| `checkBox_20` | `flows.icmp` | ICMP流量分析 | ICMP 载荷、长度分布；按源/目的/ID 重组分块隧道、时间线与解码落盘；seq 恒定（echo 标识）时按帧序整包重组并整段二次解码；**载荷长度隐蔽信道**（长度即 ASCII/原始字节 → Base64/Base32/Hex → 文本/flag；可打印过滤、原始字节、去连续重复三种读法 × 正逆序自动打分择优，请求缺失时回退应答方向，定长 ping 与随机长度不误报）；对加密载荷自动做分层分析（编码剥离/加密识别/解密尝试/文件还原，`payload_bin`，口令候选含文件名 IP 与抓包中挖出的口令），每方向产出「载荷分析」发现（失败附 openssl 命令示例与参数指引），同方向已由长度信道解出 flag 时自动标注密文为干扰项，加密外传告警收敛为一条并并入公网 IOC，每个会话输出 kind=`protocol` 的结构化发现 |
+| `checkBox_23` | `flows.dns` | DNS流量分析 | 查询/响应、长标签检测；按域名分块按序重组（Base64/Base32/Hex）、隧道时间线、解码数据落盘与 flag 提取；**长度/时序隐蔽信道**（首标签长度、查询名总长度、查询间隔；小取值按 Base64 索引还原，取值/间隔读法 × 正逆序自动打分，普通域名不误报） |
+| `checkBox_20` | `flows.icmp` | ICMP流量分析 | ICMP 载荷、长度分布；按源/目的/ID 重组分块隧道、时间线与解码落盘；seq 恒定（echo 标识）时按帧序整包重组并整段二次解码；**长度/时序隐蔽信道**（载荷长度或包间隔即 ASCII/原始字节/Base64 索引 → Base64/Base32/Hex → 文本/flag；可打印过滤、原始字节、去连续重复、Base64 索引四种读法 × 正逆序自动打分择优，时序另含毫秒/厘秒/分秒与短长二值化读法；请求缺失时回退应答方向，定长 ping、等间隔与随机抖动不误报）；对加密载荷自动做分层分析（编码剥离/加密识别/解密尝试/文件还原，`payload_bin`，口令候选含文件名 IP 与抓包中挖出的口令），每方向产出「载荷分析」发现（失败附 openssl 命令示例与参数指引），同方向已由长度信道解出 flag 时自动标注密文为干扰项，加密外传告警收敛为一条并并入公网 IOC，每个会话输出 kind=`protocol` 的结构化发现 |
 | `checkBox_19` | `flows.telnet` | Telnet流量分析 | Telnet 会话内容还原 |
 | `checkBox_27` | `flows.ftp` | FTP流量分析 | USER/PASS、命令、数据通道与传输文件 |
 | `checkBox_28` | `flows.smtp` | SMTP流量分析 | SMTP/IMAP/POP3 命令与凭据、发件人/收件人/邮箱、MIME 头、正文与附件还原（附件落盘并计算 MD5/SHA256） |
 | `checkBox_37` | `flows.mysql` | MYSQL数据分析 | `mysql_native_password`/`caching_sha2_password` 握手认证、查询、结果集、`LOAD DATA LOCAL INFILE` 上传文件与 `LOAD_FILE()` 读取内容 |
 | `checkBox_41` | `flows.gtp` | 4G/5G通信协议分析 | GTP 隧道、TEID 与异常检测 |
-| `checkBox_35` | `flows.udp` | UDP流分析 | UDP 会话与载荷；输出可能较多 |
-| `checkBox_33` | `flows.tcp` | TCP流分析 | TCP 流重组、会话统计与内容提取 |
+| `checkBox_35` | `flows.udp` | UDP流分析 | UDP 会话与载荷；按五元组方向检测**载荷长度/包间隔隐蔽信道**；输出可能较多 |
+| `checkBox_33` | `flows.tcp` | TCP流分析 | TCP 流重组、会话统计与内容提取；按五元组方向检测**载荷长度/包间隔隐蔽信道** |
 | `checkBox_44` | `arp.analyze` | ARP协议分析 | IP/MAC 冲突、免费 ARP 与异常字段 |
 | `checkBox_48` | `ldap.analyze` | LDAP流量分析 | LDAP 绑定凭据/SASL 机制、查询 base/filter、条目属性（AD 账号等）与 StartTLS 告警 |
 | `checkBox_49` | `smb.analyze` | SMB流量分析 | SMB2/3 共享与会话、NTLM 身份、文件读写还原落盘、加密/压缩告警、解密 SMB3 加密流量（会话密钥写入 `smb3_keys.txt`） |

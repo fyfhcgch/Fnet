@@ -368,6 +368,12 @@ Flag 展示统一规范化：只把 `flag` 前缀的大小写改成小写（抓�
 `FLAG{...}`），`CTF{}`、`NSSCTF{}` 等其它前缀保持原样；原文匹配保存在
 `extra.raw_flag`，详情里也会注明“原文匹配 …”，平台区分大小写时按原文提交。
 
+隐蔽信道结果统一以 `kind=protocol` 记录，`extra.kind` 区分 `length`（载荷/取值
+长度）与 `timing`（包间隔），`extra.protocol` 为 `ICMP`/`DNS`/`TCP`/`UDP`，
+`extra.variant` 是实际命中的读法（可打印取值、原始字节、Base64 索引、毫秒/
+厘秒/分秒数值或短长二值化），`extra.output` 指向落盘的解码文本；解出 flag 时
+另有独立的 `kind=flag` 条目进入 Flag 汇总条。
+
 隧道类结果（`extra.artifact`/`extra.bin` 以 `.bin` 结尾，或 `extra.encrypted`
 为真）的详情弹窗内联“载荷”面板：
 

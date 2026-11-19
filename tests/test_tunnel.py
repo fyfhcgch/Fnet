@@ -351,6 +351,102 @@ class LengthChannelTest(unittest.TestCase):
         self.assertEqual(tunnel.find_flags_loose("...UcFLAG{abc}::"),
                          ["FLAG{abc}"])
 
+    def test_small_values_decode_as_base64_index(self):
+        """DNS 标签长度最大 63，放不下 ASCII：按 Base64 索引也能解出 flag。"""
+        encoded = base64.b64encode(b"flag{dns_label_len_channel}").decode()
+        alphabet = tunnel._B64_ALPHABET
+        indexes = [alphabet.index(char) for char in encoded]
+        for values, variant in ((indexes, "b64-index"),
+                                ([value + 1 for value in indexes],
+                                 "b64-index-1")):
+            result = tunnel.length_channel(values)
+            self.assertTrue(result["channel"], variant)
+            self.assertEqual(result["variant"], variant)
+            self.assertEqual(result["flags"], ["flag{dns_label_len_channel}"])
+
+    def test_random_label_lengths_are_not_a_channel(self):
+        """随机标签长度不能因为落在 0–63 就被当成 Base64 信道。"""
+        import random
+        rng = random.Random(5)
+        values = [rng.randint(4, 40) for _ in range(90)]
+        self.assertFalse(tunnel.length_channel(values)["channel"])
+
+    def test_truncated_base64_recovers_flag(self):
+        """序列被截断（少一个间隔/丢包）时补全尾字符仍能解出完整 flag。"""
+        encoded = base64.b64encode(b"flag{truncated_channel}").decode()
+        truncated = encoded[:-1]          # 丢掉最后一个 Base64 字符
+        result = tunnel.length_channel([ord(char) for char in truncated])
+        self.assertTrue(result["channel"])
+        self.assertEqual(result["flags"], ["flag{truncated_channel}"])
+
+    def test_truncated_plain_text_is_not_guessed(self):
+        """补全只采纳带 flag 的结果，普通短文本不能凭空补成完整消息。"""
+        message = b"hello there plain text!!"      # 24 字节 → 32 字符 Base64
+        encoded = base64.b64encode(message).decode()
+        self.assertEqual(len(encoded) % 4, 0)
+        result = tunnel.length_channel([ord(char) for char in encoded[:-1]])
+        self.assertNotEqual(result["decoded_text"], message.decode())
+
+
+class TimingChannelTest(unittest.TestCase):
+    """时序隐蔽信道：间隔即字符码，或短/长两簇即比特。"""
+
+    MESSAGE = "flag{timing_channel}"
+    ALPHABET = ("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                "abcdefghijklmnopqrstuvwxyz0123456789+/")
+
+    def _numeric_times(self) -> list[float]:
+        encoded = base64.b64encode(self.MESSAGE.encode()).decode()
+        times = [0.0]
+        for char in encoded:
+            times.append(times[-1] + ord(char) / 1000.0)
+        return times
+
+    def _binary_times(self, unit: float = 0.1) -> list[float]:
+        encoded = base64.b64encode(self.MESSAGE.encode()).decode()
+        bits = "".join(f"{byte:08b}" for byte in encoded.encode())
+        times = [0.0]
+        for bit in bits:
+            times.append(times[-1] + (unit if bit == "0" else unit * 3))
+        return times
+
+    def test_numeric_intervals_decode_to_flag(self):
+        result = tunnel.timing_channel(self._numeric_times())
+        self.assertTrue(result["channel"])
+        self.assertEqual(result["flags"], [self.MESSAGE])
+        self.assertTrue(result["variant"].endswith("/ms"))
+
+    def test_binary_intervals_decode_to_flag(self):
+        result = tunnel.timing_channel(self._binary_times())
+        self.assertTrue(result["channel"])
+        self.assertEqual(result["flags"], [self.MESSAGE])
+        self.assertTrue(result["variant"].startswith("bits/"))
+
+    def test_constant_intervals_are_not_a_channel(self):
+        self.assertFalse(
+            tunnel.timing_channel([index * 1.0 for index in range(60)])
+            ["channel"])
+
+    def test_random_jitter_is_not_a_channel(self):
+        import random
+        rng = random.Random(3)
+        times, now = [], 0.0
+        for _ in range(200):
+            now += 1.0 + rng.random()
+            times.append(now)
+        self.assertFalse(tunnel.timing_channel(times)["channel"])
+
+    def test_short_sequence_is_not_a_channel(self):
+        self.assertFalse(tunnel.timing_channel([0.0, 0.1, 0.3, 0.4])["channel"])
+
+    def test_base64_index_reading_matches_small_values(self):
+        """取值落在 0–63 时，Base64 索引读法要能解出文本。"""
+        encoded = base64.b64encode(self.MESSAGE.encode()).decode().rstrip("=")
+        indexes = [self.ALPHABET.index(char) for char in encoded]
+        result = tunnel.length_channel(indexes)
+        self.assertTrue(result["channel"])
+        self.assertEqual(result["flags"], [self.MESSAGE])
+
 
 if __name__ == "__main__":
     unittest.main()
