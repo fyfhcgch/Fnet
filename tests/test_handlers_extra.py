@@ -1002,7 +1002,7 @@ class FlowsIcmpTest(CtxTestCase):
 
 
     def test_length_channel_finds_embedded_flag(self):
-        """长度隐写：每个请求包长度就是 ASCII 码（fetus_pcap 考点）。"""
+        """长度隐蔽信道：每个请求包长度就是 ASCII 码。"""
         shadow = ("ubuntu:$6$LhHRomTE$M7C4n84UcFLAG{length_channel}::")
         encoded = base64.b64encode(shadow.encode()).decode()
         rows = [[str(number), "192.168.3.73", "54.199.175.227", "8", "0",
@@ -1010,17 +1010,23 @@ class FlowsIcmpTest(CtxTestCase):
                 for number, char in enumerate(encoded, 1)]
         ctx = self._run_icmp(rows)
         log = self.lines(ctx)
-        self.assertIn("ICMP 载荷长度隐写", log)
+        self.assertIn("ICMP 载荷长度隐蔽信道", log)
         finding = [f for f in ctx.findings
-                   if f["summary"].startswith("ICMP 载荷长度隐写")]
+                   if f["summary"].startswith("ICMP 载荷长度隐蔽信道")]
         self.assertEqual(len(finding), 1)
         self.assertEqual(finding[0]["level"], "good")
         self.assertIn("ubuntu", finding[0]["detail"])
-        self.assertIn("FLAG{length_channel}", finding[0]["detail"])
+        self.assertIn("flag{length_channel}", finding[0]["detail"])
         self.assertEqual(finding[0]["extra"]["encoding"], "length-ascii")
+        self.assertEqual(finding[0]["extra"]["variant"], "printable")
         self.assertTrue(any(f["kind"] == "flag" and
-                            f["summary"] == "FLAG{length_channel}"
+                            f["summary"] == "flag{length_channel}"
                             for f in ctx.findings))
+        # 原文里的 FLAG 前缀保留在 extra.raw_flag，便于核对抓包。
+        raw = [f for f in ctx.findings
+               if f["kind"] == "flag" and f["summary"] == "flag{length_channel}"]
+        self.assertEqual(raw[0]["extra"].get("raw_flag"),
+                         "FLAG{length_channel}")
         # finding 的「帧」列要能直接跳到长度序列的第一帧。
         self.assertEqual(finding[0]["frame"], "1")
         outputs = list((self.tmp / "out").glob("*_length.txt"))
@@ -1028,7 +1034,7 @@ class FlowsIcmpTest(CtxTestCase):
         self.assertIn("ubuntu", outputs[0].read_text("utf-8"))
 
     def test_length_channel_hint_marks_ciphertext_as_decoy(self):
-        """同方向已由长度隐写解出 flag 时，载荷分析要提示密文是干扰项。"""
+        """同方向已由长度隐蔽信道解出 flag 时，载荷分析要提示密文是干扰项。"""
         import base64 as b64
         import random
 
@@ -1036,8 +1042,8 @@ class FlowsIcmpTest(CtxTestCase):
         encoded = b64.b64encode(shadow.encode()).decode()
         rng = random.Random(7)
         alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-        # fetus 同款：载荷本身是可打印的 base64 文本（拼起来解码后是随机
-        # 字节 → 判为密文），而每包长度恰好是消息字符的 ASCII 码。
+        # 载荷本身是可打印的 base64 文本（拼起来解码后是随机字节 → 判为
+        # 密文），而每包长度恰好是消息字符的 ASCII 码。
         rows = []
         for number, char in enumerate(encoded, 1):
             body = "".join(rng.choice(alphabet) for _ in range(ord(char)))
@@ -1051,7 +1057,7 @@ class FlowsIcmpTest(CtxTestCase):
         alert = [f for f in ctx.findings
                  if f["summary"].startswith("ICMP 隧道载荷为加密数据")]
         self.assertEqual(len(alert), 1)
-        self.assertIn("长度隐写", alert[0]["detail"])
+        self.assertIn("长度隐蔽信道", alert[0]["detail"])
 
 
 if __name__ == "__main__":

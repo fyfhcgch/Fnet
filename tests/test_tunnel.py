@@ -292,10 +292,10 @@ class FindFlagsTest(unittest.TestCase):
 
 
 class LengthChannelTest(unittest.TestCase):
-    """ICMP 载荷长度隐写：长度即 ASCII（fetus_pcap.pcap 考点）。"""
+    """ICMP 载荷长度隐蔽信道：长度即 ASCII。"""
 
     SHADOW = ("::\\nmongodb:!:17843:0:99999:7:::\\n"
-              "ubuntu:$6$LhHRomTE$M7C4n84UcFLAG{xx2b8a_6mm64c_fsociety}::")
+              "ubuntu:$6$LhHRomTE$M7C4n84UcFLAG{embedded_in_hash}::")
 
     def _lengths(self) -> list[int]:
         encoded = base64.b64encode(self.SHADOW.encode()).decode()
@@ -307,15 +307,30 @@ class LengthChannelTest(unittest.TestCase):
         self.assertEqual(result["printable_ratio"], 1.0)
         self.assertIn("ubuntu", result["decoded_text"])
         self.assertEqual(result["flags"],
-                         ["FLAG{xx2b8a_6mm64c_fsociety}"])
+                         ["FLAG{embedded_in_hash}"])
+        self.assertEqual(result["variant"], "printable")
         self.assertEqual([item["encoding"] for item in result["decodings"]],
                          ["base64"])
+
+    def test_canonical_flag_lowercases_only_flag_prefix(self):
+        self.assertEqual(tunnel.canonical_flag("FLAG{abc}"), "flag{abc}")
+        self.assertEqual(tunnel.canonical_flag("flag{abc}"), "flag{abc}")
+        self.assertEqual(tunnel.canonical_flag("CTF{abc}"), "CTF{abc}")
+        self.assertEqual(tunnel.canonical_flag("NSSCTF{abc}"), "NSSCTF{abc}")
+        self.assertEqual(tunnel.canonical_flag(""), "")
+
+    def test_raw_lengths_variant_is_offered(self):
+        """长度按原始字节写入时，候选读法里要包含 raw。"""
+        numbers = [70, 76, 65, 71, 7, 8, 9]  # 混入少量非可打印长度
+        labels = [label for label, _ in tunnel._length_variants(numbers)]
+        self.assertIn("raw", labels)
+        self.assertNotIn("printable", labels)
 
     def test_reversed_lengths_are_detected(self):
         result = tunnel.length_channel(list(reversed(self._lengths())))
         self.assertTrue(result["channel"])
         self.assertEqual(result["order"], "reversed")
-        self.assertIn("flag{xx2b8a_6mm64c_fsociety}",
+        self.assertIn("flag{embedded_in_hash}",
                       "".join(result["flags"]).lower())
 
     def test_constant_ping_lengths_are_not_a_channel(self):
@@ -323,6 +338,13 @@ class LengthChannelTest(unittest.TestCase):
 
     def test_short_sequence_is_not_a_channel(self):
         self.assertFalse(tunnel.length_channel([65, 66, 67])["channel"])
+
+    def test_random_lengths_without_text_are_not_a_channel(self):
+        """随机长度（解不出可读文本）不能误报成隐蔽信道。"""
+        import random
+        rng = random.Random(11)
+        values = [rng.randint(40, 1400) for _ in range(120)]
+        self.assertFalse(tunnel.length_channel(values)["channel"])
 
     def test_loose_flag_matches_embedded_token(self):
         self.assertEqual(tunnel.find_flags("...UcFLAG{abc}::"), [])

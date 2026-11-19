@@ -58,6 +58,10 @@ class FeatureContext:
 
         Handlers should still log the human readable line; findings are the
         machine friendly projection of the same discovery.
+
+        ``kind="flag"`` 的摘要统一规范化：只把 ``flag`` 前缀的大小写改成
+        平台通行的 ``flag{...}``，其余前缀（``CTF{}`` / ``NSSCTF{}`` 等）
+        保持原样；原文另存到 ``extra["raw_flag"]``，方便核对抓包原文。
         """
         if len(self.findings) >= findings_mod.MAX_FINDINGS:
             if not self._findings_capped:
@@ -66,6 +70,16 @@ class FeatureContext:
                     f"结构化结果达到上限 {findings_mod.MAX_FINDINGS} 条，后续发现不再记录",
                     "warn")
             return None
+        if kind == "flag":
+            from fnet.utils.tunnel import canonical_flag
+            raw = str(summary or "").strip()
+            summary = canonical_flag(raw)
+            if summary != raw:
+                extra = dict(extra or {})
+                extra.setdefault("raw_flag", raw)
+                # 不吞掉原文：平台若区分大小写，按原文提交。
+                note = f"（原文匹配 {raw}，如平台区分大小写请按原文提交）"
+                detail = f"{detail}{note}" if detail else note
         item = findings_mod.make(kind, summary,
                                  frame=self.original_frame(frame),
                                  detail=detail, level=level, extra=extra)

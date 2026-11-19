@@ -56,13 +56,11 @@ MAX_PREVIEW_CHARS = 2000
 #: 解压产物上限（与 openssl_enc.MAX_INFLATE_BYTES 保持一致）。
 MAX_INFLATE_BYTES = openssl_enc.MAX_INFLATE_BYTES
 
-#: 内置口令候选（按优先级排序；``fetus`` 来自真实样本 fetus_pcap.pcap）。
+#: 内置口令候选（按常见度排序；全部为通用弱口令/题面常用词）。
 DEFAULT_PASSWORDS = (
     "", "icmp", "icmp_tunnel", "password", "123456", "admin",
-    "toor", "flag", "ctf", "syclover",
+    "toor", "flag", "ctf", "root", "test",
 )
-#: 追加在文件名 IP 之后的样本相关口令。
-TAIL_PASSWORDS = ("fetus",)
 
 #: cipher 尝试顺序（常见度优先）。
 CIPHERS = ("aes-256-cbc", "aes-128-cbc", "aes-256-ctr", "aes-128-ctr",
@@ -337,7 +335,7 @@ def _ips_from_name(name: str) -> list[str]:
 
 
 def default_passwords(name: str = "", extra: list[str] | None = None) -> list[str]:
-    """口令候选：内置常见口令 + 文件名里的 IP + 样本相关口令（去重保序）。"""
+    """口令候选：内置常见口令 + 文件名里的 IP + 调用方补充（去重保序）。"""
     out: list[str] = []
     for pw in DEFAULT_PASSWORDS:
         if pw not in out:
@@ -345,9 +343,6 @@ def default_passwords(name: str = "", extra: list[str] | None = None) -> list[st
     for ip in _ips_from_name(name):
         if ip not in out:
             out.append(ip)
-    for pw in TAIL_PASSWORDS:
-        if pw not in out:
-            out.append(pw)
     for pw in extra or []:
         text = str(pw)
         if text not in out:

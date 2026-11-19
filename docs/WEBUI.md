@@ -364,6 +364,10 @@ CyberChef 入口）。解码失败的原因只显示在面板内，不影响弹�
 `extra.flags` 兜底出来的 chip 点击即复制。详情弹窗里 `kind=flag` 或带
 `extra.flags` 的结果顶部也会显示同样的 Flag 横幅。
 
+Flag 展示统一规范化：只把 `flag` 前缀的大小写改成小写（抓包原文可能是
+`FLAG{...}`），`CTF{}`、`NSSCTF{}` 等其它前缀保持原样；原文匹配保存在
+`extra.raw_flag`，详情里也会注明“原文匹配 …”，平台区分大小写时按原文提交。
+
 隧道类结果（`extra.artifact`/`extra.bin` 以 `.bin` 结尾，或 `extra.encrypted`
 为真）的详情弹窗内联“载荷”面板：
 

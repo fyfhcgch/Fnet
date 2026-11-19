@@ -117,7 +117,10 @@ class DecryptionAttemptTest(unittest.TestCase):
             "icmp_tunnel_10.0.0.1_10.0.0.2.bin")
         self.assertIn("10.0.0.1", passwords)
         self.assertIn("10.0.0.2", passwords)
-        self.assertIn("fetus", passwords)
+        # 内置候选是通用弱口令集合，按顺序排在文件名 IP 之前。
+        self.assertIn("icmp", passwords)
+        self.assertEqual(passwords[:len(payload_bin.DEFAULT_PASSWORDS)],
+                         list(payload_bin.DEFAULT_PASSWORDS))
         # 去重保序
         self.assertEqual(len(passwords), len(set(passwords)))
 

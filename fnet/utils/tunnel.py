@@ -21,7 +21,7 @@ __all__ = [
     "Chunk", "decode_chunk", "byte_profile", "decode_assembled",
     "parse_sequence", "reassemble", "group_sessions",
     "analyse_dns", "analyse_icmp", "find_flags", "find_flags_loose",
-    "write_decoded", "timeline",
+    "canonical_flag", "length_channel", "write_decoded", "timeline",
 ]
 
 #: Upper bound for everything :func:`write_decoded` writes in one call.
@@ -312,34 +312,72 @@ def decode_assembled(text: str) -> dict:
     return result
 
 
-#: 长度隐写的 ASCII 可打印区间（空格 ``0x20`` 到 ``~``）。
+#: 长度隐蔽信道的 ASCII 可打印区间（空格 ``0x20`` 到 ``~``）。
 LENGTH_MIN = 32
 LENGTH_MAX = 126
 #: 至少多少个包才认为长度序列可能承载文本。
 LENGTH_MIN_PACKETS = 8
-#: 可打印长度占比阈值。
+#: 可打印长度占比阈值（低于此值说明长度里混入了非文本值）。
 LENGTH_MIN_RATIO = 0.9
 #: 长度序列至少要有的不同取值数（正常 ping 的定长载荷只有 1 种）。
 LENGTH_MIN_DISTINCT = 6
+#: 解码文本的可读性下限：低于此值不认为解出了消息，避免把随机字节当文本。
+LENGTH_MIN_QUALITY = 0.9
+#: 解码文本的最小长度。
+LENGTH_MIN_TEXT = 8
+
+
+def _printable_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    good = sum(32 <= ord(ch) < 127 or ch in "\t\r\n" for ch in text)
+    return good / len(text)
+
+
+def _length_variants(numbers: list[int]) -> list[tuple[str, list[int]]]:
+    """长度序列的候选读法：可打印过滤、原始字节、去连续重复。
+
+    不同隧道实现会把长度写成 ASCII、原始字节，或因重传出现连续重复；
+    这里给出有界候选，由 :func:`length_channel` 统一打分选择，避免针对
+    单个样本写死一种读法。
+    """
+    out: list[tuple[str, list[int]]] = []
+    if not numbers:
+        return out
+    printable = [v for v in numbers if LENGTH_MIN <= v <= LENGTH_MAX]
+    if printable and len(printable) / len(numbers) >= LENGTH_MIN_RATIO:
+        out.append(("printable", printable))
+    if all(0 <= v <= 255 for v in numbers):
+        out.append(("raw", list(numbers)))
+    dedup: list[int] = []
+    for value in numbers:
+        if not dedup or dedup[-1] != value:
+            dedup.append(value)
+    if dedup and dedup != numbers:
+        if all(LENGTH_MIN <= v <= LENGTH_MAX for v in dedup):
+            out.append(("dedup", dedup))
+        if all(0 <= v <= 255 for v in dedup):
+            out.append(("dedup_raw", dedup))
+    return out
 
 
 def length_channel(values: Iterable[int]) -> dict:
     """Detect an ASCII-in-length covert channel (payload length == ord(char)).
 
-    有些 ICMP 隧道根本不把数据放进载荷：每个请求包的载荷长度随机，而
-    **长度本身**就是消息的一个字符（2019 工业信息安全技能大赛山东站
-    ``fetus_pcap.pcap`` 即此考点：124 个请求包的长度映射 ASCII 得到
-    Base64，解码后是 ``/etc/shadow`` 片段并带 flag）。
+    有些隐蔽信道不把数据放进载荷，而是让每个包的**长度**承载一个字符。
+    纯函数：把长度序列映射为字符，剥离 base64/base32/hex/URL 等编码并
+    扫描 flag；同时尝试正序/逆序、可打印过滤/原始字节/去重等常见读法，
+    按“是否带 flag、解码文本可读性”打分，选最可信的一种。
 
-    纯函数：把长度序列映射为字符，剥离 base64/hex/URL 编码并扫描 flag。
-    正常 ping（定长载荷）因不同取值太少直接排除，避免误报。
+    正常 ping（定长载荷）因不同取值太少直接排除；随机长度且解码不出
+    可读文本的流量也不会被误报。
 
     返回 ``{"channel", "values", "text", "printable_ratio", "decodings",
-    "decoded_text", "flags", "order"}``。
+    "decoded_text", "flags", "order", "variant"}``。
     """
     result: dict = {"channel": False, "values": [], "text": "",
                     "printable_ratio": 0.0, "decodings": [], "decoded_text": "",
-                    "flags": [], "order": "forward"}
+                    "flags": [], "order": "forward", "variant": ""}
     numbers: list[int] = []
     for value in values or []:
         try:
@@ -348,11 +386,6 @@ def length_channel(values: Iterable[int]) -> dict:
             continue
     result["values"] = numbers
     if len(numbers) < LENGTH_MIN_PACKETS:
-        return result
-    printable = [v for v in numbers if LENGTH_MIN <= v <= LENGTH_MAX]
-    ratio = len(printable) / len(numbers)
-    result["printable_ratio"] = round(ratio, 4)
-    if ratio < LENGTH_MIN_RATIO or len(set(printable)) < LENGTH_MIN_DISTINCT:
         return result
 
     def peel(sequence: str) -> tuple[str, list[dict], list[str]]:
@@ -375,17 +408,34 @@ def length_channel(values: Iterable[int]) -> dict:
                 found = decoded_flags or found
         return best, layers, found
 
-    text = "".join(chr(v) for v in printable)
-    best, layers, flags = peel(text)
-    order = "forward"
-    if not flags:
-        # 少量题目按逆序写入长度；只有逆序能解出 flag 时才采用。
-        reversed_best, reversed_layers, reversed_flags = peel(text[::-1])
-        if reversed_flags:
-            best, layers, flags = reversed_best, reversed_layers, reversed_flags
-            order = "reversed"
-    result.update(channel=True, text=text, decodings=layers,
-                  decoded_text=best, flags=flags, order=order)
+    best: tuple | None = None
+    for variant, sequence in _length_variants(numbers):
+        distinct = len({v for v in sequence if LENGTH_MIN <= v <= LENGTH_MAX})
+        if distinct < LENGTH_MIN_DISTINCT:
+            continue
+        for order, ordered in (("forward", sequence),
+                               ("reversed", list(reversed(sequence)))):
+            text = "".join(chr(v) for v in ordered)
+            decoded_text, layers, flags = peel(text)
+            quality = _printable_ratio(decoded_text)
+            if not flags and (quality < LENGTH_MIN_QUALITY
+                              or len(decoded_text) < LENGTH_MIN_TEXT):
+                continue
+            score = ((1000 if flags else 0) + quality * 100
+                     + min(len(decoded_text), 400) / 10)
+            if best is None or score > best[0]:
+                best = (score, variant, order, text, decoded_text, layers,
+                        flags, sequence)
+    if best is None:
+        return result
+
+    _, variant, order, text, decoded_text, layers, flags, sequence = best
+    result.update(
+        channel=True, text=text, decodings=layers, decoded_text=decoded_text,
+        flags=flags, order=order, variant=variant,
+        printable_ratio=round(
+            sum(LENGTH_MIN <= v <= LENGTH_MAX for v in sequence)
+            / max(len(sequence), 1), 4))
     return result
 
 
@@ -812,6 +862,28 @@ def find_flags_loose(data: bytes | str) -> list[str]:
         if value not in found:
             found.append(value)
     return found
+
+
+#: CTF 平台最常用的小写前缀；只规范化这一个前缀的大小写变体。
+_CANONICAL_PREFIX = "flag"
+
+
+def canonical_flag(value: str) -> str:
+    """Normalize a matched flag to the conventional lowercase ``flag{}`` form.
+
+    解码文本里的 flag 可能粘在哈希/字段中并带出大写前缀（如
+    ``...UcFLAG{...}``）。平台通常要求 ``flag{...}``，这里只把 ``flag``
+    前缀的大小写统一成小写，其余前缀（``CTF{}`` / ``NSSCTF{}`` 等）保持
+    原样，避免破坏题目自身约定。原文仍保留在 finding 的 ``extra.raw_flag``。
+    """
+    text = str(value or "").strip()
+    match = re.match(r"^([A-Za-z]+)(\{.*\})$", text, re.S)
+    if not match:
+        return text
+    prefix, rest = match.group(1), match.group(2)
+    if prefix.lower() == _CANONICAL_PREFIX:
+        return _CANONICAL_PREFIX + rest
+    return text
 
 
 def _sanitise_session(name: str) -> str:

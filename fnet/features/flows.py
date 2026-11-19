@@ -330,10 +330,10 @@ def _report_payload_analysis(ctx: FeatureContext, session: str, bin_name: str,
               "password/cipher/digest 配合「OpenSSL加密文件分析」"
               "（openssl_file）重跑")
     if length_hit:
-        # 同一方向的长度隐写已经解出 flag：这里的密文很可能是幌子，
+        # 同一方向的长度隐蔽信道已经解出 flag：这里的密文很可能是幌子，
         # 直接告诉用户不用再纠结解密。
-        detail += ("；注意：同一方向的「ICMP 载荷长度隐写」已解出 flag，"
-                   "本密文可能只是干扰项，优先看长度隐写结果")
+        detail += ("；注意：同一方向的「ICMP 载荷长度隐蔽信道」已解出 flag，"
+                   "本密文可能只是干扰项，优先看长度信道结果")
     ctx.report(f"会话 {session} 载荷自动解密未命中，"
                "已生成 openssl 命令示例与参数指引", "warn")
     ctx.add_finding("protocol", f"ICMP 隧道载荷分析 {bin_name}",
@@ -366,8 +366,8 @@ def _report_exfil_alert(ctx: FeatureContext, exfil: list[dict],
                     & {item["session"] for item in exfil})
     if hinted:
         detail += ("。注意：方向 " + "、".join(hinted)
-                   + " 的「ICMP 载荷长度隐写」已解出 flag，"
-                     "该方向的密文大概率是干扰项，结论以长度隐写为准")
+                   + " 的「ICMP 载荷长度隐蔽信道」已解出 flag，"
+                     "该方向的密文大概率是干扰项，结论以长度信道为准")
     ctx.add_finding(
         "protocol", "ICMP 隧道载荷为加密数据（疑似隐蔽外传）",
         detail=detail,
@@ -377,47 +377,71 @@ def _report_exfil_alert(ctx: FeatureContext, exfil: list[dict],
                "sessions": [item["session"] for item in exfil]})
 
 
+#: 长度序列的读法标签（展示用）。
+_LENGTH_VARIANT_LABELS = {
+    "printable": "可打印长度",
+    "raw": "原始字节长度",
+    "dedup": "去重后可打印长度",
+    "dedup_raw": "去重后原始字节长度",
+}
+
+
 def _report_length_channel(ctx: FeatureContext, rows: list[list[str]],
                            seen_flags: set[str]) -> set[str]:
-    """ICMP 载荷长度隐写：长度即 ASCII（fetus_pcap.pcap 类题目）。
+    """ICMP 载荷长度隐蔽信道：每个包的长度承载一个字符。
 
-    载荷内容可能完全无意义（随机长度），消息藏在每个请求包的**长度**
-    里：长度映射 ASCII → Base64 → ``/etc/shadow`` 片段 → flag。这里只
-    看 type=8 的请求包，按方向分组后交给
-    :func:`fnet.utils.tunnel.length_channel`。
+    载荷内容可能只是随机填充，消息藏在长度序列里。这里按方向分别收集
+    type=8（请求）和 type=0（应答）的长度，优先用请求；请求缺失或被
+    裁剪时回退到应答，再交给 :func:`fnet.utils.tunnel.length_channel`
+    做多读法打分。
 
     返回解出 flag 的方向集合，供后续载荷分析提示“flag 在长度通道里”。
     """
     from fnet.utils import tunnel
 
     hit_sessions: set[str] = set()
-    groups: dict[str, list[int]] = {}
-    #: 每个方向的首帧，供 finding 的「帧」列直接跳转（长度序列从它开始）。
+    buckets: dict[str, dict[str, list[int]]] = {}
+    #: 每个方向的首帧，供 finding 的「帧」列直接跳转。
     first_frames: dict[str, str] = {}
     for row in rows:
         row = list(row) + [""] * (7 - len(row))
-        if str(row[3] or "") != "8":
+        icmp_type = str(row[3] or "")
+        if icmp_type not in ("8", "0"):
             continue
         raw = hex_to_bytes(row[5])
         if not raw:
             continue
         key = f"{row[1]}>{row[2]}"
-        groups.setdefault(key, []).append(len(raw))
+        side = "request" if icmp_type == "8" else "reply"
+        buckets.setdefault(key, {"request": [], "reply": []})[side].append(
+            len(raw))
         first_frames.setdefault(key, str(row[0] or ""))
 
-    for session, lengths in groups.items():
+    for session, sides in buckets.items():
         first_frame = first_frames.get(session, "")
+        used_side = "request" if sides["request"] else "reply"
+        lengths = sides[used_side]
         channel = tunnel.length_channel(lengths)
+        if not channel.get("channel") and sides["reply"]:
+            # 请求方向缺失或被裁剪时，应答长度可能才是完整序列。
+            channel = tunnel.length_channel(sides["reply"])
+            if channel.get("channel"):
+                lengths, used_side = sides["reply"], "reply"
         if not channel.get("channel"):
             continue
         decoded = str(channel.get("decoded_text") or "")
-        flags = list(channel.get("flags") or [])
+        raw_flags = [str(flag) for flag in (channel.get("flags") or [])]
+        flags = list(dict.fromkeys(tunnel.canonical_flag(flag)
+                                   for flag in raw_flags))
         if not decoded and not flags:
             continue
         raw_text = str(channel.get("text") or "")
         layers = channel.get("decodings") or []
         layer_text = "、".join(str(item.get("encoding") or "")
                                for item in layers) or "无"
+        variant = _LENGTH_VARIANT_LABELS.get(
+            str(channel.get("variant") or ""), "可打印长度")
+        side_text = "请求" if used_side == "request" else "应答"
         stem = _icmp_bin_name(session)
         if stem.endswith(".bin"):
             stem = stem[:-4]
@@ -425,28 +449,26 @@ def _report_length_channel(ctx: FeatureContext, rows: list[list[str]],
         ctx.write_output(out_name,
                          (decoded or raw_text).encode("utf-8", "replace"))
         order = "（逆序）" if channel.get("order") == "reversed" else ""
-        flag_note = ""
-        if any(str(flag)[:4].lower() == "flag" and not str(flag).startswith("flag")
-               for flag in flags):
-            flag_note = "（原文 flag 前缀为大写，提交时按题目要求改写为 flag{...}）"
-        detail = (f"方向 {session}，{len(lengths)} 个 ICMP 请求包的载荷长度"
-                  f"映射为 ASCII{order}（可打印占比 "
+        detail = (f"方向 {session}，{len(lengths)} 个 ICMP {side_text}包的长度"
+                  f"按「{variant}」读法映射为字符{order}（可打印占比 "
                   f"{channel.get('printable_ratio'):.2f}），"
                   f"得到文本 {clean_cell(raw_text, 120)}；"
                   f"编码层 {layer_text}；"
                   f"解码文本预览：{clean_cell(decoded, 400)}；"
-                  f"flag：{'、'.join(flags) if flags else '无'}{flag_note}；"
+                  f"flag：{'、'.join(flags) if flags else '无'}；"
                   f"解码结果已保存: {out_name}")
-        ctx.report(f"ICMP 载荷长度隐写 {session}: "
-                   f"{len(lengths)} 个长度映射 ASCII，编码层 {layer_text}"
+        ctx.report(f"ICMP 载荷长度隐蔽信道 {session}: "
+                   f"{len(lengths)} 个{side_text}包长度按「{variant}」映射，"
+                   f"编码层 {layer_text}"
                    + (f"，发现 flag {flags[0]}" if flags else ""),
                    "good" if flags else "warn")
-        ctx.add_finding("protocol", f"ICMP 载荷长度隐写 {session}",
+        ctx.add_finding("protocol", f"ICMP 载荷长度隐蔽信道 {session}",
                         detail=detail, frame=first_frame,
                         level="good" if flags else "warn",
                         extra={"session": session, "packets": len(lengths),
                                "encoding": "length-ascii",
                                "order": channel.get("order") or "forward",
+                               "variant": channel.get("variant") or "",
                                "layers": layer_text,
                                "decoded": clean_cell(decoded, 1200),
                                "output": out_name,
@@ -456,9 +478,12 @@ def _report_length_channel(ctx: FeatureContext, rows: list[list[str]],
                 continue
             seen_flags.add(flag)
             ctx.report(f"  发现 flag: {flag}", "good")
+            raw_flag = next((item for item in raw_flags
+                             if tunnel.canonical_flag(item) == flag), flag)
+            extra = {"raw_flag": raw_flag} if raw_flag != flag else None
             ctx.add_finding("flag", flag, frame=first_frame,
-                            detail=f"ICMP 载荷长度隐写 {session}",
-                            level="good")
+                            detail=f"ICMP 载荷长度隐蔽信道 {session}",
+                            level="good", extra=extra)
         if flags:
             hit_sessions.add(session)
     return hit_sessions
@@ -496,7 +521,7 @@ def _icmp_tunnel(ctx: FeatureContext) -> None:
         ctx.report(f"隧道时间线: {len(timeline)} 个区间，峰值 {peak} 字节/区间",
                    "info")
     seen_flags: set[str] = set()
-    # 长度隐写与载荷内容无关，先单独检查（载荷可能全是随机密文）。
+    # 长度隐蔽信道与载荷内容无关，先单独检查（载荷可能全是随机密文）。
     length_sessions = _report_length_channel(ctx, rows, seen_flags)
     # 从抓包正文挖 password=/Basic 头里的候选口令，供载荷自动解密追加尝试。
     mined: list[str] = []
@@ -538,7 +563,7 @@ def _icmp_tunnel(ctx: FeatureContext) -> None:
                   f"首帧时间戳 {t0:.3f}，末帧时间戳 {t1:.3f}（epoch 秒），"
                   f"{uniform}")
         if session in length_sessions:
-            detail += ("；该方向的「ICMP 载荷长度隐写」已解出 flag，"
+            detail += ("；该方向的「ICMP 载荷长度隐蔽信道」已解出 flag，"
                        "载荷密文很可能只是干扰项")
         ctx.add_finding("protocol", f"ICMP 隧道 {session}",
                         detail=detail,

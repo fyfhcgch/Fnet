@@ -611,6 +611,36 @@ class ApiTest(unittest.TestCase):
         })
         self.assertEqual(status, 404)
 
+    def test_payload_crack_accepts_string_salted(self):
+        """前端把 salted 传成 "false"/"auto" 字符串时也要按布尔语义处理。"""
+        from fnet.utils.crypto import aes_cbc_encrypt
+        from fnet.utils.openssl_enc import derive_key_iv
+
+        job_id = self.run_job(str(DATA / "http_ntlm.pcap"), ["checkBox_10"])
+        job = self.runtime.jobs.get(job_id)
+        plain = b"flag{payload_crack_string_salted}\n" * 4
+        key, iv = derive_key_iv("icmp", b"", key_len=16, iv_len=16,
+                                kdf="evp", digest="md5")
+        (job.output_dir / "icmp_string_salted.bin").write_bytes(
+            aes_cbc_encrypt(plain, key, iv))
+
+        status, payload = self.json_request("/api/payload/crack", {
+            "job": job_id, "path": "icmp_string_salted.bin",
+            "password": "icmp", "cipher": "aes-128-cbc",
+            "digest": "md5", "salted": "false",
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["hit"])
+        self.assertIn("flag{payload_crack_string_salted}", payload["flags"])
+
+        status, auto = self.json_request("/api/payload/crack", {
+            "job": job_id, "path": "icmp_string_salted.bin",
+            "password": "icmp", "cipher": "aes-128-cbc",
+            "digest": "md5", "salted": "auto",
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(auto["hit"])
+
     def test_config_save_and_read(self):
         status, payload = self.json_request("/api/config", {
             "section": "config", "values": {"winrm_port": "5986"}})

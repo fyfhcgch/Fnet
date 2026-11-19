@@ -1016,8 +1016,15 @@ class Handler(BaseHTTPRequestHandler):
             passwords = [password] + [item for item in passwords
                                       if item != password]
         salted_raw = data.get("salted")
-        salted = (None if salted_raw in (None, "", "auto")
-                  else bool(salted_raw))
+        if isinstance(salted_raw, str):
+            # 兼容 CLI/脚本把布尔写成字符串（"false"/"no"/"0" 不能当 True）。
+            text = salted_raw.strip().lower()
+            salted = (None if text in ("", "auto", "none", "null")
+                      else text in ("true", "1", "yes", "on", "salted"))
+        elif salted_raw is None:
+            salted = None
+        else:
+            salted = bool(salted_raw)
         result = payload_bin.crack_payload(
             target.read_bytes(), name=target.name,
             passwords=passwords or None,
