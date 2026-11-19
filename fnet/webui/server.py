@@ -18,9 +18,11 @@ from pathlib import Path
 
 from fnet import APP_DISPLAY_NAME, __version__
 from fnet.crack import CrackManager
+from fnet.features.registry import default_features_for
 from fnet.live import LiveCapture
 from fnet.logger import logger
 from fnet.ntlmcrack_service import NtlmCrackManager
+from fnet.utils.logfile import LOG_SUFFIXES, PCAP_SUFFIXES, classify_input
 
 STATIC_DIR = Path(__file__).with_name("static")
 MAX_JSON = 4 * 1024 * 1024
@@ -532,6 +534,8 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(features, list) or not isinstance(params, dict):
             return self._error("features 必须是数组，params 必须是对象")
         selection = list(features) + list(handlers)
+        if not selection:
+            selection = default_features_for(classify_input(pcap) or "pcap")
         job = self.app.jobs.submit(pcap, selection, params,
                                    shards=data.get("shards", 1))
         self.app.config.add_recent(pcap)
@@ -583,18 +587,18 @@ class Handler(BaseHTTPRequestHandler):
 
             if not Path(name).suffix:
                 name += ".pcap"
-            if Path(name).suffix.lower() not in (".pcap", ".pcapng", ".cap",
-                                                 ".dmp", ".etl"):
+            if Path(name).suffix.lower() not in (PCAP_SUFFIXES | LOG_SUFFIXES):
                 # Unlink before responding: the ``finally`` cleanup runs after
                 # the HTTP response is sent, and a client checking uploads for
                 # leftovers right after the 400 would still see the .part.
                 temp.unlink(missing_ok=True)
                 temp = None
-                return self._error("仅支持 pcap/pcapng/cap/dmp/etl 文件")
+                return self._error("仅支持 pcap/pcapng/cap/dmp/etl 流量包，"
+                                   "或 log/txt/out/jsonl/ndjson/json/csv/tsv 日志文件")
             target = upload_dir / f"{secrets.token_hex(4)}_{name}"
             temp.replace(target)
             temp = None
-            logger.good(f"已上传流量包 {name} ({size} 字节)")
+            logger.good(f"已上传文件 {name} ({size} 字节)")
             return self._json({"ok": True, "path": str(target), "name": name,
                                "size": size})
         finally:
@@ -787,7 +791,7 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(pcaps, list) or not pcaps:
             return self._error("pcaps 必须是非空数组")
         if len(pcaps) > 50:
-            return self._error("一次最多提交 50 个流量包")
+            return self._error("一次最多提交 50 个文件")
         if not all(isinstance(item, str) and item.strip() for item in pcaps):
             return self._error("pcaps 中只能包含路径字符串")
         if not isinstance(features, list) or not isinstance(params, dict):
@@ -795,6 +799,13 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(handlers, list):
             return self._error("handlers 必须是数组")
         selection = list(features) + list(handlers)
+        if not selection:
+            kinds = {classify_input(item) or "pcap" for item in pcaps}
+            selection = []
+            for kind in sorted(kinds):
+                for checkbox in default_features_for(kind):
+                    if checkbox not in selection:
+                        selection.append(checkbox)
         jobs = self.app.jobs.submit_batch(
             [item.strip() for item in pcaps], selection, params,
             data.get("concurrency", 1), shards=data.get("shards", 1))
@@ -824,6 +835,34 @@ class Handler(BaseHTTPRequestHandler):
                     f"attachment; filename*=UTF-8''{filename}",
                     "Cache-Control": "no-store"})
 
+    @staticmethod
+    def _log_stats(sub: str, path: str, data: dict) -> dict:
+        """Stats subs for a text-log input; same keys as the capture side."""
+        from fnet import services
+
+        if sub == "timeline":
+            return services.log_timeline(path, data.get("buckets", 60))
+        if sub == "hierarchy":
+            return services.log_level_hierarchy(path)
+        if sub == "ip":
+            return services.log_top_entities(path)
+        if sub == "entities":
+            return services.log_entity_stats(
+                path, data.get("dimension") or "", data.get("limit", 50),
+                success_regex=data.get("success_regex") or "",
+                subnet_prefix=data.get("subnet_prefix"),
+                fail_regex=data.get("fail_regex") or "")
+        if sub == "topology":
+            return services.log_topology(path)
+        if sub == "protocol":
+            return services.log_protocol_detail(
+                path, data.get("protocol") or "", data.get("limit", 300))
+        if sub == "timeline_packets":
+            return services.log_timeline_packets(
+                path, data.get("start"), data.get("end"),
+                data.get("limit", 200))
+        return {"ok": False, "text": "日志任务不支持该统计项", "kind": "log"}
+
     def _action(self) -> None:
         data = self._json_body()
         action = str(data.get("action") or "")
@@ -833,6 +872,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if action == "stats":
             sub = data.get("sub") or ""
+            from fnet.utils import logfile
+
+            if logfile.is_log_input(pcap):
+                return self._json(self._log_stats(sub, pcap, data))
             if sub == "ports":
                 return self._json(services.port_scan(pcap, toolbox))
             if sub == "http_uri":

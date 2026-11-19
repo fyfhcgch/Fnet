@@ -131,6 +131,24 @@ class MarkdownTest(unittest.TestCase):
         self.assertNotIn("report.md", text)
         self.assertNotIn("report.html", text)
 
+    def test_artifacts_skip_analysis_files(self):
+        """分析结果文件不进"产出文件"章节，交付物保持原样。"""
+        text = render_markdown(
+            sample_meta(), LOGS,
+            [{"name": "findings.json", "size": 10},
+             {"name": "findings.csv", "size": 11},
+             {"name": "annotations.json", "size": 12},
+             {"name": "log_entities.csv", "size": 13},
+             {"name": "log_iocs.csv", "size": 14},
+             {"name": "restored/admin.aspx", "size": 20}],
+            sections=["artifacts"])
+        self.assertIn("`restored/admin.aspx`", text)
+        self.assertNotIn("findings.json", text)
+        self.assertNotIn("findings.csv", text)
+        self.assertNotIn("annotations.json", text)
+        self.assertNotIn("log_entities.csv", text)
+        self.assertNotIn("log_iocs.csv", text)
+
     def test_section_selection_and_escaping(self):
         text = render_markdown(sample_meta(), LOGS, [], sections=["summary"])
         self.assertIn("## 概要", text)

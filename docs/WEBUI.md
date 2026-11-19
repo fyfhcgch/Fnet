@@ -11,11 +11,12 @@ python3 -m fnet --no-browser        # 只启动服务
 python3 -m fnet --host 0.0.0.0      # 明确允许局域网访问（默认不允许）
 python3 -m fnet --port 9000
 python3 -m fnet capture.pcapng --features checkBox_10,http.extract
+python3 -m fnet access.log --features checkBox_61,checkBox_64
 ```
 
 `--host`/`--port` 也可写在配置文件的 `[config]` 段（`host`、`port`）。
-`capture.pcapng` 与 `--features` 会作为 `initial` 字段返回，前端自动预选
-流量包和复选框。
+`capture.pcapng` / `access.log` 与 `--features` 会作为 `initial` 字段返回，
+前端自动预选输入文件和复选框。
 
 ## 界面布局
 
@@ -24,8 +25,8 @@ python3 -m fnet capture.pcapng --features checkBox_10,http.extract
 │ 品牌 全局搜索 文件/统计/设置/工具…菜单 tshark 徽标 语言 主题 │
 ├──────────┬──────────────────────────────────────────────────┤
 │ 功能侧栏 │  日志 / 结果 / 产出 / 批量 / 图表 / 历史 / 文本 / 关于 │
-│ 13 组    │  （胶囊 Tab 切换）                                │
-│ 43 功能  │                                                  │
+│ 14 组    │  （胶囊 Tab 切换）                                │
+│ 54 功能  │                                                  │
 │ 全选/清空│  进度条 + 开始/取消按钮                            │
 └──────────┴──────────────────────────────────────────────────┘
 ```
@@ -36,7 +37,7 @@ python3 -m fnet capture.pcapng --features checkBox_10,http.extract
   上下堆叠；`≤560px` 单列、按钮全宽。
 - **主题**：暖夜、暖昼、浅樱、暮玫、莓紫五套配色，选择保存在
   `localStorage`。浅色主题自动切换 `--on-accent`，保证主按钮文字对比度。
-- **全局搜索**：顶栏搜索框与侧栏功能搜索双向同步，匹配功能名称、说明、分类
+- **全局搜索**：顶栏搜索框匹配功能名称、说明、分类
   与 handler；命中时自动展开分组并显示匹配数量，按 `/` 可快速聚焦。
   常用功能会出现在“最近使用”快捷标签中。
 - **语言切换**：顶栏下拉框切换中文 / English。界面外壳、功能标题、功能说明
@@ -56,7 +57,7 @@ python3 -m fnet capture.pcapng --features checkBox_10,http.extract
 - **任务历史**：完成的任务写入 `~/.cache/fnet/jobs/<id>/job.json`，可在
   “任务历史”页回看报告、一键重跑或删除；进程异常退出时未完成任务标记为
   “已中断”。历史参数保存在本机缓存目录，不要在不信任的机器上分析含敏感
-  凭据的流量包。
+  凭据的抓包或日志。
 - **日志**：按级别（info/good/warn/error/debug）与关键字过滤，支持复制、
   高亮 flag/哈希/URL、自动滚动。日志与分析结果表格里的“帧 N”可以点击：
   弹窗展示该帧摘要、前后文帧与 `tshark -V` 解码详情，并可导出上下文
@@ -65,16 +66,31 @@ python3 -m fnet capture.pcapng --features checkBox_10,http.extract
   类别/级别筛选、关键字搜索、点击表头排序、分页与每页条数、列显示/隐藏
   （保存在浏览器本地）、复制本页/选中行、按帧号跳转与 CSV 导出。旧任务
   没有 `findings.json` 时会从日志推断，并在标题旁标注。
-- **产出**：任务结束后列出文件，可单文件下载或一键打包 ZIP。
-- **批量队列**：左侧文件选择框或拖拽区一次选择多个 pcap 时，会调用
+- **产出**：任务结束后列出文件，可单文件下载或一键打包 ZIP。分析结果类文件
+  （`findings.json`、`findings.csv`、`annotations.json`、`log_*.csv` 等）
+  不出现在产出列表，详细发现在"分析结果"与"统计图表"查看；文件仍在磁盘上，
+  可通过 `/api/download?job=<id>&path=<file>` 精确下载。
+- **批量队列**：左侧文件选择框或拖拽区一次选择多个抓包或日志时，会调用
   `/api/batch` 排队执行；面板可设置并发数（1–4），暂停/继续队列、拖拽调整
   排队顺序，逐行显示状态、进度、当前功能，并可查看日志、下载报告或取消任务；
   “合并报告”把已完成任务汇总为一个 Markdown/HTML 文档。刷新页面不会丢任务，
   因为队列状态保存在服务端 `JobManager` 中。
-- **统计图表**：对当前流量包调用时间线、协议分层、IP 会话与拓扑统计，绘制
+- **统计图表**：对当前抓包任务调用时间线、协议分层、IP 会话与拓扑统计，绘制
   SVG 流量时间线、协议分层、Top 会话柱状图和会话拓扑；可切换“按字节/按帧数”
   和 30/60/120 个时间桶。时间线支持滚轮缩放、拖拽框选与双击重置，点击时间桶
-  或协议条可下钻到对应数据包；图表可导出 SVG/PNG。
+  或协议条可下钻到对应数据包；图表可导出 SVG/PNG。对文本日志任务同样可用：
+  时间线基于日志时间戳聚合事件数，协议分层显示日志级别（error/warn/info/debug）
+  计数，“Top 会话”切换为按 client_id/user/IP 统计的 **Top 实体**，拓扑在日志
+  能同时得到客户端 IP 与对端标识（server/host/program）时绘制；日志没有字节
+  数，相关图表按条数加权。日志任务还会额外显示 **实体统计** 卡片：维度下拉框
+  （client_id/user/IP/网段等，来自该日志实际可用的维度，默认 client_id）切换
+  后重新统计，上方为 Top 10 横向条形图，下方表格列出每个值的
+  次数/占比/失败次数/失败率/成功次数/成功率/首次/末次，超过 50 条时提示
+  完整数据见 `log_entities.csv`。接口为
+  `POST /api/action {action:"stats", sub:"entities", pcap, dimension, limit,
+  success_regex, fail_regex, subnet_prefix}`；成功/失败正则与前缀非法时自动
+  回退默认口径（/24 默认、范围 8–32、IPv6 固定 /64），与日志功能的任务参数
+  （`log_success_regex` / `log_fail_regex` / `log_subnet_prefix`）一致。
 - **TLS 密钥**：“设置 → 上传 TLS keylog / 私钥…”会把文件存入
   `<cache>/keys` 并写入 `tls_keylog` / `tls_private_key`；加密私钥可在
   `config.ini` 配置 `tls_key_passphrase`（或用 `FNET_TLS_KEY_PASS` 环境变量）
@@ -91,8 +107,9 @@ python3 -m fnet capture.pcapng --features checkBox_10,http.extract
   除 `/api/health` 外所有 API 都要求 `X-Fnet-Token` 或 `?token=`。
 - 静态文件路径经过 `resolve()` 与根目录前缀校验，阻止目录穿越。
 - 上传大小由 `max_upload_mb` 控制（默认 1024），只接受
-  `.pcap/.pcapng/.cap/.dmp/.etl`；TLS 密钥上传（`X-Kind`）额外限制为
-  8 MiB，并校验 keylog 标签或 PEM 私钥头。
+  `.pcap/.pcapng/.cap/.dmp/.etl` 抓包与 `.log/.txt/.out/.jsonl/.ndjson/.json/
+  .csv/.tsv` 文本日志；TLS 密钥上传（`X-Kind`）额外限制为 8 MiB，并校验
+  keylog 标签或 PEM 私钥头。
 - 响应带 `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`；
   首页 CSP 把脚本、样式与连接限制在 `self`，只额外放行注入 token 的内联脚本。
 - 服务没有“执行任意命令”的公开接口；菜单动作是固定枚举。
@@ -140,8 +157,8 @@ python3 -m fnet capture.pcapng --features checkBox_10,http.extract
 | GET | `/api/capture/status` | 实时抓包状态、文件、大小与耗时 |
 | POST | `/api/capture/start` | 开始抓包（`interface`、`filter`、`name`） |
 | POST | `/api/capture/stop` | 停止抓包，可选 `analyze` 直接提交分析 |
-| POST | `/api/batch` | 批量创建任务（`pcaps`、`features`、`params`、`concurrency`） |
-| POST | `/api/upload` | 上传流量包（multipart 流式写入临时文件，或原始 body）；`X-Kind: keylog/key` 上传 TLS 密钥，`X-Kind: rules` 导入规则文件 |
+| POST | `/api/batch` | 批量创建任务（`pcaps`，也接受日志路径、`features`、`params`、`concurrency`） |
+| POST | `/api/upload` | 上传抓包或文本日志（multipart 流式写入临时文件，或原始 body）；`X-Kind: keylog/key` 上传 TLS 密钥，`X-Kind: rules` 导入规则文件 |
 | GET | `/api/log?job=<id>&since=N` | 仅取增量日志 |
 | GET | `/api/report?job=<id>&format=<html\|markdown>&sections=...` | 渲染可下载/内联查看的报告 |
 | GET | `/api/download?job=<id>&path=<file>` | 下载单个产出 |
@@ -160,6 +177,8 @@ curl -H "X-Fnet-Token: $TOKEN" -H 'Content-Type: application/json' \
   http://127.0.0.1:8765/api/analyze
 ```
 
+`pcap` 字段是通用输入路径：填 `.log`/`.txt`/`.jsonl`/`.csv` 时会创建日志任务，
+`features` 可传日志复选框（如 `checkBox_61`），省略时自动使用 4 项日志功能。
 `features` 也可以传 handler（`text_scan.keyword_scan`），或使用
 `handlers` 字段。返回：
 
@@ -187,7 +206,7 @@ curl -H "X-Fnet-Token: $TOKEN" -H 'Content-Type: application/json' \
   http://127.0.0.1:8765/api/batch
 ```
 
-最多一次提交 50 个流量包，`concurrency` 会限制为 1–8。返回的 `jobs` 与
+最多一次提交 50 个文件，`concurrency` 会限制为 1–8。返回的 `jobs` 与
 `/api/analyze` 相同，初始状态可能是 `queued` 或 `running`。前端通过
 `GET /api/jobs` 轮询批量行；任务结束后单包状态、日志与产出仍走
 `/api/jobs/<id>`。队列中尚未开始的任务可以直接取消。
@@ -236,7 +255,7 @@ curl -X POST -H "X-Fnet-Token: $TOKEN" \
 
 详情接口返回 `job`、`report`（最多 200k 字符）与 `artifacts`。删除接口只
 允许删除已结束的任务；正在运行的任务会返回 400。前端“重跑”会复用历史
-任务的流量包路径、功能与参数，再次调用 `/api/analyze`。
+任务的输入路径、功能与参数，再次调用 `/api/analyze`。
 
 ### 报告导出
 
@@ -298,16 +317,16 @@ curl -H "X-Fnet-Token: $TOKEN" \
 
 `kind` 取值：`flag`、`credential`、`hash`、`http`、`webshell`、`sql`、
 `dns`、`file`、`protocol`、`log`、`other`；`level` 与日志级别相同。
-导出 CSV 的列固定为 `类别,级别,帧,功能,摘要,详情`。
+导出 CSV 的列固定为 `类别,级别,帧,时间,功能,摘要,详情`。
 
-#### 结果标注与时间线
+#### 结果标注
 
-“分析结果”与“结果时间线”页点击任意条目，可以为其设置人工标注：
+“分析结果”页点击任意条目，可以为其设置人工标注：
 `status` 取 `confirmed`（已确认）/ `false_positive`（误报）/ `starred`（星标），
 并附带一段自由备注。标注持久化到任务目录的 `annotations.json`，
 `GET /api/findings` 会把 `annotation` 字段合并回对应条目；
-`/api/compare` 的 diff 逻辑保持不变。结果时间线按 `capture`（抓包侧时间，
-可选字段）或记录时间、帧号纵向排列，支持按类别过滤，
+`/api/compare` 的 diff 逻辑保持不变。结果表默认按时间倒序
+（`capture` 抓包侧时间优先，其次记录时间，相同时间按发现顺序倒序），
 点击帧号可直接打开数据包详情。
 
 #### 一键 hashcat 破解
@@ -326,7 +345,7 @@ WPA 22000 等，模式由功能写入 `extra.mode`，旧任务按摘要推断）
 
 #### SMB3 解密对话框
 
-“分析结果 / 结果时间线”里 `extra.protocol == "smb2"` 的结果，详情弹窗底部有
+“分析结果”里 `extra.protocol == "smb2"` 的结果，详情弹窗底部有
 “解密 SMB3”按钮，打开凭据对话框。“SMB3 加密流量”这类结果只带 TCP 流号，
 所以前端会先请求 `GET /api/smb/hints?job=<id>&stream=<n>`，把服务端拼出来的
 线索直接填进表单；来源按下面的优先级合并，空串不算有值：
@@ -360,7 +379,7 @@ WPA 22000 等，模式由功能写入 `extra.mode`，旧任务按摘要推断）
 
 | action | 额外字段 | 作用 |
 | --- | --- | --- |
-| `stats` | `sub=ports/http_uri/ip/hierarchy/timeline/topology/protocol/timeline_packets` | 端口、URI、IP 会话、协议分层、时间线、会话拓扑、协议下钻与时间桶数据包 |
+| `stats` | `sub=ports/http_uri/ip/hierarchy/timeline/topology/protocol/timeline_packets` | 端口、URI、IP 会话、协议分层、时间线、会话拓扑、协议下钻与时间桶数据包；输入为文本日志时（`kind="log"`）自动改为日志时间线、日志级别分层、Top 实体与客户端→对端拓扑 |
 | `export_objects` | — | 一键导出所有对象 |
 | `carve` | — | 一键分离所有文件（foremost/binwalk） |
 | `repair` | — | 用 pcapfix 修复 |

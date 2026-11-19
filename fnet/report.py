@@ -78,6 +78,30 @@ _PLACEHOLDER_TEXTS = {"", "-", "—", "--", "n/a", "none", "null"}
 #: Report files are exported from the result view; they are never listed as
 #: "产出文件" artifacts in a report or in the WebUI artifact tab.
 REPORT_FILES = frozenset({"report.txt", "report.md", "report.html"})
+#: Analysis-result files that sit next to the real deliverables in a job's
+#: output directory: structured findings, human annotations and the job
+#: checkpoint.  They stay on disk (and remain downloadable by exact path via
+#: ``/api/download?path=``) but are not listed as "产出文件" — their content
+#: is surfaced in the WebUI "分析结果" tab and the statistics cards instead.
+ANALYSIS_ARTIFACT_NAMES = frozenset({
+    "findings.json", "findings.csv", "annotations.json", "job.json",
+})
+
+
+def is_analysis_artifact(name: str) -> bool:
+    """True when ``name`` is an analysis-result file rather than a deliverable.
+
+    Matches the fixed result files written by the job worker plus the
+    ``log_*.csv`` tables of the log features (``log_fields.csv``,
+    ``log_entities.csv``, ``log_anomalies.csv``, ``log_iocs.csv``).  Report
+    files are excluded separately through :data:`REPORT_FILES`; restored
+    files, decrypted payloads, pcap clips, hash files, wordlists and other
+    real deliverables never match.
+    """
+    base = Path(str(name or "")).name.lower()
+    if base in ANALYSIS_ARTIFACT_NAMES:
+        return True
+    return base.startswith("log_") and base.endswith(".csv")
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +191,9 @@ def _fmt_value(value) -> str:
 
 def summary_rows(meta: dict) -> list[tuple[str, str]]:
     features = meta.get("feature_titles") or []
+    input_label = "日志文件" if str(meta.get("kind") or "") == "log" else "流量包"
     rows = [
-        ("流量包", str(meta.get("pcap") or "")),
+        (input_label, str(meta.get("pcap") or "")),
         ("任务 ID", str(meta.get("id") or "")),
         ("状态", _status(meta)),
         ("功能数量", str(len(features))),
@@ -203,6 +228,8 @@ def artifact_rows(artifacts) -> list[tuple[str, str]]:
             continue
         name = str(item.get("name") or "")
         if not name or Path(name).name in REPORT_FILES:
+            continue
+        if is_analysis_artifact(Path(name).name):
             continue
         rows.append((name, _fmt_size(item.get("size"))))
     return rows
@@ -866,6 +893,7 @@ def write_reports(job, logs, artifacts=None, sections=None,
         "id": job.id,
         "pcap": job.pcap,
         "pcap_name": Path(job.pcap).name,
+        "kind": getattr(job, "kind", "pcap"),
         "features": [feature.checkbox for feature in job.features],
         "feature_titles": [feature.title for feature in job.features],
         "params": job.params,

@@ -40,7 +40,7 @@
       <div class="menu">
         <button class="menu-btn" data-i18n="menu_file">文件</button>
         <div class="dropdown">
-          <button data-action="pick-file">打开流量包…</button>
+          <button data-action="pick-file">打开文件…</button>
           <button data-action="report-view">查看 HTML 报告</button>
           <button data-action="report-export">导出分析报告…</button>
           <button data-action="download-report">下载纯文本报告</button>
@@ -143,7 +143,7 @@
       </div>
 
       <div class="drop-zone" id="drop-zone" tabindex="0">
-        <input type="file" id="file-input" accept=".pcap,.pcapng,.cap,.dmp,.etl" multiple hidden>
+        <input type="file" id="file-input" accept=".pcap,.pcapng,.cap,.dmp,.etl,.log,.txt,.out,.jsonl,.ndjson,.json,.csv,.tsv" multiple hidden>
         <div class="drop-icon" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
                stroke-linecap="round" stroke-linejoin="round">
@@ -151,21 +151,17 @@
             <path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"/>
           </svg>
         </div>
-        <div><strong data-i18n="drop_title">拖拽流量包到此处</strong></div>
-        <div class="muted small" data-i18n="drop_hint">支持一次拖入多个文件并进入批量队列（pcap / pcapng / cap / dmp / etl）</div>
+        <div><strong data-i18n="drop_title">拖拽流量包或日志到此处</strong></div>
+        <div class="muted small" data-i18n="drop_hint">支持一次拖入多个文件并进入批量队列（pcap / pcapng / cap / dmp / etl，或 log / txt / jsonl / csv）</div>
       </div>
       <div class="path-row">
-        <input id="pcap-path" placeholder="服务器本地路径，例如 /tmp/capture.pcapng" spellcheck="false">
+        <input id="pcap-path" placeholder="服务器本地路径，例如 /tmp/capture.pcapng 或 /var/log/auth.log" spellcheck="false">
         <button id="use-path" class="ghost" data-i18n="use_path">使用</button>
       </div>
 
       <div class="section-title">
         <span data-i18n="features_title">自动分析功能</span>
         <span class="muted small" id="feature-total"></span>
-      </div>
-      <div class="feature-search">
-        <input id="feature-search" placeholder="搜索功能 / 分类 / handler" spellcheck="false">
-        <button id="feature-search-clear" class="ghost small hidden">清除</button>
       </div>
       <div id="recent-features" class="recent-features hidden"></div>
       <div id="features" class="features"></div>
@@ -256,8 +252,8 @@
             </svg>
           </div>
           <div class="file-text">
-            <div id="file-name">未选择流量包</div>
-            <div id="file-meta" class="muted small">选择或上传一个抓包文件开始</div>
+            <div id="file-name">未选择输入文件</div>
+            <div id="file-meta" class="muted small">选择或上传一个抓包或日志文件开始</div>
           </div>
         </div>
         <div class="run-actions">
@@ -305,13 +301,6 @@
                stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
             <path d="M4 19V9M10 19V4.5M16 19v-6.5M22 19H2"/>
           </svg><span data-i18n="tab_viz">统计图表</span>
-        </button>
-        <button class="tab" data-tab="timeline" role="tab">
-          <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-               stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
-            <circle cx="6" cy="6" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="6" cy="18" r="2"/>
-            <path d="M8 6h8M8 18h8M14 12h4"/>
-          </svg><span data-i18n="tab_timeline">结果时间线</span>
         </button>
         <button class="tab" data-tab="history" role="tab">
           <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -417,9 +406,9 @@
             <button id="batch-clear" class="ghost small">清空已完成</button>
           </div>
         </div>
-        <div class="muted small batch-hint">把多个流量包拖入左侧区域即可排队分析；排队中的任务可拖拽调整顺序，运行中的任务可取消。合并报告会把选中或全部任务汇总为一个 Markdown/HTML 文档。</div>
+        <div class="muted small batch-hint">把多个抓包或日志拖入左侧区域即可排队分析；排队中的任务可拖拽调整顺序，运行中的任务可取消。合并报告会把选中或全部任务汇总为一个 Markdown/HTML 文档。</div>
         <div id="batch" class="batch-table-wrap">
-          <div class="muted">还没有批量任务。一次选择多个流量包后会自动开始排队。</div>
+          <div class="muted">还没有批量任务。一次选择多个文件后会自动开始排队。</div>
         </div>
       </section>
 
@@ -463,20 +452,6 @@
         </div>
       </section>
 
-      <section id="tab-timeline" class="tab-panel">
-        <div class="panel-head">
-          <h3 data-i18n="timeline_title">发现时间线</h3>
-          <div class="findings-actions">
-            <select id="timeline-kind"><option value="all">全部类别</option></select>
-            <button id="timeline-refresh" class="ghost small" data-i18n="timeline_refresh">刷新</button>
-          </div>
-        </div>
-        <div class="muted small" data-i18n="timeline_hint">按发现的时间 / 帧号纵向排列，点击条目可查看详情与标注。</div>
-        <div id="timeline" class="timeline-list">
-          <div class="muted" data-i18n="timeline_empty">任务结束后，凭据、哈希、flag 等会按时间与帧号展示在这里。</div>
-        </div>
-      </section>
-
       <section id="tab-history" class="tab-panel">
         <div class="panel-head">
           <h3>任务历史</h3>
@@ -508,7 +483,7 @@
           <h3>Fnet <span id="about-version"></span></h3>
           <p>Fnet 是一个面向 CTF 与流量取证的开源工具箱，把协议解析、凭据提取、
             文件还原与解密流程集中到一个本地 WebUI 和对应的命令行里。分析全部
-            在本机完成，不执行流量包中的代码。</p>
+            在本机完成，不执行抓包或日志中的代码。</p>
           <div class="about-grid">
             <div class="card">
               <h4>开源与许可</h4>
@@ -524,7 +499,7 @@
               <div id="about-tools" class="tool-list"></div>
             </div>
           </div>
-          <p class="muted small">提示：Fnet 仅用于合法的教学、竞赛与授权测试。分析未知流量包时请勿执行其中的恶意代码。</p>
+          <p class="muted small">提示：Fnet 仅用于合法的教学、竞赛与授权测试。分析未知抓包或日志时请勿执行其中的恶意代码。</p>
         </div>
       </section>
     </main>

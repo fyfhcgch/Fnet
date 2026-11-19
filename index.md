@@ -1,20 +1,21 @@
 ---
 layout: default
 title: Fnet — 面向 CTF 与流量取证的流量分析工具箱
-description: 把 pcap 拖进浏览器，勾选需要的检查项，得到 flag、凭据、还原文件与解密流量。本地运行、纯标准库、协议解析交给 tshark。
+description: 把 pcap 或文本日志拖进浏览器，勾选需要的检查项，得到 flag、凭据、还原文件与解密流量。本地运行、纯标准库、抓包解析交给 tshark。
 ---
 
 <div class="hero">
   <h1>Fnet</h1>
   <p class="tagline">面向 CTF 与流量取证的开源流量分析工具箱</p>
   <p class="lead">
-    把 pcap / pcapng 拖进浏览器，勾选要查的项，就能拿到 flag、凭据、还原的文件和
-    解密后的流量。全部在本机运行，不需要第三方 Python 包，协议解析交给 tshark。
+    把 pcap / pcapng 或文本日志拖进浏览器，勾选要查的项，就能拿到 flag、凭据、
+    还原的文件和解密后的流量。全部在本机运行，不需要第三方 Python 包，抓包解析
+    交给 tshark，日志分析则由内置解析器完成。
   </p>
   <p class="cta-row">
     <a class="btn" href="{{ '/manual/tutorial/' | relative_url }}">开始实战</a>
     <a class="btn ghost" href="{{ '/manual/install/' | relative_url }}">安装与启动</a>
-    <a class="btn ghost" href="{{ '/manual/features/' | relative_url }}">浏览 50 项功能</a>
+    <a class="btn ghost" href="{{ '/manual/features/' | relative_url }}">浏览 54 项功能</a>
     <a class="btn ghost" href="https://github.com/fyfhcgch/Fnet">GitHub 仓库</a>
     {%- if site.version %}
     <span class="badge version-badge">v{{ site.version }}</span>
@@ -24,6 +25,9 @@ description: 把 pcap 拖进浏览器，勾选需要的检查项，得到 flag�
 
 ## 2.21.3 更新
 
+- **文本日志直接分析**：`.log` / `.txt` / `.jsonl` / `.csv` 可直接作为输入，内置解析器
+  识别 Ceph、syslog、sshd、Apache 与通用 KV 等格式，新增“日志分析”分类（4 项功能），
+  输出概览时间线、实体画像、失败异常与 IOC/敏感信息；日志分析不依赖 tshark。
 - **Python 3.10 兼容**：日志证据时间戳解析统一处理 `+0000`/`+00`/`Z` 偏移，并保留非 UTC 时区的原始偏移，修复 CI 上时间窗关联失效。
 - **测试可移植性**：路径契约测试不再依赖本机才存在的 `/tmp/opencode` 临时目录。
 
@@ -88,7 +92,7 @@ description: 把 pcap 拖进浏览器，勾选需要的检查项，得到 flag�
 
 <p class="shot">
   <img src="{{ '/assets/images/webui.webp' | relative_url }}"
-       alt="Fnet WebUI：左侧 50 个功能的勾选面板，右侧分析结果表格">
+       alt="Fnet WebUI：左侧 54 个功能的勾选面板，右侧分析结果表格">
 </p>
 <p class="shot-caption">真实界面截图：暖夜主题下的分析结果页</p>
 
@@ -101,7 +105,7 @@ description: 把 pcap 拖进浏览器，勾选需要的检查项，得到 flag�
   </div>
   <div class="card">
     <h3>按赛题组织功能</h3>
-    <p>50 个分析功能分成 13 类：从 flag 扫描、HTTP 与 Webshell，到工控、无线、TLS 解密。</p>
+    <p>54 个分析功能分成 14 类：从 flag 扫描、文本日志、HTTP 与 Webshell，到工控、无线、TLS 解密。</p>
   </div>
   <div class="card">
     <h3>结果能带走</h3>
@@ -138,8 +142,8 @@ python3 -m fnet</code></pre>
     浏览器会自动打开 <code>http://127.0.0.1:8765</code>。
   </li>
   <li>
-    <strong>上传抓包并运行</strong>：拖入 pcap → 左侧勾选功能 → “开始分析”，
-    结果与日志会实时出现在右侧。
+    <strong>上传抓包或日志并运行</strong>：拖入 pcap / pcapng / 日志文件 →
+    左侧勾选功能 → “开始分析”，结果与日志会实时出现在右侧。
   </li>
   <li>
     <strong>拿走结论</strong>：在“分析结果”页筛选、复制或导出 CSV，或从“产出文件”
@@ -181,6 +185,11 @@ python3 -m fnet</code></pre>
 按场景选择，勾选后会在同一次任务里依次执行；缺失的可选工具只会让对应功能降级。
 
 <div class="feature-grid">
+  <div class="card">
+    <span class="badge">4 项</span>
+    <h3>日志分析</h3>
+    <p>Ceph / syslog / sshd / Apache / JSONL / CSV 等文本日志：格式识别、时间线、实体失败率、异常突增与 IOC 提取，无需 tshark。</p>
+  </div>
   <div class="card">
     <span class="badge">1 项</span>
     <h3>文本与关键字</h3>
@@ -274,7 +283,7 @@ python3 -m fnet</code></pre>
   <li>
     <a href="{{ '/manual/features/' | relative_url }}">
       <strong>功能清单</strong>
-      <span>50 项功能的作用、复选框编号与所需工具</span>
+      <span>54 项功能的作用、复选框编号与所需工具</span>
     </a>
   </li>
   <li>
@@ -294,10 +303,11 @@ python3 -m fnet</code></pre>
 ## 适用场景
 
 - **CTF 流量题**：flag 扫描、隐写与编码、协议还原、Webshell 与盲注流量。
+- **日志取证**：Ceph / syslog / sshd / Web 访问日志的失败统计、异常实体与 IOC 提取。
 - **应急与取证**：凭据与哈希提取、文件还原、认证时间线、跨协议账号关联。
 - **教学与演练**：本地跑通完整分析链路，报告可直接交付或打印成 PDF。
 
 <p class="note">
-  请仅在合法的教学、竞赛与授权测试中使用。Fnet 不会执行流量包中的任何代码，
-  所有协议解析由 <code>tshark</code> 完成。
+  请仅在合法的教学、竞赛与授权测试中使用。Fnet 不会执行流量包或日志中的任何代码；
+  抓包的协议解析由 <code>tshark</code> 完成，文本日志由内置解析器读取。
 </p>

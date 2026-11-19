@@ -46,6 +46,7 @@ def snapshot(job) -> dict:
         "id": job.id,
         "pcap": job.pcap,
         "pcap_name": Path(job.pcap).name,
+        "kind": getattr(job, "kind", "pcap"),
         "features": [f.checkbox for f in job.features],
         "feature_titles": [f.title for f in job.features],
         "params": job.params,
@@ -141,7 +142,8 @@ def load_from_history(job_id: str):
     except (TypeError, ValueError):
         shards = 1
     job = Job(job_id, pcap, features, dict(data.get("params") or {}),
-              output, created=str(data.get("created") or ""), shards=shards)
+              output, created=str(data.get("created") or ""), shards=shards,
+              kind=str(data.get("kind") or "pcap"))
     job.status = str(data.get("status") or "interrupted")
     job.progress = int(data.get("progress") or 0)
     job.started = data.get("started")

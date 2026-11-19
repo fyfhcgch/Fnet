@@ -37,7 +37,7 @@ KINDS: tuple[dict[str, str], ...] = (
 KIND_KEYS = tuple(item["key"] for item in KINDS)
 KIND_NAMES = {item["key"]: item["name"] for item in KINDS}
 LEVELS = ("debug", "info", "good", "warn", "error")
-COLUMNS = ("类别", "级别", "帧", "功能", "摘要", "详情")
+COLUMNS = ("类别", "级别", "帧", "时间", "功能", "摘要", "详情")
 
 
 def kind_catalogue() -> list[dict]:
@@ -164,6 +164,9 @@ def to_csv(records: Iterable) -> str:
             KIND_NAMES.get(item.get("kind"), item.get("kind") or ""),
             item.get("level") or "",
             item.get("frame") or "",
+            #: Same display rule as the WebUI result table: capture-side
+            #: timestamp first, wall-clock time as fallback.
+            item.get("capture") or item.get("time") or "",
             item.get("feature") or "",
             item.get("summary") or "",
             item.get("detail") or "",

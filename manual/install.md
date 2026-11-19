@@ -78,11 +78,12 @@ fnet
 
 <ol class="steps">
   <li>
-    打开 <code>http://127.0.0.1:8765</code>，把 pcap / pcapng 拖到左侧虚线框，
+    打开 <code>http://127.0.0.1:8765</code>，把 pcap / pcapng 或文本日志拖到左侧虚线框，
     或在下方的输入框里填写本机路径后点“使用”。
   </li>
   <li>
-    左侧已按 13 个分类列出 50 个功能，默认勾选“关键字检测”和“HTTP数据提取”。
+    左侧已按 14 个分类列出 54 个功能，默认勾选“关键字检测”和“HTTP数据提取”；
+    上传 `.log`/`.txt`/`.jsonl`/`.csv` 时会自动切换到日志功能。
     不确定时可以先点“全选”，或只勾与本题相关的功能。
   </li>
   <li>
@@ -101,7 +102,8 @@ fnet
 
 ```bash
 python3 -m fnet -C capture.pcapng                       # 只跑默认勾选项
-python3 -m fnet -C capture.pcapng --all                 # 跑全部 50 个功能
+python3 -m fnet -C ceph.log                             # 日志默认 4 项
+python3 -m fnet -C capture.pcapng --all                 # 跑全部 54 个功能
 python3 -m fnet -C capture.pcapng --features checkBox_10,webshell.decrypt
 ```
 

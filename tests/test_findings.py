@@ -90,8 +90,13 @@ class CsvTest(unittest.TestCase):
             "credential", "admin:p@ss", frame=7, feature="HTTP",
             detail="POST /login")])
         lines = text.strip().splitlines()
-        self.assertEqual(lines[0], "类别,级别,帧,功能,摘要,详情")
-        self.assertIn("凭据,info,7,HTTP,admin:p@ss,POST /login", lines[1])
+        self.assertEqual(lines[0], "类别,级别,帧,时间,功能,摘要,详情")
+        # 时间列是 make() 记录的 wall-clock 时间（HH:MM:SS），只断言其余列。
+        row = lines[1].split(",")
+        self.assertEqual(row[0], "凭据")
+        self.assertEqual(row[1:3], ["info", "7"])
+        self.assertTrue(row[3])
+        self.assertEqual(row[4:], ["HTTP", "admin:p@ss", "POST /login"])
 
     def test_quotes_commas(self):
         text = findings.to_csv([findings.make("file", "a,b", detail="x,y")])

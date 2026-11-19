@@ -30,6 +30,9 @@ class FeatureContext:
     cancel: threading.Event | None = None
     output_dir: Path | None = None
     findings: list = field(default_factory=list)
+    #: Same value as ``Job.kind``: ``"pcap"`` or ``"log"``.  Log handlers use
+    #: it to skip captures, capture handlers use it to explain the skip.
+    input_kind: str = "pcap"
     #: Set when the handler runs on a frame-range shard: original frame
     #: numbers are ``frame + frame_offset`` and output names are prefixed.
     frame_offset: int = 0
@@ -130,6 +133,7 @@ CATEGORIES: list[dict[str, str]] = [
     {"key": "tls", "name": "TLS / 加密", "name_en": "TLS / encryption"},
     {"key": "misc", "name": "杂项", "name_en": "Miscellaneous"},
     {"key": "rdp", "name": "RDP 重放", "name_en": "RDP replay"},
+    {"key": "log", "name": "日志分析", "name_en": "Log analysis"},
 ]
 
 FEATURES: list[Feature] = [
@@ -426,10 +430,48 @@ FEATURES: list[Feature] = [
             description_en="Derive password candidates from accounts/domains/"
                            "shares/filenames plus a weak-password dictionary, "
                            "with path wordlists and bounded brute force"),
+    Feature("checkBox_61", "日志概览与时间线", "logs.summary", "log",
+            "解析 .log/.txt/.jsonl/.csv 文本日志：格式识别、时间范围、级别与"
+            "来源分布、字段覆盖率、事件时间线与字段统计落盘",
+            title_en="Log overview & timeline",
+            description_en="Parse text logs (.log/.txt/.jsonl/.csv): format "
+                           "detection, time range, levels/sources, field "
+                           "coverage and an event timeline"),
+    Feature("checkBox_62", "日志字段与实体统计", "logs.entities", "log",
+            "按客户端/账号/IP/主机等维度统计活动量、失败次数、失败率与活跃时段",
+            title_en="Log entity profiles",
+            description_en="Activity, failure count/rate and active window per "
+                           "client/account/IP/host dimension"),
+    Feature("checkBox_63", "日志失败与异常检测", "logs.anomalies", "log",
+            "失败/认证错误关键字、失败率异常实体、事件突增时间桶与低频异常字段值；"
+            "可用 log_fail_regex / log_fail_threshold / log_fail_ratio 调整",
+            title_en="Log failure & anomaly detection",
+            description_en="Failure/auth-error keywords, suspicious entities, "
+                           "activity bursts and rare field values; tune with "
+                           "log_fail_regex / log_fail_threshold / log_fail_ratio"),
+    Feature("checkBox_64", "日志IOC与敏感信息", "logs.iocs", "log",
+            "从日志提取 flag、凭据、哈希、URL、域名、邮箱、密钥标识与公网/内网 IP "
+            "清单，命中写入结构化结果",
+            title_en="Log IOCs & sensitive data",
+            description_en="Extract flags, credentials, hashes, URLs, domains, "
+                           "emails, key IDs and public/private IP inventory "
+                           "into structured findings"),
 ]
 
 BY_CHECKBOX = {feature.checkbox: feature for feature in FEATURES}
 BY_HANDLER = {feature.handler: feature for feature in FEATURES}
+
+
+def default_features_for(kind: str = "pcap") -> list[str]:
+    """Default checkbox selection for an input kind.
+
+    Capture jobs use the two starred defaults; log jobs use every ``log``
+    category feature so ``fnet -C access.log`` works without ``--features``.
+    """
+    if str(kind or "").strip().lower() == "log":
+        return [feature.checkbox for feature in FEATURES
+                if feature.category == "log"]
+    return [feature.checkbox for feature in FEATURES if feature.default]
 
 
 def feature_dict(feature: Feature) -> dict:

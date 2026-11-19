@@ -12,10 +12,16 @@ description: Fnet 无界面用法：参数、功能选择、参数传递、批�
 ## 基本用法
 
 ```bash
-python3 -m fnet -C capture.pcapng                    # 只跑默认勾选项
-python3 -m fnet -C capture.pcapng --all              # 全部 50 个功能
+python3 -m fnet -C capture.pcapng                    # 抓包：只跑默认勾选项
+python3 -m fnet -C access.log                        # 日志：默认跑 4 项日志功能
+python3 -m fnet -C capture.pcapng --all              # 全部 54 个功能
 python3 -m fnet -C capture.pcapng --features checkBox_10,http.extract
 ```
+
+`-C` 接受 pcap / pcapng 抓包，也接受 `.log` / `.txt` / `.jsonl` / `.csv` 文本
+日志。不带 `--features` 时，抓包默认勾选 2 项（关键字检测、HTTP 数据提取），
+日志默认勾选“日志分析”分类的 4 项；显式 `--features` / `--all` 会覆盖默认值。
+日志分析使用内置解析器，不需要 `tshark`。
 
 输出结构：
 
@@ -38,10 +44,10 @@ HTML 报告: .../report.html
 
 | 参数 | 说明 |
 | --- | --- |
-| `capture` | 要分析的 pcap / pcapng / cap / dmp / etl 文件 |
+| `capture` | 要分析的抓包（pcap / pcapng / cap / dmp / etl）或文本日志（.log / .txt / .jsonl / .csv） |
 | `-C`, `--cli` | 不启动 WebUI，直接在终端运行 |
 | `--features a,b` | 逗号分隔的功能，可写复选框编号或功能名 |
-| `--all` | 运行全部 50 个功能 |
+| `--all` | 运行全部 54 个功能 |
 | `--param KEY=VALUE` | 传给功能的参数，可重复 |
 | `--json` | 结束后只向 stdout 输出 JSON（任务、findings、统计与产出） |
 | `--rules PATH` | 导入正则 / YARA 子集规则文件，命中写入 findings |
@@ -84,6 +90,11 @@ HTML 报告: .../report.html
 | `sql_success` | SQL 盲注 | 成功响应的特征文本 |
 | `sql_regex` | SQL 盲注 | 自定义提取正则 |
 | `keywords` | 关键字检测 | `--param keywords="flag{;ctf"` |
+| `log_fail_regex` | 日志异常检测 | 自定义失败关键字正则 |
+| `log_fail_threshold` | 日志异常检测 | 实体失败次数阈值（默认 3） |
+| `log_fail_ratio` | 日志异常检测 | 实体失败率阈值（默认 0.5） |
+| `log_success_regex` | 日志实体统计 | 自定义“成功”口径正则（IGNORECASE），命中即计一次成功，如 `--param log_success_regex="Key: key_"` |
+| `log_subnet_prefix` | 日志实体统计 | 网段维度的 IPv4 前缀，8–32，默认 24，非法时回退 24；IPv6 固定 /64，如 `--param log_subnet_prefix=16` |
 | `wordlist` | 字典类功能 | 自定义字典路径 |
 
 `--param` 的值写成 `true` / `false` 会被解析为布尔值。
@@ -158,9 +169,9 @@ WebUI 导入的规则保存在 `paths.rules_file`，后续任务会自动沿用�
 ```bash
 #!/usr/bin/env bash
 set -u
-for pcap in samples/*.pcapng; do
-  echo "== $pcap"
-  python3 -m fnet -C "$pcap" --all \
+for input in samples/*.pcapng logs/*.log; do
+  echo "== $input"
+  python3 -m fnet -C "$input" --all \
     --param tls_keylog="$HOME/keys/sslkeys.log" || echo "  失败: $?"
 done
 ```

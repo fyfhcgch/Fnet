@@ -2,13 +2,32 @@
 layout: page
 title: 功能清单
 permalink: /manual/features/
-description: Fnet 50 项分析功能与附加处理器的用途、复选框编号和依赖。
+description: Fnet 54 项分析功能与附加处理器的用途、复选框编号和依赖。
 ---
 
-Fnet 有 **50 个复选框功能**，按 **13 个分类**组织；另有若干不带复选框的深度
-处理器，用 `--features` 或“专项功能”菜单调用。★ 表示默认勾选。
+Fnet 有 **54 个复选框功能**，按 **14 个分类**组织；另有若干不带复选框的深度
+处理器，用 `--features` 或“专项功能”菜单调用。★ 表示默认勾选。抓包
+（pcap/pcapng）与文本日志（`.log`/`.txt`/`.jsonl`/`.csv`）都是合法输入，
+日志任务默认勾选“日志分析”分类。
 
 想按赛题类型挑选功能，可以直接看文末的[选择建议](#选择建议)。
+
+## 日志分析（4）
+
+| 功能 | 复选框 | 说明 |
+| --- | --- | --- |
+| 日志概览与时间线 | `checkBox_61` ★ | 识别 Ceph / syslog / sshd / Apache / JSON Lines / CSV 与通用 KV 格式，输出时间范围、级别与来源分布、字段覆盖率与事件时间线 |
+| 日志字段与实体统计 | `checkBox_62` ★ | 按客户端、账号、IP、网段、主机等维度统计活动量、成功次数/成功率、失败次数/失败率与活跃时段；网段维度 IPv4 默认按 /24（IPv6 固定 /64）聚合，并输出“网段成功统计”汇总 |
+| 日志失败与异常检测 | `checkBox_63` ★ | 失败/认证错误关键字、失败率异常实体、事件突增时间桶与低频异常字段值 |
+| 日志IOC与敏感信息 | `checkBox_64` ★ | 提取 flag、凭据、哈希、URL、域名、邮箱、密钥标识与公网/内网 IP 清单 |
+
+参数：`log_fail_regex`、`log_fail_threshold`（默认 3）、`log_fail_ratio`
+（默认 0.5）、`log_success_regex`（自定义“成功”口径正则，命中即计一次成功；
+未提供时“未命中失败关键字”即视为成功）、`log_subnet_prefix`（网段维度的
+IPv4 前缀，8–32，默认 24，非法时回退 24；IPv6 固定 /64）。这 4 项是**日志
+输入**的默认勾选；抓包任务默认仍是关键字检测与
+HTTP 数据提取。关键字检测在日志输入上会自动改用内置扫描，只保留 flag/编码
+规则与用户自定义关键字。
 
 ## 文本与关键字（1）
 
@@ -51,14 +70,16 @@ Webshell 解密（冰蝎 3.x/4.x、哥斯拉、蚁剑、菜刀、内存马）没
 | Meterpreter会话分析 | `checkBox_55` | Meterpreter/metsvc TCP TLV 会话识别，提取命令 ID、字符串参数与时间线 |
 | Sliver/meterpreter C2扩展 | `checkBox_56` | Sliver HTTP/DNS/mTLS beacon 识别（v1.6 ChaCha20-Poly1305 与签名前缀/gzip、v1.5/旧版 AES-GCM 回退、密钥交换、流量编码器）与 meterpreter staging/AES-128/256-CBC wire 分析；`sliver_session_key`（32/16 字节 hex）/ `meterpreter_symkey`（16=AES-128、32=AES-256 hex）解密会话载荷，`sliver_dns_domain` 指定已知 DNS beacon 域名 |
 
-## 认证与凭据（2）
+## 认证与凭据（4）
 
 | 功能 | 复选框 | 说明 |
 | --- | --- | --- |
 | NTLM HASH提取 | `checkBox_39` | 从 NTLMSSP 认证中提取 NetNTLM 哈希（hashcat 格式） |
 | Kerberos解析破解 | `checkBox_45` | 提取 AS-REQ/AS-REP/TGS-REP，生成 18200/13100/19800/19900 哈希；可用 keytab、账号口令或原始密钥解密响应（19600/19700），解析 PAC、NTLM 哈希与用户时间线 |
+| NTLM密码离线验证 | `checkBox_58` | 无 hashcat 时用挑战/响应离线验证或受控枚举 NetNTLMv2 密码（默认不强攻） |
+| SMB密码候选生成 | `checkBox_60` | 从账号/域名/共享/文件名与弱口令字典派生候选，供 NTLM 验证与 SMB3 解密复用 |
 
-## 协议流量（16）
+## 协议流量（17）
 
 | 功能 | 复选框 | 说明 |
 | --- | --- | --- |
@@ -78,12 +99,13 @@ Webshell 解密（冰蝎 3.x/4.x、哥斯拉、蚁剑、菜刀、内存马）没
 | PostgreSQL流量分析 | `checkBox_51` | 查询语句与参数、结果摘要、明文口令消息与 COPY 数据 |
 | Redis流量分析 | `checkBox_52` | RESP 命令、AUTH/ACL 凭据、敏感键读取与写入值摘要（支持非标准端口） |
 | SSH流量分析 | `checkBox_53` | SSH 版本交换、KEXINIT 算法协商、userauth 用户名/方法/口令与爆破时间线 |
+| SMB加密链路智能串联 | `checkBox_57` | NTLM 账号 → 候选密码注入/离线验证 → SMB3 解密 → 导出文件 → 熵识别 → flag，候选耗尽时回退提示 hashcat |
 
 ## 工控协议（7）
 
 | 功能 | 复选框 | 说明 |
 | --- | --- | --- |
-| 工控协议modbus分析 | `checkBox_11` | 功能码、地址与异常帧 |
+| 工控协议modbus分析 | `checkBox_11` | 功能码、地址与异常帧；写操作统计与寄存器隐蔽通道检测（ASCII 隐写自动解码） |
 | 工控协议s7comm分析 | `checkBox_14` | S7comm 读写请求 |
 | 工控协议iec60870分析 | `checkBox_12` | IEC 60870-5-104 类型标识与传送原因 |
 | 工控协议mqtt分析 | `checkBox_13` | MQTT 主题与消息 |
@@ -183,6 +205,7 @@ CSV 导出与任务对比。WebUI 导入的路径保存在 `paths.rules_file`，
 | 场景 | 建议勾选 |
 | --- | --- |
 | 只想快速找 flag | 关键字检测 + `text_scan.deep` |
+| 日志审计 / 应急 | 日志概览与时间线、字段与实体统计、失败与异常检测、IOC与敏感信息 |
 | Web 题 | HTTP数据提取、HTTP下载文件分析、shiro流量解密、SQL 盲注系列、`webshell.decrypt` |
 | 内网 / 域环境 | NTLM HASH提取、Kerberos解析破解、WINRM流量解密、`protocols.*`、`forensics.*` |
 | 无线 / 硬件 | 无线流量暴力破解、蓝牙流量分析、USB 键盘/鼠标、EV3 |

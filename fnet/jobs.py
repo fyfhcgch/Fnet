@@ -32,7 +32,8 @@ from fnet import jobs_shards as _shards
 from fnet.jobs_findings import ANNOTATION_STATUSES
 from fnet.config import Config
 from fnet.features.registry import (
-    BY_CHECKBOX, BY_HANDLER, CancelledError, Feature, FeatureContext, call_feature,
+    BY_CHECKBOX, BY_HANDLER, CancelledError, Feature, FeatureContext,
+    call_feature, default_features_for,
 )
 from fnet.logger import JobLog, logger
 # ``CACHE_DIR`` stays importable/patchable on this module (``fnet.jobs.CACHE_DIR``)
@@ -41,10 +42,11 @@ from fnet.logger import JobLog, logger
 from fnet.paths import CACHE_DIR
 from fnet.report import (
     MAX_LOG_RECORDS, MAX_REPORT_FINDINGS, REPORT_FILES, annotation_lines,
-    normalise_sections, parse_report_text, render_html, render_markdown,
-    write_reports,
+    is_analysis_artifact, normalise_sections, parse_report_text, render_html,
+    render_markdown, write_reports,
 )
 from fnet.tools.runner import ToolBox
+from fnet.utils.logfile import classify_input
 
 
 @dataclass
@@ -54,6 +56,10 @@ class Job:
     features: list[Feature]
     params: dict
     output_dir: Path
+    #: ``"pcap"`` for captures, ``"log"`` for text logs (see
+    #: :func:`fnet.utils.logfile.classify_input`).  The field name ``pcap`` is
+    #: kept for API/report compatibility and holds the input path either way.
+    kind: str = "pcap"
     created: str = field(default_factory=lambda: _dt.datetime.now().isoformat(timespec="seconds"))
     started: str | None = None
     finished: str | None = None
@@ -99,6 +105,8 @@ class Job:
             "id": self.id,
             "pcap": self.pcap,
             "pcap_name": Path(self.pcap).name,
+            "kind": self.kind,
+            "input_type": "log" if self.kind == "log" else "pcap",
             "features": [f.checkbox for f in self.features],
             "feature_titles": [f.title for f in self.features],
             "status": self.status,
@@ -318,6 +326,7 @@ class JobManager:
                         entry.get("features") or [])]
                 stub = SimpleNamespace(
                     id=job_id, pcap=str(entry.get("pcap") or ""),
+                    kind=str(entry.get("kind") or "pcap"),
                     features=features, params=entry.get("params") or {},
                     output_dir=output, status=str(entry.get("status") or ""),
                     created=entry.get("created"), started=entry.get("started"),
@@ -494,9 +503,12 @@ class JobManager:
                shards: int = 1) -> Job:
         source = Path(pcap).expanduser()
         if not source.is_file():
-            raise FileNotFoundError(f"流量包不存在: {source}")
-        if source.suffix.lower() not in (".pcap", ".pcapng", ".cap", ".dmp", ".etl"):
-            raise ValueError("仅支持 pcap / pcapng / cap / dmp / etl 文件")
+            raise FileNotFoundError(f"输入文件不存在: {source}")
+        kind = classify_input(source)
+        if kind is None:
+            raise ValueError(
+                "仅支持 pcap / pcapng / cap / dmp / etl 流量包，"
+                "或 log / txt / out / jsonl / ndjson / json / csv / tsv 日志文件")
         features: list[Feature] = []
         seen: set[str] = set()
         for item in checkboxes:
@@ -517,7 +529,7 @@ class JobManager:
         except (TypeError, ValueError):
             shards = 1
         job = Job(job_id, str(source.resolve()), features, params or {}, output,
-                  shards=shards)
+                  kind=kind, shards=shards)
         for feature in features:
             job.feature_status[feature.checkbox] = "pending"
         with self._lock:
@@ -547,7 +559,7 @@ class JobManager:
         the backend for the WebUI's drag-many-captures workflow.
         """
         if not pcaps:
-            raise ValueError("批量分析至少需要一个流量包")
+            raise ValueError("批量分析至少需要一个输入文件")
         jobs: list[Job] = []
         try:
             for pcap in pcaps:
@@ -824,12 +836,12 @@ class JobManager:
         params.setdefault("sql_time_threshold",
                           self.config.get_float("sql_time_threshold", fallback=1.0))
 
-        job.log.info(f"开始分析: {job.pcap}")
+        job.log.info(f"开始分析{'日志' if job.kind == 'log' else ''}: {job.pcap}")
         job.log.info(f"输出目录: {job.output_dir}")
         job.log.info("功能: " + "、".join(f.title for f in job.features))
         if job.shards > 1:
             job.log.info(f"分片执行：无状态功能按 {job.shards} 个帧区间并行切片")
-        if tshark is None:
+        if tshark is None and job.kind != "log":
             job.log.error("tshark 不可用，依赖 tshark 的功能将被跳过")
 
         resume_note = bool(job.completed)
@@ -919,7 +931,7 @@ class JobManager:
             job.progress = int(_base + _span * (value / 100))
 
         ranges: list[tuple[int, int]] = []
-        if feature.shardable and job.shards > 1:
+        if feature.shardable and job.shards > 1 and job.kind == "pcap":
             count = self._frame_count(job.pcap, tshark)
             if count and count >= job.shards * 2:
                 ranges = _shards.split_ranges(count, job.shards)
@@ -972,6 +984,7 @@ class JobManager:
             cancel=job.cancel_event,
             output_dir=job.output_dir,
             findings=job.findings,
+            input_kind=job.kind,
             frame_offset=frame_offset,
             shard=shard,
         )
@@ -1005,8 +1018,27 @@ class JobManager:
         job.log.info(f"===== 自定义规则（{len(rule_set)} 条）=====")
         first = len(job.findings)
         try:
-            matches = rules_mod.scan_pcap(rule_set, job.pcap, tshark,
-                                          cancel=job.cancel_event)
+            if job.kind == "log":
+                from fnet.utils import logfile
+
+                log = logfile.parse_path(job.pcap)
+                matches = []
+                for record in log.records:
+                    if job.cancel_event.is_set():
+                        break
+                    hits = rules_mod.match_text(
+                        rule_set, record.raw, time=record.time,
+                        protocol=record.source)
+                    for hit in hits:
+                        hit["detail"] = (f"第 {record.line} 行；"
+                                         + str(hit.get("detail") or ""))
+                    matches.extend(hits)
+                    if len(matches) >= rules_mod.MAX_MATCHES:
+                        break
+                matches = matches[:rules_mod.MAX_MATCHES]
+            else:
+                matches = rules_mod.scan_pcap(rule_set, job.pcap, tshark,
+                                              cancel=job.cancel_event)
         except CancelledError:
             job.feature_status["__rules__"] = "cancelled"
             return
@@ -1085,7 +1117,7 @@ class JobManager:
         lines = [
             "Fnet 分析报告",
             "=" * 60,
-            f"流量包: {job.pcap}",
+            f"{'日志文件' if job.kind == 'log' else '流量包'}: {job.pcap}",
             f"任务 ID: {job.id}",
             f"开始时间: {job.started}",
             f"结束时间: {job.finished}",
@@ -1127,25 +1159,39 @@ class JobManager:
     # -- artifact helpers ---------------------------------------------
     @staticmethod
     def artifacts_in(output_dir: Path) -> list[dict]:
+        """Deliverables of a job: report/analysis-result files are not listed.
+
+        ``report.*`` files are exported from the result view and pure analysis
+        results (``findings.*``, ``annotations.json``, ``log_*.csv`` …) are
+        shown in the "分析结果" tab; the files stay on disk and remain
+        downloadable via ``/api/download?path=``.
+        """
         items = []
         if not output_dir.is_dir():
             return items
         for path in sorted(output_dir.rglob("*")):
-            if path.is_file() and path.name != "job.json" \
-                    and path.name not in REPORT_FILES:
-                items.append({
-                    "name": path.relative_to(output_dir).as_posix(),
-                    "size": path.stat().st_size,
-                })
+            if not path.is_file() or path.name in REPORT_FILES \
+                    or is_analysis_artifact(path.name):
+                continue
+            items.append({
+                "name": path.relative_to(output_dir).as_posix(),
+                "size": path.stat().st_size,
+            })
         return items
 
     def artifacts(self, job: Job) -> list[dict]:
         return self.artifacts_in(job.output_dir)
 
     def zip_artifacts(self, job: Job) -> Path:
+        """Pack the job output; pure analysis-result files stay out of the ZIP.
+
+        The three report files keep their historical behaviour here: they are
+        hidden from the "产出文件" list but still travel inside the archive.
+        """
         archive = job.output_dir / f"fnet-{job.id}.zip"
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
             for path in job.output_dir.rglob("*"):
-                if path.is_file() and path != archive and path.name != "job.json":
+                if path.is_file() and path != archive \
+                        and not is_analysis_artifact(path.name):
                     zf.write(path, path.relative_to(job.output_dir).as_posix())
         return archive

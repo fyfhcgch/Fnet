@@ -32,7 +32,7 @@ JobManager ─────────────►  worker thread
 - **输出**：每个任务有独立目录 `~/.cache/fnet/jobs/<job-id>/`，报告会写成
   `report.txt`、`report.md` 与自包含的 `report.html`，结构化结果写成
   `findings.json` 与 `findings.csv`，其余为功能导出的文件
-  （哈希、证书、解密载荷、CSV 等）。`job.json` 保存任务元数据（流量包、
+  （哈希、证书、解密载荷、CSV 等）。`job.json` 保存任务元数据（输入文件、
   功能、参数、状态），供重启后的“任务历史”恢复；它不会出现在产出列表与
   打包 ZIP 中。
 - **结构化结果**：`fnet/findings.py` 定义统一的记录格式（类别、级别、帧、
@@ -51,6 +51,13 @@ JobManager ─────────────►  worker thread
 - **数据包定位**：`GET /api/packet` 按 `job`/`frame` 找到抓包路径（历史任务
   从 `job.json` 恢复），调用 `fnet/services.py` 取相邻帧与 `-V` 解码；导出的
   片段写到任务目录 `frames/`，因此会进入产出列表与打包 ZIP。
+- **输入类型**：`JobManager.create()` 用 `fnet/utils/logfile.py:classify_input()`
+  区分抓包（pcap/pcapng）与文本日志（`.log`/`.txt`/`.jsonl`/`.csv`），把结果
+  写入 `Job.kind`（`"pcap"` / `"log"`）并传给 `FeatureContext.input_kind`。
+  日志分析功能由内置解析器读取记录，不启动 `tshark`，因此 `--doctor` 报缺
+  tshark 时仍可完成默认的日志分析；默认功能也按 kind 选择（抓包 2 项、
+  日志 4 项）。若在日志任务上显式选择抓包功能，这些功能仍会按各自逻辑跳过或
+  报错。
 - **断点与分片**：`Job` 在 `job.json` 中记录 `completed`、`feature_status`、
   `succeeded`、`failed`，任务只在功能边界暂停；`/api/jobs/<id>/pause` 设置
   `pause_event`，`resume()` 从下一个未完成功能继续。注册表中 `shardable=True`
@@ -58,7 +65,7 @@ JobManager ─────────────►  worker thread
   通过 `frame_offset` 把分片帧号还原为原始帧号；流重组/解密类功能保持整包
   执行，避免跨分片状态丢失。
 - **自定义规则**：`fnet/utils/rules.py` 只依赖标准库，解析 YARA 子集与逐行
-  正则；`JobManager._apply_rules()` 在功能结束后扫描 pcap 载荷，把命中写入
+  正则；`JobManager._apply_rules()` 在功能结束后扫描抓包载荷或日志记录，把命中写入
   结构化结果的 `rule` 类别。未显式传 `--rules` 时回退到配置
   `paths.rules_file`，因此 WebUI 导入的规则对后续任务持续生效。
 - **流式上传**：`/api/upload` 的 multipart 分支边读边写临时文件
@@ -79,9 +86,9 @@ JobManager ─────────────►  worker thread
 | 实时抓包 | `fnet/live.py` | tshark 网卡枚举与单实例抓包控制 |
 | 结果 | `fnet/findings.py` | 结构化结果的格式、筛选、CSV 导出 |
 | 报告 | `fnet/report.py` | Markdown/HTML 报告渲染、章节选择、旧报告反解 |
-| 功能 | `fnet/features/` | 50 个分析功能，按主题拆文件 |
+| 功能 | `fnet/features/` | 54 个分析功能，按主题拆文件；`logs.py` 处理文本日志 |
 | 外部工具 | `fnet/tools/runner.py` | 工具发现、子进程、tshark 字段校验 |
-| 工具库 | `fnet/utils/` | 编解码、AES/RC4/MD4/RSA/GCM、pcap 辅助、TCP 流重组、RESP/PostgreSQL/BSON-MongoDB/WebSocket/MySQL 解析、Kerberos 原语、DNS/ICMP 隧道、邮件 MIME、WPA CCMP 解密、规则解析 |
+| 工具库 | `fnet/utils/` | 编解码、AES/RC4/MD4/RSA/GCM、pcap 辅助、TCP 流重组、RESP/PostgreSQL/BSON-MongoDB/WebSocket/MySQL 解析、Kerberos 原语、DNS/ICMP 隧道、邮件 MIME、WPA CCMP 解密、规则解析、文本日志格式识别（`logfile.py`） |
 | 配置 | `fnet/config.py` | `config.ini` 默认值、读写、最近文件 |
 
 ## 功能注册表
@@ -107,13 +114,14 @@ Feature("checkBox_10", "关键字检测", "text_scan.keyword_scan", "text",
 
 ## 一次分析的完整流程
 
-1. 前端 `POST /api/analyze`，传入 `pcap`、`features`、`params`。
-2. `JobManager.create()` 校验文件后缀、解析复选框、创建输出目录。
+1. 前端 `POST /api/analyze`，传入抓包或日志路径、`features`、`params`。
+2. `JobManager.create()` 校验输入后缀、识别输入类型、解析复选框、创建输出目录。
 3. worker 打开 `report.txt`，逐个调用 `call_feature(ctx, handler)`。
 4. 每个功能：
-   - 用 `tshark_rows(ctx, fields, filter)` 取字段；字段列表先经过
+   - 抓包功能用 `tshark_rows(ctx, fields, filter)` 取字段；字段列表先经过
      `tshark -G fields` 校验，未知字段会被丢弃并按位置补空，避免整条查询
-     静默失败。
+     静默失败。日志功能直接用 `fnet.utils.logfile.parse_path(ctx.pcap)` 读取
+     记录，不调用 `tshark`。
    - 用 `ctx.report()` 写日志，用 `ctx.write_output()` 存文件。
    - 值得汇总的发现用 `ctx.add_finding()` 记成结构化结果（凭据、哈希、
      flag、导出文件等），日志仍然是完整的人读流水。

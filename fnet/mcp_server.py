@@ -25,7 +25,10 @@ import sys
 from pathlib import Path
 
 from fnet import __version__
-from fnet.features.registry import CATEGORIES, FEATURES
+from fnet.features.registry import (
+    CATEGORIES, FEATURES, default_features_for,
+)
+from fnet.utils.logfile import classify_input
 
 #: MCP protocol version advertised during the ``initialize`` handshake.
 PROTOCOL_VERSION = "2024-11-05"
@@ -62,15 +65,15 @@ def tool_definitions() -> list[dict]:
         {
             "name": "analyze",
             "description": (
-                "对一个 pcap/pcapng 文件同步运行分析任务并等待完成，"
-                "返回 findings 摘要、统计与报告路径。"
+                "对一个 pcap/pcapng 流量包或 .log/.txt/.jsonl/.csv 日志文件"
+                "同步运行分析任务并等待完成，返回 findings 摘要、统计与报告路径。"
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "pcap_path": {
                         "type": "string",
-                        "description": "pcap/pcapng 文件路径；缺省时使用启动 fnet 时预载的流量包",
+                        "description": "流量包或日志文件路径；缺省时使用启动 fnet 时预载的文件",
                     },
                     "features": {
                         "type": "array",
@@ -264,13 +267,16 @@ class MCPServer:
                     "缺少 pcap_path，且启动 fnet 时也没有预载流量包"}
         path = Path(pcap).expanduser()
         if not path.is_file():
-            return {"ok": False, "error": f"流量包不存在: {path}"}
+            return {"ok": False, "error": f"输入文件不存在: {path}"}
+        kind = classify_input(path)
+        if kind is None:
+            return {"ok": False, "error": f"不支持的输入文件类型: {path.suffix}"}
         features = arguments.get("features") or self.default_features
         if isinstance(features, str):
             features = [item.strip() for item in features.split(",") if item.strip()]
         features = [str(item).strip() for item in features or [] if str(item).strip()]
         if not features:
-            features = [feature.checkbox for feature in FEATURES if feature.default]
+            features = default_features_for(kind)
         params = arguments.get("params")
         params = dict(params) if isinstance(params, dict) else {}
         try:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import gzip
+import ipaddress
 import os
 import re
 import subprocess
@@ -19,7 +20,7 @@ from pathlib import Path
 from fnet.logger import logger
 from fnet.paths import CACHE_DIR
 from fnet.tools.runner import ToolBox, run
-from fnet.utils import codec
+from fnet.utils import codec, logfile
 from fnet.utils.pcap import conversations
 
 
@@ -523,6 +524,392 @@ def timeline_packets(pcap: str, toolbox: ToolBox, start, end,
 
 
 # ---------------------------------------------------------------------------
+# Log stats: the 统计图表 page also works on plain-text log inputs.
+# The shapes mirror the capture-side results so the WebUI renders both with
+# the same code; ``kind="log"`` marks a log-derived payload (additive and
+# backward compatible).  ``bytes`` is always 0 for logs: there is no packet
+# size, so the UI falls back to counting events ("条").
+# ---------------------------------------------------------------------------
+_LOG_BUCKET_WIDTHS = (1, 5, 10, 30, 60, 300, 600, 900, 1800, 3600, 10800,
+                      21600, 43200, 86400, 604800)
+
+#: Entity ranking keys: user-ish first, then client IP-ish.
+_LOG_ENTITY_KEYS = ("client_id", "user", "client_ip", "src_ip", "ip")
+
+#: Peer keys for the log topology: a server/host/program-ish identifier.
+_LOG_PEER_KEYS = ("server", "server_ip", "host", "dst_ip", "peer", "target",
+                  "node", "program", "source")
+
+
+def _log_parsed(path: str) -> tuple[logfile.LogFile | None, str]:
+    """Parse a text-log input; ``(None, reason)`` when it cannot be read.
+
+    Uses :func:`fnet.utils.logfile.parse_path`, which caps the file at
+    ``MAX_RECORDS`` lines, so every stats sub inherits that guard.
+    """
+    try:
+        parsed = logfile.parse_path(path)
+    except Exception as exc:  # noqa: BLE001 - never raise into the HTTP layer
+        logger.warning("日志统计解析失败 %s: %s", path, exc)
+        return None, f"日志解析失败：{exc}"
+    return parsed, ""
+
+
+def _log_entity(record: logfile.LogRecord) -> str:
+    """Best entity for one record: user/client id first, then an IP."""
+    value = record.value(*_LOG_ENTITY_KEYS)
+    if value:
+        return value
+    return record.ips[0] if record.ips else ""
+
+
+def _log_peer(record: logfile.LogRecord) -> str:
+    value = record.value(*_LOG_PEER_KEYS)
+    return value if value and value != _log_entity(record) else ""
+
+
+def _looks_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(str(value))
+        return True
+    except ValueError:
+        return False
+
+
+def log_timeline_points(log: logfile.LogFile,
+                        buckets: int = 60) -> list[dict]:
+    """Event counts per adaptive time bucket; pure and unit-testable.
+
+    Bucket widths follow the same strategy as ``fnet.features.logs._buckets``
+    (a ladder of fixed widths) and fall back to an even split so the point
+    count always stays within ``max(buckets, 1) + 1``.
+    """
+    stamped = [record.epoch for record in log.records
+               if record.epoch is not None]
+    if len(stamped) < 2:
+        return []
+    try:
+        count = max(1, min(int(buckets), 240))
+    except (TypeError, ValueError):
+        count = 60
+    low, high = min(stamped), max(stamped)
+    span = max(0.0, high - low)
+    width = next((item for item in _LOG_BUCKET_WIDTHS if span / item <= count),
+                 0.0)
+    if width <= 0:
+        width = max(span / count, 1e-6)
+    counts: Counter = Counter()
+    for epoch in stamped:
+        counts[int((epoch - low) // width)] += 1
+    return [{"time": low + index * width, "frames": counts[index], "bytes": 0}
+            for index in range(int((high - low) // width) + 1)]
+
+
+def log_timeline(path: str, buckets=60,
+                 cancel: threading.Event | None = None) -> dict:
+    log, error = _log_parsed(path)
+    if log is None:
+        return _result(False, error, kind="log")
+    points = log_timeline_points(log, buckets)
+    if not points:
+        return _result(False, "日志任务：日志中没有可解析的时间戳，无法生成时间线",
+                       kind="log")
+    total = sum(point["frames"] for point in points)
+    low, high = points[0]["time"], points[-1]["time"]
+    duration = max(0.0, high - low)
+    text = (f"日志时间线：{total} 条日志 · 时间跨度 {duration:.3f}s · "
+            f"{len(points)} 个时间桶")
+    return _result(True, text, points=points, duration=duration,
+                   total_frames=total, total_bytes=0, start=low, end=high,
+                   buckets=len(points), kind="log")
+
+
+def log_level_items(log: logfile.LogFile) -> list[dict]:
+    """Log-level "protocol hierarchy" items, sorted by count."""
+    items = [{"label": level, "frames": count, "bytes": 0}
+             for level, count in log.levels().items()]
+    items.sort(key=lambda item: (-item["frames"], item["label"]))
+    return items
+
+
+def log_level_hierarchy(path: str,
+                        cancel: threading.Event | None = None) -> dict:
+    log, error = _log_parsed(path)
+    if log is None:
+        return _result(False, error, kind="log")
+    items = log_level_items(log)
+    if not items:
+        return _result(False, "日志任务：日志中没有可解析的记录", kind="log")
+    breakdown = " · ".join(f"{item['label']} {item['frames']}"
+                           for item in items)
+    text = f"日志级别分层：{breakdown}"
+    return _result(True, text, items=items, kind="log")
+
+
+def log_entity_items(log: logfile.LogFile, limit: int = 20) -> list[dict]:
+    """Top entities (client_id/user first, then IPs) as bar-chart items."""
+    counts: Counter = Counter()
+    for record in log.records:
+        entity = _log_entity(record)
+        if entity:
+            counts[entity] += 1
+    try:
+        capped = max(1, min(int(limit), 50))
+    except (TypeError, ValueError):
+        capped = 20
+    return [{"label": name, "frames": count, "bytes": 0}
+            for name, count in counts.most_common(capped)]
+
+
+def log_top_entities(path: str, limit: int = 20,
+                     cancel: threading.Event | None = None) -> dict:
+    log, error = _log_parsed(path)
+    if log is None:
+        return _result(False, error, kind="log")
+    items = log_entity_items(log, limit)
+    if not items:
+        return _result(False,
+                       "日志任务：日志中没有可识别的实体"
+                       "（client_id/user/IP）",
+                       kind="log")
+    total = sum(item["frames"] for item in items)
+    text = f"Top 实体：{len(items)} 个实体 · 共 {total} 条日志"
+    return _result(True, text, items=items, kind="log")
+
+
+#: Cap on entity rows returned to the WebUI; the full table stays in the
+#: job's ``log_entities.csv`` artifact.
+LOG_ENTITY_STATS_LIMIT = 50
+
+
+def log_entity_stats(path: str, dimension: str, limit: int = 50,
+                     success_regex: str = "", subnet_prefix=None,
+                     fail_regex: str = "",
+                     cancel: threading.Event | None = None) -> dict:
+    """Full per-entity statistics for one dimension (「实体统计」card).
+
+    Reuses :func:`fnet.features.logs.entity_stats` so the WebUI table and
+    the feature report share one implementation and can never drift.
+    ``dimension`` must be one of the dimensions that actually occur in this
+    log (:func:`fnet.features.logs._entity_dimensions`); anything else
+    answers ``ok:false`` with the available list.  ``success_regex`` /
+    ``fail_regex`` / ``subnet_prefix`` mirror the feature params and fall
+    back gracefully on invalid input (default failure rules, "non-failing
+    counts as success", /24 with the 8–32 range and IPv6 always /64).
+    Never raises: parse failures and empty dimensions return ``ok:false``
+    with a reason.
+    """
+    from fnet.features import logs as log_features
+
+    kind = {"kind": "log"}
+    log, error = _log_parsed(path)
+    if log is None:
+        return _result(False, error, dimension=str(dimension or ""),
+                       dimensions=[], items=[], total=0, **kind)
+    if not log.records:
+        return _result(False, "日志中没有可解析的记录",
+                       dimension=str(dimension or ""), dimensions=[],
+                       items=[], total=0, **kind)
+    dimensions = log_features._entity_dimensions(log)
+    name = str(dimension or "").strip()
+    if name not in dimensions:
+        available = "、".join(dimensions) if dimensions else "（无）"
+        shown_name = name or "（空）"
+        return _result(
+            False, f"未知实体维度 {shown_name}；可用维度: {available}",
+            dimension=name, dimensions=dimensions, items=[], total=0, **kind)
+    fail_re = log_features.DEFAULT_FAIL_RE
+    success_re = None
+    notes: list[str] = []
+    raw_fail = str(fail_regex or "").strip()
+    if raw_fail:
+        try:
+            fail_re = re.compile(raw_fail, re.IGNORECASE)
+        except re.error as exc:
+            notes.append(f"fail_regex 无效（{exc}），使用默认失败规则")
+    raw_success = str(success_regex or "").strip()
+    if raw_success:
+        try:
+            success_re = re.compile(raw_success, re.IGNORECASE)
+        except re.error as exc:
+            notes.append(f"success_regex 无效（{exc}），"
+                         "回退为“未命中失败关键字即成功”口径")
+    prefix = log_features.DEFAULT_SUBNET_PREFIX
+    if subnet_prefix not in ("", None):
+        try:
+            value = int(str(subnet_prefix).strip())
+        except (TypeError, ValueError):
+            value = 0
+        if 8 <= value <= 32:
+            prefix = value
+        else:
+            notes.append(f"subnet_prefix 超出范围 8-32（{value}），回退 /24")
+    try:
+        capped = max(1, min(int(limit), LOG_ENTITY_STATS_LIMIT))
+    except (TypeError, ValueError):
+        capped = LOG_ENTITY_STATS_LIMIT
+    try:
+        items = log_features.entity_stats(
+            log, name, fail_re=fail_re, success_re=success_re,
+            subnet_prefix=prefix)
+    except Exception as exc:  # noqa: BLE001 - never raise into the HTTP layer
+        logger.warning("实体统计失败 %s/%s: %s", path, name, exc)
+        return _result(False, f"实体统计失败：{exc}", dimension=name,
+                       dimensions=dimensions, items=[], total=0, **kind)
+    if not items:
+        return _result(False, f"维度 {name} 没有统计到任何值", dimension=name,
+                       dimensions=dimensions, items=[], total=0, **kind)
+    shown = items[:capped]
+    rule = ("命中 success_regex 的记录计一次成功" if success_re is not None
+            else "未命中失败关键字（默认规则）的记录视为成功")
+    text = (f"实体统计（{name}）：共 {len(items)} 个值 · 成功口径：{rule} · "
+            f"网段前缀 /{prefix}（IPv6 固定 /64）")
+    if notes:
+        text += "；" + "；".join(notes)
+    return _result(True, text, dimension=name, dimensions=dimensions,
+                   items=shown, total=len(items),
+                   truncated=len(items) > capped, subnet_prefix=prefix,
+                   success_rule=rule, **kind)
+
+
+def log_topology_base(log: logfile.LogFile) -> dict:
+    """Client-IP → peer (server/host/program) graph for one parsed log.
+
+    Returns ``{"nodes": [...], "edges": [...], "total_frames": n}``; empty
+    lists when the log never pairs a client IP with a peer identifier.
+    """
+    nodes: dict[str, dict] = {}
+    edges: dict[tuple[str, str], dict] = {}
+    for record in log.records:
+        client = _log_entity(record)
+        peer = _log_peer(record)
+        if not client or not peer or client == peer:
+            continue
+        key = (client, peer)
+        edge = edges.get(key)
+        if edge is None:
+            edge = edges[key] = {"source": client, "target": peer,
+                                 "frames": 0, "first_line": record.line,
+                                 "last_line": record.line}
+        edge["frames"] += 1
+        edge["last_line"] = record.line
+        for name, other in ((client, peer), (peer, client)):
+            node = nodes.get(name)
+            if node is None:
+                node = nodes[name] = {"frames": 0, "peers": set()}
+            node["frames"] += 1
+            node["peers"].add(other)
+    ranked = sorted(nodes.items(), key=lambda kv: -kv[1]["frames"])[:60]
+    kept = {name for name, _info in ranked}
+    selected = sorted(edges.values(), key=lambda item: -item["frames"])[:200]
+    node_items = [{
+        "id": name, "label": name,
+        "ip": name if _looks_ip(name) else "", "port": "",
+        "frames": info["frames"], "bytes": 0,
+        "peers": len(info["peers"]), "protocols": [],
+    } for name, info in ranked]
+    edge_items = [{
+        "source": item["source"], "target": item["target"],
+        "frames": item["frames"], "bytes": 0, "protocol": "日志",
+        "protocols": ["日志"], "first_frame": str(item["first_line"]),
+        "last_frame": str(item["last_line"]), "frames_list": [],
+    } for item in selected if item["source"] in kept
+        and item["target"] in kept]
+    return {"nodes": node_items, "edges": edge_items,
+            "total_frames": sum(item["frames"] for item in edges.values()),
+            "max_frames": max((item["frames"] for item in node_items),
+                              default=0)}
+
+
+def log_topology(path: str,
+                 cancel: threading.Event | None = None) -> dict:
+    log, error = _log_parsed(path)
+    if log is None:
+        return _result(False, error, kind="log")
+    base = log_topology_base(log)
+    if not base["nodes"]:
+        return _result(False,
+                       "日志任务：日志中无法同时得到客户端 IP 与对端标识"
+                       "（server/host/program），无法生成拓扑",
+                       kind="log")
+    text = (f"{len(base['nodes'])} 个节点 · {len(base['edges'])} 条对端关系 · "
+            f"{base['total_frames']} 条日志")
+    return _result(True, text, nodes=base["nodes"], edges=base["edges"],
+                   total_bytes=0, total_frames=base["total_frames"],
+                   max_bytes=0, max_frames=base["max_frames"], kind="log")
+
+
+def log_timeline_packets(path: str, start, end, limit: int = 200,
+                         cancel: threading.Event | None = None) -> dict:
+    """Log records inside one timeline bucket (click-to-drilldown)."""
+    try:
+        low, high = float(start), float(end)
+    except (TypeError, ValueError):
+        return _result(False, "时间范围无效", kind="log")
+    if not (-1e12 <= low <= high < 1e12):
+        return _result(False, "时间范围无效", kind="log")
+    log, error = _log_parsed(path)
+    if log is None:
+        return _result(False, error, kind="log")
+    try:
+        count = max(1, min(int(limit), 1000))
+    except (TypeError, ValueError):
+        count = 200
+    packets = []
+    for record in log.records:
+        if record.epoch is None or not (low <= record.epoch <= high):
+            continue
+        client = _log_entity(record)
+        packets.append({
+            "frame": record.line, "time": record.time,
+            "src": client, "dst": _log_peer(record),
+            "protocol": record.level or "info",
+            "info": (record.message or record.raw)[:200],
+            "length": 0,
+        })
+        if len(packets) >= count:
+            break
+    if not packets:
+        return _result(False, "该时间范围内没有日志记录", kind="log")
+    return _result(True, f"{low:.2f}s–{high:.2f}s: {len(packets)} 条日志",
+                   packets=packets, start=low, end=high, kind="log")
+
+
+def log_protocol_detail(path: str, protocol: str, limit: int = 300,
+                        cancel: threading.Event | None = None) -> dict:
+    """Log records matching one level/source label (hierarchy drilldown)."""
+    name = str(protocol or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,40}", name):
+        return _result(False, "日志级别/来源名称无效", kind="log")
+    log, error = _log_parsed(path)
+    if log is None:
+        return _result(False, error, kind="log")
+    try:
+        count = max(1, min(int(limit), 1000))
+    except (TypeError, ValueError):
+        count = 300
+    packets = []
+    for record in log.records:
+        level = record.level or "info"
+        if name.lower() not in (level.lower(), (record.source or "").lower()):
+            continue
+        client = _log_entity(record)
+        packets.append({
+            "frame": record.line, "time": record.time,
+            "src": client, "dst": _log_peer(record),
+            "protocol": level,
+            "info": (record.message or record.raw)[:200],
+            "length": 0,
+        })
+        if len(packets) >= count:
+            break
+    if not packets:
+        return _result(False, f"没有找到 {name} 相关日志记录", kind="log")
+    return _result(True, f"{name}: {len(packets)} 条日志记录",
+                   protocol=name, packets=packets, filter=name, kind="log")
+
+
+# ---------------------------------------------------------------------------
 # Text tools
 # ---------------------------------------------------------------------------
 def _readable(value: str, threshold: float = 0.75) -> bool:
@@ -590,15 +977,21 @@ def network_topology(pcap: str, toolbox: ToolBox,
 
     Reuses :func:`session_topology` so both the chart view and this API stay
     consistent; nodes carry ``{id,label,protocols,count}`` and links
-    ``{source,target,protocol,frames}``.
+    ``{source,target,protocol,frames}``.  Text-log inputs are graphed from
+    :func:`log_topology` instead (client IP -> server/host/program).
     """
-    base = session_topology(pcap, toolbox, cancel)
+    if logfile.is_log_input(pcap):
+        base = log_topology(pcap)
+    else:
+        base = session_topology(pcap, toolbox, cancel)
     if not base.get("ok"):
         return base
     nodes = [{
         "id": item["id"],
-        "label": (f"{item['ip']}:{item['port']}"
-                  if item.get("port") else str(item.get("ip") or item["id"])),
+        "label": (str(item.get("label") or item["id"])
+                  if item.get("label") else
+                  (f"{item['ip']}:{item['port']}"
+                   if item.get("port") else str(item.get("ip") or item["id"]))),
         "protocols": item.get("protocols") or [],
         "count": item.get("frames", 0),
         "bytes": item.get("bytes", 0),

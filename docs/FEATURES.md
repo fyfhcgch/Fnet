@@ -1,15 +1,45 @@
 # 功能说明
 
-Fnet 共 **50 个分析功能**、**13 个分类**。WebUI 侧栏按分类折叠展示；CLI 用
+Fnet 共 **54 个分析功能**、**14 个分类**。WebUI 侧栏按分类折叠展示；CLI 用
 复选框编号（`checkBox_10`）或 handler（`text_scan.keyword_scan`）选择。
 
 ```bash
 python3 -m fnet --list-features          # 带 * 的是默认勾选
 python3 -m fnet -C x.pcap --features checkBox_10,http.extract
+python3 -m fnet -C access.log            # 日志输入默认运行 4 项日志功能
 ```
 
-所有功能都可以在 WebUI 中运行；标记“需要”的工具缺失时，功能仍会执行并给出
-明确提示，不会影响其它功能。
+输入分为两类：**抓包**（pcap/pcapng，协议解析交给 `tshark`）与**文本日志**
+（`.log`/`.txt`/`.jsonl`/`.csv`，由 `fnet/utils/logfile.py` 内置解析，无需
+`tshark`）。所有功能都可以在 WebUI 中运行；标记“需要”的工具缺失时，功能仍会
+执行并给出明确提示，不会影响其它功能。
+
+## 日志分析
+
+日志任务默认选中本分类的 4 项功能；也可以显式指定：
+
+```bash
+python3 -m fnet -C ceph.log
+python3 -m fnet -C access.log --features checkBox_61,checkBox_63
+```
+
+| 复选框 | Handler | 功能 | 说明 |
+| --- | --- | --- | --- |
+| `checkBox_61` | `logs.summary` | 日志概览与时间线 | 识别 Ceph / syslog / sshd / Apache / JSON Lines / CSV 与通用 KV 格式；输出时间范围、级别与来源分布、字段覆盖率、事件时间线与字段统计（`log_fields.csv`） |
+| `checkBox_62` | `logs.entities` | 日志字段与实体统计 | 按客户端、账号、IP、网段、主机等维度统计活动量、成功次数/成功率、失败次数/失败率与活跃时段；网段维度 IPv4 默认按 /24（`log_subnet_prefix` 可调 8–32，IPv6 固定 /64）聚合，并在网段数 ≥ 2 时输出“网段成功统计”汇总 finding（`log_entities.csv`） |
+| `checkBox_63` | `logs.anomalies` | 日志失败与异常检测 | 失败/认证错误关键字、失败率异常实体、事件突增时间桶与低频异常字段值（`log_anomalies.csv`） |
+| `checkBox_64` | `logs.iocs` | 日志IOC与敏感信息 | 提取 flag、凭据、哈希、URL、域名、邮箱、密钥标识与公网/内网 IP 清单并写入结构化结果（`log_iocs.csv`） |
+
+日志参数：`log_fail_regex`（自定义失败关键字正则）、`log_fail_threshold`
+（实体失败次数阈值）、`log_fail_ratio`（失败率阈值）、`log_success_regex`
+（自定义“成功”口径正则，IGNORECASE，命中即计一次成功；未提供时按“未命中
+失败关键字即成功”统计并在日志中说明口径）、`log_subnet_prefix`（网段维度
+的 IPv4 前缀，8–32，默认 24；非法或越界时告警并回退 24；IPv6 固定按 /64
+归组）。网段归组来源依次是 `client_ip`/`ip`/`src_ip`/`remote_ip`/`source_ip`
+字段与解析出的 IP 列表；多 IP 记录取第一个客户端 IP 归组，无法解析的 IP 不
+参与网段统计。`log_entities.csv` 在原列末尾追加了 `成功次数`、`成功率` 两列。
+关键字检测（`checkBox_10`）在日志输入上会自动改用内置扫描，只保留 flag/编码
+规则与用户自定义关键字，避免把日志中常见的 `Key:` 字段误报为凭据。
 
 ## 文本与关键字
 
@@ -167,7 +197,7 @@ SMB2 在自有解析未取得消息时回退到 `tshark` 字段；HTTP/2 使用�
 | 复选框 | Handler | 功能 |
 | --- | --- | --- |
 | `checkBox_29` | `ics.summary` | MMS 会话概览 |
-| `checkBox_11` | `ics.modbus` | Modbus 功能码、地址、写操作与异常帧 |
+| `checkBox_11` | `ics.modbus` | Modbus 功能码、地址、写操作与异常帧；写操作统计与寄存器隐蔽通道检测（ASCII 隐写自动解码） |
 | `checkBox_12` | `ics.iecd` | IEC 60870-5-104 类型标识/传送原因 |
 | `checkBox_13` | `ics.mqtt` | MQTT 主题与消息（自动尝试 Hex/Base64 解码） |
 | `checkBox_22` | `ics.omron` | OMRON FINS 会话 |
@@ -256,6 +286,10 @@ FoxIO JA4+ 规范计算 JA3/JA4 指纹（纯 stdlib 实现，见 `fnet/utils/tls
 findings 做交集，任务没有 findings 时照常归一化日志。识别不出格式时
 会提示需要 eve.json（JSON Lines）或带 `#fields` 头的 Zeek 日志。
 
+如果输入本身就是文本日志（例如 `fnet -C ceph.log`），任务会进入“日志分析”
+分类并使用内置解析器，不需要先导入到某个抓包任务；`checkBox_54` 适用于
+“抓包 + 旁证日志”的关联场景。
+
 ## RDP 重放
 
 | 复选框 | Handler | 功能 | 需要 | 说明 |
@@ -275,7 +309,10 @@ findings 做交集，任务没有 findings 时照常归一化日志。识别不�
 
 “关键发现”和“时间线”只列出成功结果（`info`/`good`），`warn`、`error` 与
 `debug` 行仍保留在完整日志和 WebUI 的“分析结果”中；报告文件本身不会出现在
-“产出文件”列表里，因为它就是当前这份报告。
+“产出文件”列表里，因为它就是当前这份报告。同理，分析结果类文件
+（`findings.json`、`findings.csv`、`annotations.json`、`log_*.csv` 等）
+不出现在产出列表与打包 ZIP 中，详细发现在 WebUI 的“分析结果”与“统计图表”
+查看，文件仍可按精确路径下载。
 
 WebUI 的“文件 → 导出分析报告…”可以勾选章节（`summary`、`features`、
 `findings`、`log`、`artifacts`、`params`），“任务历史”每一行也提供 HTML

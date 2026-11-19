@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import tempfile
 import threading
@@ -9,6 +10,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -105,8 +107,8 @@ class ApiTest(unittest.TestCase):
     def test_meta_payload(self):
         status, meta = self.json_request("/api/meta")
         self.assertEqual(status, 200)
-        self.assertEqual(len(meta["features"]), 50)
-        self.assertEqual(len(meta["categories"]), 13)
+        self.assertEqual(len(meta["features"]), 54)
+        self.assertEqual(len(meta["categories"]), 14)
         self.assertEqual(meta["initial"], {"pcap": "", "features": []})
         self.assertIn("tshark", meta["tools"])
         self.assertIn("report", meta)
@@ -329,8 +331,10 @@ class ApiTest(unittest.TestCase):
         self.assertIn("NetNTLMv1", logs)
         names = {item["name"] for item in payload["artifacts"]}
         self.assertIn("ntlm_hashes.txt", names)
-        self.assertIn("findings.json", names)
-        self.assertIn("findings.csv", names)
+        # 分析结果文件不进产出列表：findings 在"分析结果"页查看。
+        self.assertNotIn("findings.json", names)
+        self.assertNotIn("findings.csv", names)
+        self.assertNotIn("annotations.json", names)
         # Reports are exported from the result view, not listed as artifacts.
         self.assertNotIn("report.txt", names)
         self.assertNotIn("report.md", names)
@@ -363,7 +367,7 @@ class ApiTest(unittest.TestCase):
         status, content = self.request(
             f"/api/findings?job={job['id']}&format=csv")
         self.assertEqual(status, 200)
-        self.assertIn("类别,级别,帧,功能,摘要,详情".encode(), content)
+        self.assertIn("类别,级别,帧,时间,功能,摘要,详情".encode(), content)
         self.assertIn(b"Administrator", content)
 
         status, _ = self.request("/api/findings?job=0123456789abcdef")
@@ -428,6 +432,28 @@ class ApiTest(unittest.TestCase):
             f"/api/download?job={job['id']}&bundle=1")
         self.assertEqual(status, 200)
         self.assertTrue(bundle.startswith(b"PK"))
+        # 打包 ZIP 同样跳过分析结果文件，交付物保留。
+        packed = set(zipfile.ZipFile(io.BytesIO(bundle)).namelist())
+        self.assertIn("ntlm_hashes.txt", packed)
+        self.assertNotIn("findings.json", packed)
+        self.assertNotIn("findings.csv", packed)
+
+    def test_history_artifacts_hide_analysis_files(self):
+        """构造含分析结果文件与假交付物的任务目录，产出列表只留交付物。"""
+        job_id = "abc12345"
+        output = self.cache / "jobs" / job_id
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "job.json").write_text(
+            json.dumps({"id": job_id, "status": "done"}), encoding="utf-8")
+        for name in ("findings.json", "findings.csv", "annotations.json",
+                     "log_fields.csv", "log_entities.csv"):
+            (output / name).write_text("analysis", encoding="utf-8")
+        (output / "restored_admin.aspx").write_text("payload", encoding="utf-8")
+
+        status, payload = self.json_request(f"/api/history/{job_id}")
+        self.assertEqual(status, 200)
+        names = {item["name"] for item in payload["artifacts"]}
+        self.assertEqual(names, {"restored_admin.aspx"})
 
     def test_timeline_stats_action(self):
         status, payload = self.json_request("/api/action", {
@@ -440,6 +466,105 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(sum(point["frames"] for point in payload["points"]), 36)
         self.assertEqual(payload["total_frames"], 36)
         self.assertGreater(payload["total_bytes"], 0)
+
+    def test_stats_action_routes_log_inputs(self):
+        """A text-log input answers the same stats subs with kind="log"."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "audit.log"
+            log.write_text("\n".join(
+                json.dumps({"time": f"2026-01-02T00:00:{index:02d}",
+                            "level": "info",
+                            "client_ip": f"10.0.0.{index % 2}",
+                            "server": "web01", "message": f"hit {index}"})
+                for index in range(6)) + "\n")
+            common = {"action": "stats", "pcap": str(log)}
+            status, timeline = self.json_request("/api/action", {
+                **common, "sub": "timeline", "buckets": 10})
+            self.assertEqual(status, 200)
+            self.assertTrue(timeline["ok"])
+            self.assertEqual(timeline["kind"], "log")
+            self.assertEqual(timeline["total_frames"], 6)
+
+            status, hierarchy = self.json_request("/api/action", {
+                **common, "sub": "hierarchy"})
+            self.assertTrue(hierarchy["ok"])
+            self.assertEqual(hierarchy["kind"], "log")
+            self.assertEqual(
+                {item["label"] for item in hierarchy["items"]}, {"info"})
+
+            status, entities = self.json_request("/api/action", {
+                **common, "sub": "ip"})
+            self.assertTrue(entities["ok"])
+            self.assertEqual(entities["kind"], "log")
+            self.assertEqual({item["label"] for item in entities["items"]},
+                             {"10.0.0.0", "10.0.0.1"})
+
+            status, topology = self.json_request("/api/action", {
+                **common, "sub": "topology"})
+            self.assertTrue(topology["ok"])
+            self.assertEqual(topology["kind"], "log")
+            self.assertTrue(topology["nodes"])
+
+            status, unsupported = self.json_request("/api/action", {
+                **common, "sub": "ports"})
+            self.assertEqual(status, 200)
+            self.assertFalse(unsupported["ok"])
+            self.assertIn("日志任务", unsupported["text"])
+
+    def test_stats_entities_action_for_log_inputs(self):
+        """sub:"entities" routes to the log stats API with graceful errors."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "audit.log"
+            log.write_text("\n".join(
+                json.dumps({"time": f"2026-01-02T00:00:{index:02d}",
+                            "level": "info",
+                            "client_id": f"user{index % 2}",
+                            "client_ip": f"10.0.0.{index % 2}",
+                            "message": "ok" if index % 3 else "failed"})
+                for index in range(6)) + "\n")
+            common = {"action": "stats", "pcap": str(log)}
+
+            status, entities = self.json_request("/api/action", {
+                **common, "sub": "entities", "dimension": "client_id"})
+            self.assertEqual(status, 200)
+            self.assertTrue(entities["ok"])
+            self.assertEqual(entities["kind"], "log")
+            self.assertEqual(entities["dimension"], "client_id")
+            self.assertIn("client_id", entities["dimensions"])
+            self.assertIn("网段", entities["dimensions"])
+            self.assertEqual(len(entities["items"]), 2)
+            item = entities["items"][0]
+            for key in ("value", "count", "share", "fail", "fail_rate",
+                        "success", "success_rate", "first", "last",
+                        "line", "sample"):
+                self.assertIn(key, item)
+            # "ok"×4 / "failed"×2 的默认失败口径。
+            self.assertEqual(
+                sum(entry["fail"] for entry in entities["items"]), 2)
+
+            status, bad = self.json_request("/api/action", {
+                **common, "sub": "entities", "dimension": "nope"})
+            self.assertEqual(status, 200)
+            self.assertFalse(bad["ok"])
+            self.assertEqual(bad["kind"], "log")
+            self.assertIn("可用维度", bad["text"])
+            self.assertIn("client_id", bad["dimensions"])
+
+            status, fallback = self.json_request("/api/action", {
+                **common, "sub": "entities", "dimension": "client_id",
+                "subnet_prefix": 40, "success_regex": "("})
+            self.assertEqual(status, 200)
+            self.assertTrue(fallback["ok"])
+            self.assertIn("success_regex 无效", fallback["text"])
+            self.assertIn("subnet_prefix 超出范围", fallback["text"])
+            self.assertEqual(fallback["subnet_prefix"], 24)
+
+            status, missing = self.json_request("/api/action", {
+                **common, "sub": "entities", "dimension": "client_id",
+                "pcap": str(Path(tmp) / "nope.log")})
+            self.assertEqual(status, 200)
+            self.assertFalse(missing["ok"])
+            self.assertTrue(missing["text"])
 
     def test_decode(self):
         status, payload = self.json_request(

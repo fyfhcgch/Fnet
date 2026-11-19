@@ -7,12 +7,14 @@
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/fyfhcgch/Fnet/pulls)
 
 Fnet 是一个面向 CTF 与流量取证的开源网络流量分析工具箱。它把常见赛题里的
-“找 flag、找凭据、解协议、还原文件”等操作集中到一个本地 WebUI 中。
+“找 flag、找凭据、解协议、还原文件”等操作集中到一个本地 WebUI 中。除了
+pcap / pcapng 抓包，也可以直接分析 `.log` / `.txt` / `.jsonl` / `.csv` 文本日志。
 
 **English** — Fnet is a stdlib-only Python toolkit for CTF and network forensics:
-point it at a pcap/pcapng, tick the checks you need, and read flags, credentials,
-reassembled files and decrypted traffic in a local WebUI or from the CLI. Protocol
-parsing is delegated to `tshark`, so there are no Python dependencies to install.
+point it at a pcap/pcapng or a plain-text log, tick the checks you need, and read
+flags, credentials, reassembled files and decrypted traffic in a local WebUI or
+from the CLI. Capture parsing is delegated to `tshark`, while logs are handled by
+a built-in parser, so there are no Python dependencies to install.
 
 在线教程与功能介绍：<https://fyfhcgch.github.io/Fnet/>
 
@@ -37,9 +39,10 @@ python3 -m fnet
 python3 -m fnet --no-browser            # 不自动打开浏览器
 python3 -m fnet --port 9000             # 换端口
 python3 -m fnet capture.pcapng          # 启动并预选流量包
+python3 -m fnet access.log              # 启动并预选文本日志
 python3 -m fnet capture.pcapng --features checkBox_10,http.extract
 python3 -m fnet --doctor                # 检查 tshark / java / hashcat 等
-python3 -m fnet --list-features         # 列出 50 个功能与复选框编号
+python3 -m fnet --list-features         # 列出 54 个功能与复选框编号
 ```
 
 WebUI 顶栏可切换中文 / English；大文件上传显示进度并可按 `Esc` 取消，
@@ -61,8 +64,15 @@ fnet
 # 运行默认勾选的功能，日志直接打印到终端
 python3 -m fnet -C capture.pcapng
 
-# 运行全部 50 个功能
+# 运行全部 54 个功能
 python3 -m fnet -C capture.pcapng --all
+
+# 直接分析文本日志：默认选中 4 项日志功能，不需要 tshark
+python3 -m fnet -C /var/log/auth.log
+python3 -m fnet -C ceph.log --features checkBox_61,checkBox_64
+
+# 工控：Modbus 寄存器隐写检测（自动解码藏进寄存器写请求的 ASCII/flag）
+python3 -m fnet -C modbus_traffic.pcap --features checkBox_11
 
 # 只运行指定功能（复选框编号或 handler 均可）
 python3 -m fnet -C capture.pcapng --features checkBox_10,webshell.decrypt
@@ -88,7 +98,7 @@ python3 -m fnet --compare <base-job-id> <target-job-id> --json
 
 # MCP stdio 服务器：把功能列表/分析/findings/帧上下文暴露为 MCP 工具（JSON-RPC 2.0）
 python3 -m fnet --mcp
-# 预载默认流量包，analyze 工具可省略 pcap_path
+# 预载默认抓包或日志，analyze 工具可省略 pcap_path
 python3 -m fnet --mcp capture.pcapng
 
 # PCAP-over-IP：监听 127.0.0.1:18000 接收 pcap 字节流，连接关闭后自动分析
@@ -108,23 +118,24 @@ tshark 字段提取默认启用磁盘缓存与超时重试，可通过 `config.i
 
 ## WebUI 界面
 
-![Fnet WebUI：左侧 50 个功能的勾选面板，右侧分析结果表格与统计图表](docs/images/webui.webp)
+![Fnet WebUI：左侧 54 个功能的勾选面板，右侧分析结果表格与统计图表](docs/images/webui.webp)
 
 | 区域       | 说明                                                                                                             |
 | ---------- | ---------------------------------------------------------------------------------------------------------------- |
-| 左侧功能栏 | 50 个功能按 13 个分类折叠展示，可全选/全不选                                                                 |
+| 左侧功能栏 | 54 个功能按 14 个分类折叠展示，可全选/全不选                                                                 |
 | 顶部       | 全局功能搜索、文件/统计/设置/工具菜单、tshark 状态、语言切换、主题切换                                           |
-| 主区域     | 关键字、HTTP、Webshell、SQL、认证、C2、工控、杂项、文本、设置、关于                                              |
-| 分析结果   | 凭据、哈希、flag、导出文件等汇总为可排序表格，支持筛选、搜索、分页、列显示/隐藏、批量复制、按帧号跳转与 CSV 导出 |
+| 主区域     | 分析日志、分析结果、产出文件、批量队列、统计图表、任务历史、文本工具、关于                                        |
+| 分析结果   | 凭据、哈希、flag、导出文件等汇总为表格：新增“时间”列、默认按时间倒序，支持筛选、搜索、分页、列显示/隐藏、批量复制、按帧号跳转与 CSV 导出 |
 | 任务历史   | 保存历次分析记录，可回看报告、一键重跑、对比两个任务的 findings diff 或删除                                      |
-| 批量队列   | 一次拖入多个流量包，按并发数排队执行，可暂停/继续、拖拽排序、逐包查看日志、取消并合并报告                        |
-| 统计图表   | 流量时间线、协议分层、Top 会话与会话拓扑；时间线支持缩放/框选与点击下钻，图表可导出 SVG/PNG                      |
+| 批量队列   | 一次拖入多个抓包或日志，按并发数排队执行，可暂停/继续、拖拽排序、逐包查看日志、取消并合并报告                        |
+| 统计图表   | 流量时间线、协议分层、Top 会话与会话拓扑；日志任务同样可用（级别分层、Top 实体与「实体统计」维度卡片），时间线支持缩放/框选与点击下钻，图表可导出 SVG/PNG |
 | 日志区     | 级别过滤、关键字过滤、复制、导出、进度与取消；日志中的帧号可点击定位数据包                                       |
-| 产出区     | 任务结束后列出报告与导出文件，可单文件下载或打包下载                                                             |
+| 产出区     | 任务结束后列出报告与导出文件，可单文件下载或打包下载；分析结果类文件（findings/log_*.csv 等）不出现在产出列表，详细发现在分析结果与统计图表查看 |
 | 报告导出   | 自动生成 `report.txt` / `report.md` / `report.html`，可自选章节，HTML 可直接打印为 PDF                           |
 
-侧栏提供功能搜索与“最近使用”快捷入口：搜索会匹配功能名称、说明、分类与
-handler，最近使用的复选框会保存在浏览器本地，便于重复执行常用分析。
+顶栏提供全局功能搜索，“最近使用”快捷入口显示在功能列表上方：搜索会匹配
+功能名称、说明、分类与 handler，最近使用的复选框会保存在浏览器本地，便于
+重复执行常用分析。
 
 “文件”菜单里的“查看 HTML 报告 / 导出分析报告…”使用同一套报告渲染器：
 任务详情、功能清单、关键发现、完整日志、产出文件与分析参数都可以单独勾选，
@@ -135,10 +146,11 @@ HTML 报告自带样式、无需联网，适合直接交付或打印成 PDF。
 暮玫、莓紫五套配色，选择会保存在浏览器本地。
 
 “分析结果”页把日志里值得汇总的内容（凭据、哈希、flag、Webshell/SQL 还原
-结果、导出的文件等）整理成表格：可以按类别与级别筛选、搜索、点击表头排序、
-分页浏览并调整每页条数、切换显示的列、复制本页或选中行、按帧号跳转，也可
-导出 CSV；任务结束时相同数据也会写入输出目录的 `findings.json` 与
-`findings.csv`。哈希类结果的详情弹窗还能一键调用 hashcat 破解：可指定字典、
+结果、导出的文件等）整理成表格：可以按类别与级别筛选、搜索、点击表头排序
+（新增“时间”列，默认按时间倒序）、分页浏览并调整每页条数、切换显示的列、
+复制本页或选中行、按帧号跳转，也可导出 CSV；任务结束时相同数据也会写入输出
+目录的 `findings.json` 与 `findings.csv`（在“分析结果”页查看，不占用“产出
+文件”列表）。哈希类结果的详情弹窗还能一键调用 hashcat 破解：可指定字典、
 加速档位、`-O`、`--force`、超时和附加参数，日志与密码实时回显，设置会持久化。
 
 日志与分析结果中的“帧 N”是可点击按钮：弹窗会显示该帧的摘要、前后文帧和
@@ -175,7 +187,7 @@ python3 scripts/bench.py --sizes 10,100,1000 --features default
 
 | 工具                   | 用途                             | 是否必需 |
 | ---------------------- | -------------------------------- | -------- |
-| `tshark`               | 所有协议解析与字段提取           | **是**   |
+| `tshark`               | 抓包协议解析与字段提取           | 抓包必需 |
 | `java`                 | 反编译、部分 Webshell/序列化分析 | 可选     |
 | `hashcat` / `john`     | 哈希爆破                         | 可选     |
 | `foremost` / `binwalk` | 文件分离                         | 可选     |
@@ -194,6 +206,7 @@ python3 scripts/bench.py --sizes 10,100,1000 --features default
 分类概览：
 
 - **文本 / HTTP**：关键字与编码识别、深度 flag 扫描（重组流/导出文件/二进制载荷，带来源与置信度）、HTTP 请求响应提取、登录凭据、Basic 认证。
+- **日志分析**：直接读取 `.log`/`.txt`/`.jsonl`/`.csv`，识别 Ceph、syslog、sshd、Apache 与通用 KV 格式；输出概览时间线、实体失败率、异常突增与 IOC/敏感信息，不依赖 `tshark`。
 - **会话 / 协议**：TCP/UDP 会话、DNS、ICMP、ARP、FTP、SMTP、Telnet、MySQL；
   额外支持 Redis、MongoDB、PostgreSQL、LDAP、SMB2/3、WebSocket 与 HTTP/2。
   Redis/MongoDB/PostgreSQL 会先做 TCP 流重组，再解析 RESP3、OP_MSG/SCRAM/GridFS、
@@ -201,7 +214,7 @@ python3 scripts/bench.py --sizes 10,100,1000 --features default
   可还原共享、DFS、命名管道与文件内容。
 - **Web 安全**：SQL 注入（含盲注时间/布尔）、Webshell 明文与哥斯拉/冰蝎 3.x/4.x/蚁剑/菜刀/天蝎解密（规则表驱动、请求响应配对、内存马与命令输出还原）、Shiro `rememberMe`（CBC/ECB/GCM）。
 - **认证 / C2**：NTLM 哈希、Kerberos 票据、WinRM、Cobalt Strike Beacon。
-- **工控 / 无线**：Modbus、S7comm、MQTT、BACnet、DNP3、OPC UA、Wi-Fi EAPOL/PMKID/WPA3/SAE 与 hashcat 22000 命令。
+- **工控 / 无线**：Modbus（含写操作统计与**寄存器隐蔽通道检测**——连续寄存器值按大端/小端/低字节拼接出 ASCII 即自动解码并提取 flag）、S7comm、IEC 60870-5-104、MQTT、MMS、OMRON FINS、GOOSE，以及 Wi-Fi EAPOL/PMKID/WPA3/SAE 与 hashcat 22000 命令。
 - **其它**：TLS/QUIC 解密（keylog、带口令私钥与证书匹配、证书链/KeyUpdate、解密后的 HTTP/2/gRPC/WebSocket/HTTP3 与凭据文件提取）、RDP、USB 键盘/鼠标、文件分离、EV3/SCSI/IPID 等。
 
 ## 项目结构
@@ -217,10 +230,10 @@ Fnet/
 │   ├── findings.py        结构化结果（类别、级别、筛选、CSV）
 │   ├── report.py          纯文本/Markdown/HTML 报告渲染与章节选择
 │   ├── config.py          config.ini 读写与默认值
-│   ├── features/          50 个分析功能（按主题拆分）
+│   ├── features/          54 个分析功能（按主题拆分）
 │   ├── tools/runner.py    外部工具发现与 tshark 封装
 │   ├── utils/             编解码、AES/RC4/MD4/RSA、pcap、TCP 流重组、
-│   │                      MySQL/Kerberos/邮件/隧道/WPA/规则解析
+│   │                      MySQL/Kerberos/邮件/隧道/WPA/规则/日志解析
 │   ├── webui/             HTTP 服务与静态页面
 │   └── assets/            字典、Shiro 密钥、图标、默认配置
 ├── docs/                  架构、功能、WebUI、安全说明

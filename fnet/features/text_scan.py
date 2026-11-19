@@ -80,11 +80,106 @@ def _compile(pattern: str) -> re.Pattern:
         return re.compile(re.escape(pattern), re.IGNORECASE)
 
 
+def _flag_like_pattern(pattern: str) -> bool:
+    """Keep flag/encoded-flag rules when scanning text logs.
+
+    The built-in ``regmatch`` list is tuned for packet payloads and contains
+    short words such as ``KEY``/``PASS``; every Ceph line contains "Key:", so
+    using the full list on logs would bury real hits under noise.
+    """
+    lowered = str(pattern or "").lower()
+    return ("{" in pattern or "flag" in lowered
+            or lowered.startswith(("zmxh", "tvp", "mzw", "ctf", "begin",
+                                   "q0nur", "q1rg")))
+
+
+def _log_keyword_scan(ctx: FeatureContext, compiled: list[tuple[str, re.Pattern]],
+                      params: dict, max_hits: int) -> None:
+    """Match keywords against parsed log records (no tshark required)."""
+    from fnet.utils import logfile
+
+    log = logfile.parse_path(ctx.pcap)
+    if not log.records:
+        ctx.report("日志中没有可扫描的记录", "warn")
+        return
+    ctx.report(f"日志关键字扫描：{log.format_name}，{len(log.records)} 条记录",
+               "info")
+    hits = 0
+    seen: set[tuple[int, str]] = set()
+    flags: list[str] = []
+    seen_flags: set[str] = set()
+    decode = bool(params.get("decode", True))
+    for record in log.records:
+        ctx.check_cancel()
+        haystacks = [("raw", record.raw)]
+        if decode:
+            unquoted = urllib.parse.unquote(record.raw)
+            if unquoted != record.raw:
+                haystacks.append(("url", unquoted))
+        for label, haystack in haystacks:
+            for pattern, rx in compiled:
+                match = rx.search(haystack)
+                if not match:
+                    continue
+                hits += 1
+                start = max(0, match.start() - 50)
+                end = min(len(haystack), match.end() + 70)
+                snippet = haystack[start:end].replace("\r", " ").replace(
+                    "\n", " ")
+                ctx.report(f"行 {record.line} ({label}) 命中 {pattern!r}: "
+                           f"…{snippet}…", "good")
+                key = (record.line, pattern)
+                if key not in seen:
+                    seen.add(key)
+                    is_flag = bool(codec.find_flags(haystack)) or \
+                        _flag_like_pattern(pattern)
+                    ctx.add_finding(
+                        "flag" if is_flag else "log",
+                        f"{'发现 flag' if is_flag else '日志关键字命中'}：{pattern}",
+                        level="good" if is_flag else "info",
+                        detail=f"第 {record.line} 行 ({label}) …{snippet}…",
+                        extra={"line": record.line, "log_time": record.time})
+                if hits >= max_hits:
+                    ctx.report("命中数量达到上限，停止扫描", "warn")
+                    break
+            for flag in codec.find_flags(haystack):
+                if flag in seen_flags:
+                    continue
+                seen_flags.add(flag)
+                flags.append(flag)
+                ctx.report(f"行 {record.line} 发现 flag: {flag}", "good")
+                ctx.add_finding("flag", flag, level="good",
+                                detail=f"第 {record.line} 行 {label}",
+                                extra={"line": record.line})
+            if hits >= max_hits:
+                break
+        if hits >= max_hits:
+            break
+    ctx.set_progress(100)
+    if flags:
+        ctx.report("===== 汇总 flag =====", "good")
+        for flag in flags:
+            ctx.report(flag, "good")
+    ctx.report(f"关键字检测完成，共 {hits} 处命中",
+               "info" if hits else "warn")
+
+
 def keyword_scan(ctx: FeatureContext) -> None:
     params = ctx.params
-    patterns: list[str] = []
-    if params.get("auto_regex", True):
-        patterns.extend(ctx.config.regmatch())
+    from fnet.utils import logfile
+
+    is_log = (getattr(ctx, "input_kind", "pcap") == "log"
+              or logfile.is_log_input(ctx.pcap))
+    auto_patterns = list(ctx.config.regmatch()) if params.get("auto_regex", True) else []
+    if is_log:
+        kept = [pattern for pattern in auto_patterns
+                if _flag_like_pattern(pattern)]
+        if len(kept) != len(auto_patterns):
+            ctx.report(
+                f"日志模式：跳过 {len(auto_patterns) - len(kept)} 条面向报文的"
+                "宽泛规则，仅保留 flag/编码类与自定义关键字", "info")
+        auto_patterns = kept
+    patterns: list[str] = auto_patterns
     patterns.extend(_extra_keywords(params))
 
     # De-duplicate while preserving order.
@@ -95,6 +190,10 @@ def keyword_scan(ctx: FeatureContext) -> None:
         compiled.append((pattern, _compile(pattern)))
 
     ctx.report(f"关键字检测：{len(compiled)} 条规则", "info")
+    max_hits = int(params.get("max_hits") or 500)
+    if is_log:
+        _log_keyword_scan(ctx, compiled, params, max_hits)
+        return
     if params.get("decode", True):
         ctx.report("已启用 Base64/URL 解码辅助扫描", "debug")
 
@@ -117,7 +216,6 @@ def keyword_scan(ctx: FeatureContext) -> None:
     else:
         ranges = [None]
 
-    max_hits = int(params.get("max_hits") or 500)
     hits = 0
     flags: list[str] = []
     seen_flags: set[str] = set()

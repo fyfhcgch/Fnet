@@ -85,7 +85,7 @@ git push origin v2.20.0
 - [ ] `node --check fnet/webui/static/app.js` 通过
 - [ ] `python3 scripts/bench.py --sizes 10,100,1000 --features default` 更新
       `docs/PERFORMANCE.md`
-- [ ] README / docs/FEATURES.md 与 `FEATURES` 的 50 个功能一致
+- [ ] README / docs/FEATURES.md 与 `FEATURES` 的 54 个功能一致
 - [x] `pyproject.toml` 与 `fnet/__init__.py` 版本一致
 - [x] `twine check dist/*` 通过（2.19.0 已验证）
 - [ ] 干净环境中 `fnet --version` 与 WebUI `/api/health` 正常

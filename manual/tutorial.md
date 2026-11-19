@@ -12,16 +12,17 @@ description: 跟着做一遍完整流量分析：找 flag、还原 Web 与 Websh
 
 ## 0. 开始之前
 
-- 只分析**合法获得**的抓包：CTF 题目、授权演练或自己的实验流量。
+- 只分析**合法获得**的抓包或日志：CTF 题目、授权演练或自己的实验流量。
 - 建议每道题单独跑一次任务；Fnet 会为每次分析建立独立输出目录，互不覆盖。
-- 不确定该勾什么时，先跑默认的“关键字检测 + HTTP数据提取”，再按下面的场景追加。
+- 不确定该勾什么时，先跑默认的“关键字检测 + HTTP数据提取”；输入是文本日志时
+  会自动改跑 4 项日志功能。
 
 <a id="find-flag"></a>
 ## 1. 找 flag：先跑默认两项
 
 多数 CTF 流量题可以先靠默认勾选拿到线索。
 
-1. 打开 `http://127.0.0.1:8765`，把 pcap / pcapng 拖进左侧上传区。
+1. 打开 `http://127.0.0.1:8765`，把 pcap / pcapng 或 `.log` 文本日志拖进左侧上传区。
 2. 保持默认勾选：**关键字检测**（`checkBox_10`）与 **HTTP数据提取**（`checkBox_30`）。
 3. 点右上角“开始分析”，等待状态变为“完成”。
 4. 切到“分析结果”页，在搜索框输入 `flag`，或按类别筛选 `flag`、`credential`、`file`。
@@ -118,13 +119,34 @@ python3 -m fnet -C krb5.pcap --features checkBox_45 \
 <a id="batch"></a>
 ## 6. 批量分析与赛后复盘
 
-- **批量**：一次拖入多个 pcap，自动进入“批量队列”；可以暂停、调整顺序、取消单个任务。
+- **批量**：一次拖入多个抓包或日志，自动进入“批量队列”；可以暂停、调整顺序、取消单个任务。
 - **重跑**：在“任务历史”里找到旧任务，一键沿用原参数重跑。
 - **续跑**：运行中可暂停，任务停在功能边界；点“继续”或 `--resume <job-id>` 从断点接着跑。
 - **对比**：在“任务历史”里对比两个任务，查看新增/消失的凭据、哈希与 flag；
   命令行用 `--compare <base> <target>`。
 - **脚本**：`--json` 输出任务、findings、统计与产出，方便接入流水线。
 - **分享**：报告和 CSV 可能包含明文凭据，分享前先脱敏。
+
+## 7. 日志分析：不依赖 tshark
+
+Ceph、syslog、sshd、Apache、JSON Lines、CSV 等文本日志可以直接作为输入：
+
+```bash
+python3 -m fnet -C ceph.log
+python3 -m fnet -C /var/log/auth.log --features checkBox_61,checkBox_63
+```
+
+1. 命令行或 WebUI 选择 `.log` / `.txt` / `.jsonl` / `.csv` 文件；检测到日志后
+   会自动勾选“日志分析”分类的 4 项功能。
+2. 先看“日志概览与时间线”：确认格式、时间范围、级别与来源分布，以及时间桶是否出现突增。
+3. 再看“日志字段与实体统计”和“日志失败与异常检测”：按客户端/账号/IP 找出
+   失败次数、失败率异常或低频异常字段值的实体。
+4. 用“日志IOC与敏感信息”提取 flag、凭据、哈希、URL、域名与 IP 清单。
+5. 结果同样进入“分析结果”和 `findings.json`，产出包含 `log_fields.csv`、
+   `log_entities.csv`、`log_anomalies.csv` 与 `log_iocs.csv`。
+
+日志记录没有数据包帧号，定位时以日志行号与原始文本为准；需要旁证抓包时，
+再用 `checkBox_54` 把 Suricata/Zeek 日志与已有流量任务关联。
 
 ## 一页速查
 
@@ -133,6 +155,7 @@ python3 -m fnet -C krb5.pcap --features checkBox_45 \
 | 快速找 flag | 关键字检测 + `text_scan.deep` |
 | Web 题 | HTTP数据提取、HTTP下载文件分析、shiro流量解密、`webshell.decrypt` |
 | SQL 盲注 | SQL盲注流量分析 / SQL二分盲注增强 / SQL盲注日志分析 |
+| 文本日志 | 日志概览与时间线、字段与实体统计、失败与异常检测、IOC与敏感信息 |
 | 加密流量 | TLS流量解密（先上传 keylog 或私钥） |
 | 域环境 / 内网 | NTLM HASH提取、Kerberos解析破解、WINRM流量解密、`protocols.credentials` |
 | 无线 / 硬件 | 无线流量暴力破解、蓝牙流量分析、USB 键盘 / 鼠标、EV3 |

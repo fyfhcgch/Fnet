@@ -9,6 +9,10 @@ Modes:
 ``fnet -C capture.pcapng --features checkBox_10,http.extract``
     Run the analysis headless and stream the log to stdout.
 
+``fnet -C access.log`` / ``fnet -C ceph.log``
+    Analyse a plain-text log (.log/.txt/.jsonl/.csv) with the log features;
+    no tshark is required for this path.
+
 ``fnet --mcp``
     Serve the MCP (Model Context Protocol) tools over stdio (JSON-RPC 2.0,
     newline-delimited); optional positional capture pre-loads the default
@@ -27,9 +31,12 @@ from pathlib import Path
 
 from fnet import APP_DISPLAY_NAME, __version__
 from fnet.app import build, describe_environment
-from fnet.features.registry import FEATURES, CATEGORIES, BY_CHECKBOX, BY_HANDLER
+from fnet.features.registry import (
+    CATEGORIES, BY_CHECKBOX, BY_HANDLER, FEATURES, default_features_for,
+)
 from fnet.logger import logger
 from fnet.paths import USER_CONFIG
+from fnet.utils.logfile import classify_input
 
 
 def _ensure_utf8_streams() -> None:
@@ -55,7 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="fnet",
         description=f"{APP_DISPLAY_NAME} {__version__}",
     )
-    parser.add_argument("capture", nargs="?", help="要分析的 pcap/pcapng 文件")
+    parser.add_argument("capture", nargs="?",
+                        help="要分析的 pcap/pcapng 流量包或 .log/.txt/.jsonl/.csv 日志")
     parser.add_argument("-C", "--cli", action="store_true",
                         help="不启动 WebUI，直接在终端运行分析")
     parser.add_argument("--host", default=None, help="WebUI 监听地址（默认 127.0.0.1）")
@@ -63,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-browser", action="store_true", help="启动后不自动打开浏览器")
     parser.add_argument("--config", default=None, help="使用指定的 config.ini")
     parser.add_argument("--features", default="",
-                        help="逗号分隔的功能（checkBox_10 或 http.extract），默认全部默认勾选项")
+                        help="逗号分隔的功能（checkBox_10 或 http.extract）；缺省按输入类型选择（抓包 2 项、日志 4 项）")
     parser.add_argument("--all", action="store_true", help=f"运行全部 {len(FEATURES)} 个功能")
     parser.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
                         help="传给分析功能的额外参数，可重复")
@@ -136,14 +144,15 @@ def list_features() -> None:
                   f"{feature.handler:<26s} {feature.title}")
             if feature.needs:
                 print(f"{'':<14s} 需要: {', '.join(feature.needs)}")
-    print("\n* = 默认勾选")
+    print("\n* = 默认勾选（抓包）；日志输入默认勾选 checkBox_61–checkBox_64")
 
 
-def select_features(spec: str, run_all: bool) -> list[str]:
+def select_features(spec: str, run_all: bool,
+                    kind: str = "pcap") -> list[str]:
     if run_all:
         return [feature.checkbox for feature in FEATURES]
     if not spec:
-        return [feature.checkbox for feature in FEATURES if feature.default]
+        return default_features_for(kind)
     selected: list[str] = []
     for token in (part.strip() for part in spec.split(",")):
         if not token:
@@ -199,13 +208,18 @@ def _wait_for_job(job, runtime, json_mode: bool = False) -> int:
 
 def run_headless(args, runtime) -> int:
     if not args.capture:
-        print("需要指定流量包", file=sys.stderr)
+        print("需要指定输入文件（流量包或日志）", file=sys.stderr)
         return 2
     capture = Path(args.capture).expanduser()
     if not capture.is_file():
-        print(f"流量包不存在: {capture}", file=sys.stderr)
+        print(f"输入文件不存在: {capture}", file=sys.stderr)
         return 2
-    checkboxes = select_features(args.features, args.all)
+    kind = classify_input(capture)
+    if kind is None:
+        print(f"不支持的输入文件类型: {capture.suffix or capture.name}",
+              file=sys.stderr)
+        return 2
+    checkboxes = select_features(args.features, args.all, kind=kind)
     if not checkboxes:
         print("没有选择任何功能", file=sys.stderr)
         return 2
@@ -315,9 +329,10 @@ def serve(args, runtime) -> int:
 
     if args.capture:
         capture = Path(args.capture).expanduser()
+        kind = classify_input(capture) if capture.is_file() else None
         if not capture.is_file():
-            print(f"警告: 流量包不存在: {capture}", file=sys.stderr)
-        elif capture.suffix.lower() not in (".pcap", ".pcapng", ".cap", ".dmp", ".etl"):
+            print(f"警告: 输入文件不存在: {capture}", file=sys.stderr)
+        elif kind is None:
             print(f"警告: 不支持的文件类型: {capture.suffix}", file=sys.stderr)
         else:
             runtime.app.initial_pcap = str(capture.resolve())
@@ -344,19 +359,22 @@ def run_mcp(args, runtime) -> int:
     from fnet.mcp_server import MCPServer
 
     default_features: list[str] | None = None
-    if args.features or args.all:
-        try:
-            default_features = select_features(args.features, args.all)
-        except SystemExit as exc:
-            print(str(exc.code), file=sys.stderr)
-            return 2
     default_pcap = ""
+    input_kind = "pcap"
     if args.capture:
         capture = Path(args.capture).expanduser()
         if capture.is_file():
             default_pcap = str(capture.resolve())
+            input_kind = classify_input(capture) or "pcap"
         else:
-            print(f"警告: 流量包不存在: {capture}", file=sys.stderr)
+            print(f"警告: 输入文件不存在: {capture}", file=sys.stderr)
+    if args.features or args.all:
+        try:
+            default_features = select_features(args.features, args.all,
+                                               kind=input_kind)
+        except SystemExit as exc:
+            print(str(exc.code), file=sys.stderr)
+            return 2
     server = MCPServer(runtime=runtime, default_pcap=default_pcap,
                        default_features=default_features)
     server.serve()

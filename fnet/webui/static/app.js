@@ -23,7 +23,8 @@
     findingsKinds: {},
     findingsDerived: false,
     findingsTruncated: false,
-    findingsSort: { key: "seq", dir: 1 },
+    // null = 默认排序（时间倒序、seq 倒序）；表头点击排序后由点击逻辑改写。
+    findingsSort: null,
     findingsPage: 1,
     findingsPageSize: 100,
     findingsSelected: new Set(),
@@ -36,8 +37,9 @@
     decodeText: "",
     localSeq: 0,
     featureCount: 0,
+    inputKind: "",
     batch: { ids: [], jobs: [], timer: null, active: false, summary: null, drag: null },
-    viz: { timeline: null, hierarchy: null, talkers: null, topology: null, topologyApi: null, zoom: null, svg: "" },
+    viz: { timeline: null, hierarchy: null, talkers: null, topology: null, topologyApi: null, zoom: null, svg: "", log: false },
     tlsKeyKind: "keylog",
     language: "zh",
     featureSearch: "",
@@ -56,13 +58,13 @@
     zh: {
       tab_log: "分析日志", tab_findings: "分析结果", tab_artifacts: "产出文件",
       tab_batch: "批量队列", tab_viz: "统计图表", tab_history: "任务历史",
-      tab_text: "文本工具", tab_about: "关于", tab_timeline: "结果时间线",
+      tab_text: "文本工具", tab_about: "关于",
       menu_file: "文件", menu_stats: "统计", menu_settings: "设置",
       menu_tools: "工具", menu_special: "专项功能", menu_help: "帮助",
       search: "搜索功能 / 分类 / handler", select_all: "全选",
       features_title: "自动分析功能",
-      drop_title: "拖拽流量包到此处",
-      drop_hint: "支持一次拖入多个文件并进入批量队列（pcap / pcapng / cap / dmp / etl）",
+      drop_title: "拖拽流量包或日志到此处",
+      drop_hint: "支持一次拖入多个文件并进入批量队列（pcap / pcapng / cap / dmp / etl，或 log / txt / jsonl / csv）",
       use_path: "使用", start: "开始分析", pause: "暂停", cancel: "取消",
       live: "实时抓包", compare: "对比两个任务",
       settings_webshell: "Webshell 解密设置", settings_shiro: "Shiro 解密设置",
@@ -70,10 +72,6 @@
       settings_general: "通用分析设置",
       status_idle: "空闲", status_running: "运行中", status_paused: "已暂停",
       status_done: "完成", status_cancelled: "已取消", status_error: "错误",
-      timeline_title: "发现时间线", timeline_refresh: "刷新",
-      timeline_hint: "按发现的时间 / 帧号纵向排列，点击条目可查看详情与标注。",
-      timeline_empty: "任务结束后，凭据、哈希、flag 等会按时间与帧号展示在这里。",
-      timeline_no_match: "没有匹配的结果，试试调整类别筛选。",
       ann_status: "标注状态", ann_none: "无标注",
       ann_confirmed: "已确认", ann_false_positive: "误报", ann_starred: "星标",
       ann_note: "备注", ann_save: "保存标注", ann_saved: "标注已保存",
@@ -149,13 +147,13 @@
     en: {
       tab_log: "Log", tab_findings: "Findings", tab_artifacts: "Artifacts",
       tab_batch: "Batch queue", tab_viz: "Charts", tab_history: "History",
-      tab_text: "Text tools", tab_about: "About", tab_timeline: "Timeline",
+      tab_text: "Text tools", tab_about: "About",
       menu_file: "File", menu_stats: "Statistics", menu_settings: "Settings",
       menu_tools: "Tools", menu_special: "One-click", menu_help: "Help",
       search: "Search features / categories / handlers", select_all: "Select all",
       features_title: "Analysis features",
-      drop_title: "Drop a capture here",
-      drop_hint: "Multiple files are queued for a batch run (pcap / pcapng / cap / dmp / etl)",
+      drop_title: "Drop a capture or log here",
+      drop_hint: "Multiple files are queued for a batch run (pcap / pcapng / cap / dmp / etl, or log / txt / jsonl / csv)",
       use_path: "Use", start: "Start", pause: "Pause", cancel: "Cancel",
       live: "Live capture", compare: "Compare jobs",
       settings_webshell: "Webshell decryption", settings_shiro: "Shiro decryption",
@@ -163,10 +161,6 @@
       settings_general: "General analysis",
       status_idle: "Idle", status_running: "Running", status_paused: "Paused",
       status_done: "Done", status_cancelled: "Cancelled", status_error: "Error",
-      timeline_title: "Findings timeline", timeline_refresh: "Refresh",
-      timeline_hint: "Listed vertically by capture time / frame; click an entry for details and annotations.",
-      timeline_empty: "Credentials, hashes and flags appear here by time and frame once a job finishes.",
-      timeline_no_match: "No matching findings; try another kind filter.",
       ann_status: "Annotation", ann_none: "None",
       ann_confirmed: "Confirmed", ann_false_positive: "False positive",
       ann_starred: "Starred",
@@ -360,7 +354,7 @@
     renderTools(state.meta.tools);
     renderRuntime();
     loadHistory().catch(() => {});
-    if (!state.meta.tools.tshark?.available) {
+    if (!state.meta.tools.tshark?.available && state.inputKind !== "log") {
       toast("未找到 tshark，依赖 tshark 的分析功能不可用。\nDebian/Ubuntu: sudo apt install tshark",
         "warn", 9000);
     }
@@ -386,10 +380,6 @@
     kindSelect.innerHTML = '<option value="all">全部类别</option>' +
       kinds.map((kind) =>
         `<option value="${esc(kind.key)}">${esc(kind.name)}</option>`).join("");
-    const timelineKind = $("#timeline-kind");
-    if (timelineKind) {
-      timelineKind.innerHTML = kindSelect.innerHTML;
-    }
 
     // Feature list grouped by category.
     state.features = meta.features || [];
@@ -625,7 +615,7 @@
       log.appendChild(line);
     });
     if (!visible.length) {
-      log.innerHTML = '<div class="log-empty">暂无日志。选择一个流量包和功能后点击“开始分析”。</div>';
+      log.innerHTML = '<div class="log-empty">暂无日志。选择一个输入文件和功能后点击“开始分析”。</div>';
     }
     if (checked("auto-scroll")) log.scrollTop = log.scrollHeight;
   }
@@ -697,10 +687,8 @@
 
   /* --------------------------------------------------- feature finder */
   function filterFeatures() {
-    const query = val("feature-search").toLowerCase();
-    state.featureSearch = query;
+    const query = (state.featureSearch || "").toLowerCase();
     const english = state.language === "en";
-    $("#feature-search-clear").classList.toggle("hidden", !query);
     let visible = 0;
     $$("#features .feature-group").forEach((group) => {
       let groupVisible = 0;
@@ -848,7 +836,7 @@
         <div class="history-main">
           <div class="history-title">
             <span class="badge ${status === "done" ? "ok" : status === "running" ? "running" : status === "error" ? "bad" : ""}">${esc(statusLabel(status))}</span>
-            <strong>${esc(job.pcap_name || job.pcap || "未知流量包")}</strong>
+            <strong>${esc(job.pcap_name || job.pcap || "未知文件")}</strong>
           </div>
           <div class="muted small">${esc(when)} · ${(job.features || []).length} 个功能 · 任务 ${esc(String(job.id).slice(0, 8))}</div>
           <div class="muted small history-features">${esc(titles)}</div>
@@ -930,25 +918,61 @@
     // ``fnet capture.pcapng --features ...`` preselects both the capture and
     // the feature checkboxes; without it the WebUI simply uses the defaults.
     if (!initial) return;
+    if (initial.pcap) {
+      setPcap(initial.pcap);
+      toast(`已预选${inputKindOf(initial.pcap) === "log" ? "日志" : "流量包"}: `
+        + `${initial.pcap.split(/[\\/]/).pop()}`, "good");
+    }
     const boxes = $$("#features input[type=checkbox]");
     if (Array.isArray(initial.features) && initial.features.length) {
       const wanted = new Set(initial.features);
-      boxes.forEach((box) => { box.checked = wanted.has(box.value); });
-    }
-    if (initial.pcap) {
-      setPcap(initial.pcap);
-      toast(`已预选流量包: ${initial.pcap.split(/[\\/]/).pop()}`, "good");
+      boxes.forEach((box) => {
+        box.checked = wanted.has(box.value);
+        box.dispatchEvent(new Event("change"));
+      });
     }
     renderRecentFeatures();
+  }
+
+  const LOG_FILE_RE = /\.(log|txt|out|jsonl|ndjson|json|csv|tsv)$/i;
+
+  function inputKindOf(path) {
+    return LOG_FILE_RE.test(String(path || "")) ? "log" : "pcap";
+  }
+
+  function applyInputKindDefaults(path) {
+    const kind = inputKindOf(path);
+    if (state.inputKind === kind) return;
+    const previous = state.inputKind;
+    state.inputKind = kind;
+    // Keep the historical pcap workflow intact: a user may tick extra
+    // features before dropping the first capture.  Log inputs are a new path
+    // and always start from the four log features.
+    if (kind !== "log" && !previous) return;
+    const boxes = $$("#features input[type=checkbox]");
+    if (!boxes.length) return;
+    const byValue = new Map((state.features || []).map((feature) =>
+      [feature.checkbox, feature]));
+    boxes.forEach((box) => {
+      const feature = byValue.get(box.value);
+      box.checked = kind === "log"
+        ? !!(feature && feature.category === "log")
+        : !!(feature && feature.default);
+      box.dispatchEvent(new Event("change"));
+    });
+    toast(kind === "log"
+      ? "已按日志文件勾选日志分析功能（.log / .txt / .jsonl / .csv）"
+      : "已恢复抓包的默认功能", "good", 5000);
   }
 
   function setPcap(path, name, size) {
     state.pcap = path || "";
     state.fileName = name || (path ? path.split(/[\\/]/).pop() : "");
-    setText("#file-name", state.fileName || "未选择流量包");
+    applyInputKindDefaults(state.pcap);
+    setText("#file-name", state.fileName || "未选择输入文件");
     setText("#file-meta", state.pcap
       ? `${state.pcap}${size ? ` · ${fmtSize(size)}` : ""}`
-      : "选择或上传一个抓包文件开始");
+      : "选择或上传一个抓包或日志文件开始");
     setVal("pcap-path", state.pcap);
     refreshSelected();
   }
@@ -1024,7 +1048,7 @@
       }
       return;
     }
-    toast(`正在上传 ${list.length} 个流量包…`, "info", 6000);
+    toast(`正在上传 ${list.length} 个文件…`, "info", 6000);
     const uploaded = [];
     try {
       for (const [index, file] of list.entries()) {
@@ -1035,7 +1059,7 @@
       }
       setProgress(100);
       setPcap(uploaded[0].path, uploaded[0].name, uploaded[0].size);
-      toast(`已上传 ${uploaded.length} 个流量包，开始批量排队`, "good", 5000);
+      toast(`已上传 ${uploaded.length} 个文件，开始批量排队`, "good", 5000);
       await startBatch(uploaded.map((item) => item.path));
     } catch (error) {
       setProgress(0);
@@ -1044,7 +1068,7 @@
   }
 
   async function startBatch(paths) {
-    if (!paths || !paths.length) { toast("请先选择流量包", "warn"); return; }
+    if (!paths || !paths.length) { toast("请先选择输入文件", "warn"); return; }
     const features = selectedFeatures();
     if (!features.length) { toast("请至少选择一个分析功能", "warn"); return; }
     const concurrency = Number(val("batch-concurrency")) || 1;
@@ -1131,7 +1155,7 @@
     const merge = $("#batch-merge");
     if (merge) merge.disabled = !jobs.some((job) => job.status === "done");
     if (!jobs.length) {
-      box.innerHTML = '<div class="muted">还没有批量任务。一次选择多个流量包后会自动开始排队。</div>';
+      box.innerHTML = '<div class="muted">还没有批量任务。一次选择多个文件后会自动开始排队。</div>';
       return;
     }
     const rows = orderedBatchJobs(jobs).map((job) => {
@@ -1153,7 +1177,7 @@
           class="${draggable ? "batch-queued" : ""}">
           <td class="batch-grip-cell">${grip}</td>
           <td><span class="badge ${badge}">${esc(statusLabel(job.status))}</span></td>
-          <td class="batch-name">${esc(job.pcap_name || job.pcap || "未知流量包")}</td>
+          <td class="batch-name">${esc(job.pcap_name || job.pcap || "未知文件")}</td>
           <td>
             <div class="batch-progress">
               <div class="batch-bar"><div style="width:${pct}%"></div></div>
@@ -1170,7 +1194,7 @@
     }).join("");
     box.innerHTML = `
       <table class="batch-table">
-        <thead><tr><th></th><th>状态</th><th>流量包</th><th>进度</th><th>操作</th></tr></thead>
+        <thead><tr><th></th><th>状态</th><th>文件</th><th>进度</th><th>操作</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
   }
@@ -1286,22 +1310,23 @@
     return items.sort((a, b) => b.bytes - a.bytes).slice(0, 8);
   }
 
-  function renderBars(selector, items, metric) {
+  function renderBars(selector, items, metric, emptyText) {
     const box = $(selector);
     if (!box) return;
     if (!items || !items.length) {
       box.classList.add("muted");
-      box.textContent = "没有可用于图表的数据";
+      box.textContent = emptyText || "没有可用于图表的数据";
       return;
     }
     const value = (item) => Math.max(0, Number(item[metric]) || 0);
     const max = Math.max(...items.map(value), 1);
     box.classList.remove("muted");
     const clickable = selector === "#viz-protocols";
+    const unit = state.viz.log ? "条" : "帧";
     box.innerHTML = items.map((item) => {
       const width = Math.max(1, Math.round(value(item) / max * 100));
       const label = metric === "frames"
-        ? `${item.frames} 帧` : fmtSize(item.bytes);
+        ? `${item.frames} ${unit}` : fmtSize(item.bytes);
       return `
         <div class="viz-bar-row${clickable ? " drillable" : ""}"
           title="${esc(item.label)} · ${esc(label)}${clickable ? " · 点击下钻" : ""}"
@@ -1333,7 +1358,9 @@
       return;
     }
     const { points, start, end } = timelineVisible();
-    const metric = val("viz-metric") === "frames" ? "frames" : "bytes";
+    const isLog = !!(data && data.kind === "log");
+    const metric = isLog || val("viz-metric") === "frames" ? "frames" : "bytes";
+    const unit = isLog ? "条" : "帧";
     const max = Math.max(...points.map((point) => Number(point[metric]) || 0), 1);
     box.classList.remove("muted");
     const width = 1000, height = 260, left = 42, right = 12, top = 12, bottom = 34;
@@ -1345,7 +1372,7 @@
       const barH = amount ? Math.max(2, Math.round(amount / max * plotH)) : 1;
       const x = left + index * slot + gap / 2;
       const y = top + plotH - barH;
-      const label = `${(point.time - (data.start || 0)).toFixed(2)}s · ${point.frames} 帧 · ${fmtSize(point.bytes)}`;
+      const label = `${(point.time - (data.start || 0)).toFixed(2)}s · ${point.frames} ${unit} · ${fmtSize(point.bytes)}`;
       return `<rect class="tl-bar" x="${x.toFixed(2)}" y="${y.toFixed(2)}"
         width="${Math.max(1, slot - gap).toFixed(2)}" height="${barH}"
         data-index="${start + index}" data-start="${point.time}"
@@ -1463,7 +1490,7 @@
   }
 
   async function openProtocolDetail(protocol) {
-    if (!state.pcap) { toast("请先选择流量包", "warn"); return; }
+    if (!state.pcap) { toast("请先选择输入文件", "warn"); return; }
     try {
       const data = await api("/api/action", {
         method: "POST",
@@ -1498,7 +1525,12 @@
     }
     box.classList.remove("muted");
     const width = 1000, height = 420, cx = width / 2, cy = height / 2;
-    const maxBytes = Math.max(...nodes.map((node) => Number(node.bytes) || 0), 1);
+    // Log topology carries no byte counts; size nodes/edges by event count.
+    const topoLog = !!(data && data.kind === "log");
+    const weightOf = (item) => topoLog
+      ? Math.max(0, Number(item.frames) || 0)
+      : Math.max(0, Number(item.bytes) || 0);
+    const maxBytes = Math.max(...nodes.map(weightOf), 1);
     const positions = {};
     nodes.forEach((node, index) => {
       const ratio = index / Math.max(nodes.length, 1);
@@ -1507,14 +1539,14 @@
       positions[node.id] = {
         x: cx + Math.cos(angle) * ring,
         y: cy + Math.sin(angle) * ring,
-        radius: 5 + Math.sqrt((Number(node.bytes) || 0) / maxBytes) * 17,
+        radius: 5 + Math.sqrt(weightOf(node) / maxBytes) * 17,
       };
     });
     const edgeSvg = edges.map((edge) => {
       const a = positions[edge.source], b = positions[edge.target];
       if (!a || !b) return "";
-      const weight = 1 + Math.min(7, Math.sqrt((Number(edge.bytes) || 0) /
-        Math.max(data.max_bytes || maxBytes, 1)) * 9);
+      const weight = 1 + Math.min(7, Math.sqrt(weightOf(edge) /
+        Math.max((topoLog ? data.max_frames : data.max_bytes) || maxBytes, 1)) * 9);
       const color = protoColor(edge.protocol);
       return `<line class="topo-edge" x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}"
         x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}"
@@ -1526,7 +1558,7 @@
       return `<g class="topo-node" data-node="${esc(node.id)}" tabindex="0" role="button"
         aria-label="按 ${esc(label)} 过滤结果">
         <circle cx="${pos.x.toFixed(1)}" cy="${pos.y.toFixed(1)}" r="${pos.radius.toFixed(1)}"
-          fill="${protoColor((node.protocols || [])[0])}"><title>${esc(label)} · ${node.count ?? node.frames ?? 0} 帧 · ${fmtSize(node.bytes)} · ${esc((node.protocols || []).join(", "))}</title></circle>
+          fill="${protoColor((node.protocols || [])[0])}"><title>${esc(label)} · ${node.count ?? node.frames ?? 0} ${state.viz.log ? "条" : "帧"} · ${fmtSize(node.bytes)} · ${esc((node.protocols || []).join(", "))}</title></circle>
         <text x="${pos.x.toFixed(1)}" y="${(pos.y + pos.radius + 13).toFixed(1)}"
           text-anchor="middle">${esc(label.length > 24 ? label.slice(0, 23) + "…" : label)}</text>
       </g>`;
@@ -1572,7 +1604,7 @@
   }
 
   async function loadViz() {
-    if (!state.pcap) { toast("请先选择流量包", "warn"); return; }
+    if (!state.pcap) { toast("请先选择输入文件", "warn"); return; }
     const buckets = Number(val("viz-buckets")) || 60;
     setText("#viz-summary", "正在统计…");
     const calls = [
@@ -1584,11 +1616,21 @@
       method: "POST", body: { action: "stats", pcap: state.pcap, ...body },
     }).catch((error) => ({ ok: false, text: error.message })));
     const [timeline, hierarchy, talkers, topology] = await Promise.all(calls);
-    state.viz.timeline = timeline.ok ? timeline : null;
-    state.viz.hierarchy = hierarchy.ok ? parseHierarchy(hierarchy.text) : null;
-    state.viz.talkers = talkers.ok ? parseConversations(talkers.text) : null;
-    state.viz.topology = topology.ok ? topology : null;
+    // Log inputs answer with kind:"log" and structured items; failed
+    // responses are kept so their reason text can be shown in the panel.
+    state.viz.log = [timeline, hierarchy, talkers, topology]
+      .some((data) => data && data.kind === "log");
+    state.viz.timeline = timeline;
+    state.viz.hierarchy = hierarchy.ok
+      ? ((hierarchy.items && hierarchy.items.length)
+        ? hierarchy.items : parseHierarchy(hierarchy.text)) : null;
+    state.viz.talkers = talkers.ok
+      ? ((talkers.items && talkers.items.length)
+        ? talkers.items.slice(0, 8) : parseConversations(talkers.text)) : null;
+    state.viz.topology = topology;
     state.viz.zoom = null;
+    // Log jobs get the extra 实体统计 card (loaded in the background).
+    if (state.viz.log) loadEntityStats().catch(() => {});
     // Prefer the job-scoped topology API when a task is attached; it keeps
     // historical jobs replottable even after the pcap picker moves on.
     state.viz.topologyApi = null;
@@ -1599,17 +1641,160 @@
         if (data.ok && (data.nodes || []).length) state.viz.topologyApi = data;
       } catch (error) { /* fall back to the pcap-based stats above */ }
     }
+    const talkersTitle = document.querySelector("#viz-talkers")
+      ?.closest(".viz-card")?.querySelector("h4");
+    if (talkersTitle) talkersTitle.textContent = state.viz.log ? "Top 实体" : "Top 会话";
     setText("#viz-summary", timeline.ok
       ? (timeline.text || "") : (timeline.text || "统计失败"));
     renderViz();
   }
 
   function renderViz() {
-    const metric = val("viz-metric") === "frames" ? "frames" : "bytes";
+    const metric = state.viz.log || val("viz-metric") === "frames"
+      ? "frames" : "bytes";
     renderTimeline();
     renderTopology();
-    renderBars("#viz-protocols", state.viz.hierarchy, metric);
-    renderBars("#viz-talkers", state.viz.talkers, metric);
+    renderBars("#viz-protocols", state.viz.hierarchy, metric,
+      state.viz.log ? "日志任务：协议分层显示日志级别统计" : undefined);
+    renderBars("#viz-talkers", state.viz.talkers, metric,
+      state.viz.log ? "日志任务：Top 实体基于 client_id/user/IP 统计" : undefined);
+    if (!state.viz.log) removeEntityCard();
+  }
+
+  /* ------------------------------------------------------ entity stats --
+   * Log jobs only: a card showing the full per-entity statistics table
+   * (the same shape as the feature report's 实体统计 table), driven by
+   * POST /api/action {action:"stats", sub:"entities"} on the log input. */
+  function ensureEntityCard() {
+    const existing = $("#viz-entities-card");
+    if (existing) return existing;
+    const grid = document.querySelector("#tab-viz .viz-grid");
+    if (!grid) return null;
+    const card = document.createElement("div");
+    card.className = "viz-card wide";
+    card.id = "viz-entities-card";
+    card.innerHTML = `
+      <h4>实体统计
+        <select id="viz-entity-dim" class="ghost small"
+          title="实体维度（来自当前日志的可用字段）"></select>
+        <button id="viz-entity-refresh" class="ghost small">刷新</button>
+      </h4>
+      <div id="viz-entity-bars" class="viz-bars muted">尚无数据</div>
+      <div id="viz-entity-table" class="entity-table-wrap muted">尚无数据</div>
+      <div id="viz-entity-note" class="muted small"></div>`;
+    grid.appendChild(card);
+    $("#viz-entity-refresh").addEventListener("click", () => {
+      loadEntityStats().catch((error) => setEntityError(error.message));
+    });
+    $("#viz-entity-dim").addEventListener("change", () => {
+      state.viz.entityDimension = val("viz-entity-dim");
+      loadEntityStats().catch((error) => setEntityError(error.message));
+    });
+    return card;
+  }
+
+  function removeEntityCard() {
+    const card = $("#viz-entities-card");
+    if (card) card.remove();
+  }
+
+  function setEntityError(text) {
+    const box = $("#viz-entity-table");
+    if (box) {
+      box.classList.add("muted");
+      box.textContent = text || "统计失败";
+    }
+  }
+
+  // Like api() but keeps ok:false payloads (with dimensions) instead of
+  // throwing, so the card can render server-side reasons and fall back to
+  // an available dimension itself.
+  async function postActionRaw(body) {
+    const response = await fetch("/api/action", {
+      method: "POST",
+      headers: { "X-Fnet-Token": TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const type = response.headers.get("content-type") || "";
+    if (type.includes("application/json")) return response.json();
+    return { ok: false, text: await response.text() };
+  }
+
+  async function loadEntityStats(dimension) {
+    if (!state.viz.log || !state.pcap) return;
+    if (!ensureEntityCard()) return;
+    const dim = dimension || state.viz.entityDimension || "client_id";
+    setEntityError("正在统计…");
+    let data;
+    try {
+      data = await postActionRaw({
+        action: "stats", sub: "entities", pcap: state.pcap,
+        dimension: dim, limit: 50,
+        ...(state.viz.entityParams || {}),
+      });
+    } catch (error) {
+      data = { ok: false, text: error.message, dimensions: [] };
+    }
+    // The default dimension may not exist in this log; retry once with the
+    // first dimension the server offers instead of leaving an error.
+    const dims = data.dimensions || [];
+    if (!data.ok && dims.length && !dims.includes(dim)) {
+      state.viz.entityDimension = dims[0];
+      return loadEntityStats(dims[0]);
+    }
+    state.viz.entityDimension = data.ok ? data.dimension : dim;
+    renderEntityStats(data);
+  }
+
+  function renderEntityStats(data) {
+    if (!ensureEntityCard()) return;
+    const dims = data.dimensions || [];
+    const select = $("#viz-entity-dim");
+    if (select && dims.length) {
+      const current = state.viz.entityDimension || "client_id";
+      select.innerHTML = dims.map((name) =>
+        `<option value="${esc(name)}"${name === current ? " selected" : ""}>${esc(name)}</option>`).join("");
+    }
+    const note = $("#viz-entity-note");
+    const items = (data.ok && data.items) || [];
+    renderBars("#viz-entity-bars",
+      items.slice(0, 10).map((item) => ({
+        label: String(item.value ?? ""), frames: Number(item.count) || 0,
+        bytes: 0,
+      })),
+      "frames", data.ok ? "没有实体统计数据" : "");
+    if (!data.ok) {
+      setEntityError(data.text || "统计失败");
+      if (note) note.textContent = "";
+      return;
+    }
+    if (!items.length) {
+      setEntityError("没有实体统计数据");
+      if (note) note.textContent = "";
+      return;
+    }
+    const table = $("#viz-entity-table");
+    table.classList.remove("muted");
+    const pct = (ratio) => `${(Number(ratio) * 100).toFixed(1)}%`;
+    table.innerHTML = `<table class="entity-table"><thead><tr>
+        <th>值</th><th>次数</th><th>占比</th><th>失败次数</th><th>失败率</th>
+        <th>成功次数</th><th>成功率</th><th>首次</th><th>末次</th></tr></thead>
+      <tbody>${items.map((item) => `<tr>
+        <td class="mono" title="${esc(item.sample || "")}">${esc(item.value)}</td>
+        <td>${esc(item.count)}</td>
+        <td>${pct(item.share)}</td>
+        <td>${esc(item.fail)}</td>
+        <td>${pct(item.fail_rate)}</td>
+        <td>${esc(item.success)}</td>
+        <td>${pct(item.success_rate)}</td>
+        <td class="mono">${esc(item.first || "-")}</td>
+        <td class="mono">${esc(item.last || "-")}</td>
+      </tr>`).join("")}</tbody></table>`;
+    if (note) {
+      note.textContent = data.truncated
+        ? `仅显示前 ${items.length} 条（共 ${data.total} 条），完整数据见 log_entities.csv`
+        : (data.text || "");
+    }
   }
 
   function downloadSvg() {
@@ -1658,7 +1843,7 @@
   }
 
   async function startJob(features, params, label) {
-    if (!state.pcap) { toast("请先选择流量包", "warn"); return; }
+    if (!state.pcap) { toast("请先选择输入文件", "warn"); return; }
     if (!features.length) { toast("请至少选择一个分析功能", "warn"); return; }
     try {
       const data = await api("/api/analyze", {
@@ -1837,15 +2022,21 @@
   const LEVEL_NAMES = {
     debug: "调试", info: "信息", good: "成功", warn: "警告", error: "错误",
   };
+  // 默认排序：时间倒序（capture 优先于 wall-clock time），相同时间按 seq 倒序。
+  const FINDINGS_DEFAULT_SORT = { key: "time", dir: -1 };
   const FINDING_COLUMNS = [
-    ["kind", "类别"], ["level", "级别"], ["frame", "帧"], ["feature", "功能"],
-    ["summary", "摘要"], ["detail", "详情"],
+    ["kind", "类别"], ["level", "级别"], ["frame", "帧"], ["time", "时间"],
+    ["feature", "功能"], ["summary", "摘要"], ["detail", "详情"],
   ];
 
   function findingValue(item, key) {
     if (key === "kind") return state.findingsKinds[item.kind] || item.kind || "";
     if (key === "level") return LEVEL_NAMES[item.level] || item.level || "";
     return String(item[key] ?? "");
+  }
+
+  function findingTime(item) {
+    return String(item.capture || item.time || "");
   }
 
   function findingMatches(item) {
@@ -1860,8 +2051,16 @@
   }
 
   function sortedFindings() {
-    const { key, dir } = state.findingsSort || { key: "seq", dir: 1 };
+    const { key, dir } = state.findingsSort || FINDINGS_DEFAULT_SORT;
     return [...state.findings].sort((left, right) => {
+      if (key === "time") {
+        // 时间列按显示时间字符串比较（%H:%M:%S / 抓包时间戳都可用字典序），
+        // 相同时间回退到 seq，保持发现顺序稳定。
+        const a = findingTime(left);
+        const b = findingTime(right);
+        if (a !== b) return (a < b ? -1 : a > b ? 1 : 0) * dir;
+        return ((Number(left.seq) || 0) - (Number(right.seq) || 0)) * dir;
+      }
       if (key === "seq" || key === "frame") {
         return ((Number(left[key]) || 0) - (Number(right[key]) || 0)) * dir;
       }
@@ -1886,6 +2085,10 @@
       return frame
         ? `<button type="button" class="frame-link" data-frame="${frame}" title="查看数据包 ${frame}">${esc(frame)}</button>`
         : "";
+    }
+    if (key === "time") {
+      const when = findingTime(item);
+      return `<span class="mono">${esc(when || "-")}</span>`;
     }
     if (key === "level") {
       const level = LEVEL_NAMES[item.level] ? item.level : "info";
@@ -1967,7 +2170,7 @@
       renderFindingsPager(page);
       return;
     }
-    const sort = state.findingsSort || { key: "seq", dir: 1 };
+    const sort = state.findingsSort || FINDINGS_DEFAULT_SORT;
     const columns = visibleFindingColumns();
     const pageSelected = page.items.every((item) => state.findingsSelected.has(String(item.seq)));
     const head = columns.map(([key, label]) => {
@@ -2112,7 +2315,6 @@
       });
       toast(t("ann_saved"), "good", 1800);
       await loadFindings(job, { quiet: true });
-      renderTimelinePanel();
     } catch (error) {
       toast(error.message, "error", 7000);
     }
@@ -2511,13 +2713,6 @@
       /* artifact refresh is best-effort */
     }
   }
-
-  function annotationLabel(status) {
-    return { confirmed: t("ann_confirmed"),
-             false_positive: t("ann_false_positive"),
-             starred: t("ann_starred") }[status] || "";
-  }
-
   /* ------------------------------------------------------------- hashcat */
   const CRACK_STATUS_KEYS = {
     running: "crack_running", cracked: "crack_cracked",
@@ -2902,53 +3097,6 @@
     }
   }
 
-  /* ------------------------------------------------- findings timeline */
-  function renderTimelinePanel() {
-    const box = $("#timeline");
-    if (!box) return;
-    if (!state.findings.length) {
-      box.innerHTML = `<div class="muted">${esc(t("timeline_empty"))}</div>`;
-      return;
-    }
-    const kind = val("timeline-kind") || "all";
-    const items = [...state.findings]
-      .filter((item) => kind === "all" || item.kind === kind)
-      .sort((left, right) => {
-        // Capture order first (frame number); entries without a frame keep
-        // their seq order at the end.
-        const lf = Number(left.frame) || 0, rf = Number(right.frame) || 0;
-        if (lf && rf) return lf - rf || left.seq - right.seq;
-        if (lf !== rf) return lf ? 1 : -1;
-        return left.seq - right.seq;
-      });
-    if (!items.length) {
-      box.innerHTML = `<div class="muted">${esc(t("timeline_no_match"))}</div>`;
-      return;
-    }
-    box.innerHTML = items.map((item) => {
-      const frame = Number(item.frame) || 0;
-      const when = item.capture || item.time || "";
-      const level = LEVEL_NAMES[item.level] ? item.level : "info";
-      const badge = item.annotation
-        ? annotationLabel(item.annotation.status) : "";
-      return `<div class="timeline-item lvl-${level}" data-seq="${esc(item.seq)}">
-        <div class="timeline-rail"><span class="timeline-dot"></span></div>
-        <div class="timeline-body">
-          <div class="timeline-meta">
-            <span class="log-time">${esc(when || "—")}</span>
-            ${frame ? `<button type="button" class="frame-link" data-frame="${frame}"
-              title="查看数据包 ${frame}">帧 ${frame}</button>` : ""}
-            <span class="finding-kind">${esc(findingValue(item, "kind"))}</span>
-            <span class="finding-level ${level}">${esc(findingValue(item, "level"))}</span>
-            ${item.feature ? `<span class="muted small">${esc(item.feature)}</span>` : ""}
-            ${badge ? `<span class="ann-badge">${esc(badge)}</span>` : ""}
-          </div>
-          <div class="timeline-summary">${highlightFlags(esc(clip(item.summary, 220)))}</div>
-        </div>
-      </div>`;
-    }).join("");
-  }
-
   /* ------------------------------------------------------------ packets */
   const packetState = { job: null, frame: 0, wireshark: false, range: [1, 1] };
 
@@ -3100,7 +3248,6 @@
         encodeURIComponent(TOKEN)}`;
       csv.classList.remove("disabled");
       renderFindings();
-      renderTimelinePanel();
     } catch (error) {
       if (!options.quiet) toast(`获取分析结果失败：${error.message}`, "error", 7000);
     }
@@ -3112,7 +3259,7 @@
     state.findingsJob = null;
     state.findingsDerived = false;
     state.findingsTruncated = false;
-    state.findingsSort = { key: "seq", dir: 1 };
+    state.findingsSort = null;
     state.findingsPage = 1;
     state.findingsSelected = new Set();
     setText("#findings-count", "0");
@@ -3510,26 +3657,16 @@
       refreshSelected();
       renderRecentFeatures();
     });
-    $("#feature-search").addEventListener("input", () => {
-      setVal("global-search", val("feature-search"));
-      filterFeatures();
-    });
-    $("#feature-search-clear").addEventListener("click", () => {
-      setVal("feature-search", "");
-      setVal("global-search", "");
-      filterFeatures();
-      $("#feature-search").focus();
-    });
     const globalSearch = $("#global-search");
     if (globalSearch) {
       globalSearch.addEventListener("input", () => {
-        setVal("feature-search", globalSearch.value);
+        state.featureSearch = globalSearch.value;
         filterFeatures();
       });
       globalSearch.addEventListener("keydown", (event) => {
         if (event.key !== "Escape") return;
         globalSearch.value = "";
-        setVal("feature-search", "");
+        state.featureSearch = "";
         filterFeatures();
         globalSearch.blur();
       });
@@ -3539,9 +3676,9 @@
       if (event.key === "/" && !event.ctrlKey && !event.metaKey
           && !["input", "textarea", "select"].includes(tag)) {
         event.preventDefault();
-        const target = globalSearch || $("#feature-search");
-        target.focus();
-        target.select?.();
+        if (!globalSearch) return;
+        globalSearch.focus();
+        globalSearch.select?.();
       }
     });
     $("#history-refresh").addEventListener("click", () => {
@@ -3668,33 +3805,6 @@
       filterFindingsByEndpoint(node.dataset.node);
     });
 
-    $("#timeline-kind").addEventListener("change", () => renderTimelinePanel());
-    $("#timeline-refresh").addEventListener("click", () => {
-      const job = packetJob();
-      if (!job) { toast("还没有分析任务", "warn"); return; }
-      loadFindings(job, { quiet: true })
-        .then(() => toast("分析结果已刷新", "good", 1400))
-        .catch((error) => toast(error.message, "error", 7000));
-    });
-    $("#timeline").addEventListener("click", (event) => {
-      const frame = event.target.closest(".frame-link");
-      if (frame) {
-        event.stopPropagation();
-        openPacket(frame.dataset.frame);
-        return;
-      }
-      const item = event.target.closest(".timeline-item");
-      if (item) showFinding(item.dataset.seq);
-    });
-    $("#timeline").addEventListener("keydown", (event) => {
-      if (event.key !== "Enter" && event.key !== " ") return;
-      if (event.target.closest(".frame-link")) return;
-      const item = event.target.closest(".timeline-item");
-      if (!item) return;
-      event.preventDefault();
-      showFinding(item.dataset.seq);
-    });
-
     $("#log-search").addEventListener("input", debounce(reRenderLog, 180));
     $("#log-filter").addEventListener("change", reRenderLog);
     $("#log-level").addEventListener("change", reRenderLog);
@@ -3726,9 +3836,6 @@
         }
         if (tab.dataset.tab === "viz") {
           loadViz().catch((error) => toast(error.message, "error", 7000));
-        }
-        if (tab.dataset.tab === "timeline") {
-          renderTimelinePanel();
         }
       });
     });
@@ -3810,9 +3917,11 @@
       const header = event.target.closest("th[data-sort]");
       if (header) {
         const key = header.dataset.sort;
-        const sort = state.findingsSort || { key: "seq", dir: 1 };
-        state.findingsSort = sort.key === key
-          ? { key, dir: -sort.dir } : { key, dir: 1 };
+        const sort = state.findingsSort;
+        // 三态循环：升序 → 降序 → 回到默认时间排序（null）。
+        state.findingsSort = !sort || sort.key !== key
+          ? { key, dir: 1 }
+          : sort.dir === 1 ? { key, dir: -1 } : null;
         state.findingsPage = 1;
         renderFindings();
         return;
@@ -4010,7 +4119,7 @@
         return;
       }
       if (action === "http_login") {
-        if (!state.pcap) { toast("请先选择流量包", "warn"); return; }
+        if (!state.pcap) { toast("请先选择抓包文件", "warn"); return; }
         const data = await api("/api/action", {
           method: "POST", body: { action, pcap: state.pcap },
         });
@@ -4057,7 +4166,7 @@
         return;
       }
       if (["export_objects", "carve", "repair", "etl"].includes(action)) {
-        if (!state.pcap) { toast("请先选择流量包", "warn"); return; }
+        if (!state.pcap) { toast("请先选择抓包文件", "warn"); return; }
         toast("正在执行，请稍候…", "info");
         const body = { action, pcap: state.pcap };
         if (action === "etl") body.pcap = state.pcap;
@@ -4068,7 +4177,7 @@
         return;
       }
       if (action === "stats") {
-        if (!state.pcap) { toast("请先选择流量包", "warn"); return; }
+        if (!state.pcap) { toast("请先选择抓包文件", "warn"); return; }
         toast("正在统计…", "info");
         const data = await api("/api/action", {
           method: "POST", body: { action: "stats", sub: dataset.sub, pcap: state.pcap },
@@ -4094,7 +4203,7 @@
   async function runPlugin(key) {
     try {
       if (!state.pcap && !["cyberchef"].includes(key)) {
-        toast("请先选择流量包", "warn");
+        toast("请先选择抓包文件", "warn");
         return;
       }
       toast(`正在运行 ${key}…`, "info");

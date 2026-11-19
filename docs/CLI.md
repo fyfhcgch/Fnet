@@ -9,9 +9,14 @@ Fnet 除了本地 WebUI（见 [docs/WEBUI.md](WEBUI.md)），还提供三种命�
 
 ```bash
 python3 -m fnet -C capture.pcapng                          # 默认勾选项
+python3 -m fnet -C access.log                              # 日志默认 4 项
 python3 -m fnet -C capture.pcapng --features checkBox_10,http.extract
 python3 -m fnet -C capture.pcapng --json                   # 机器可读输出
 ```
+
+`-C` 的输入既可以是 pcap/pcapng 抓包，也可以是 `.log`/`.txt`/`.out`/`.jsonl`/
+`.ndjson`/`.json`/`.csv`/`.tsv` 文本日志。日志任务使用内置解析器并默认选中
+“日志分析”分类的 4 项功能，不依赖 `tshark`。
 
 完整参数见 `python3 -m fnet --help` 与 README 的「无界面分析」一节；
 `--shards` 分片与 `--resume` 断点续跑见 [docs/ARCHITECTURE.md](ARCHITECTURE.md)。
@@ -97,7 +102,7 @@ Claude Desktop、Claude Code 或任何支持 stdio transport 的 LLM 客户端�
 
 ```bash
 python3 -m fnet --mcp                  # 纯 stdio 服务，等待 JSON-RPC
-python3 -m fnet --mcp capture.pcapng   # 预载默认流量包，analyze 可省略 pcap_path
+python3 -m fnet --mcp capture.pcapng   # 预载默认抓包或日志，analyze 可省略 pcap_path
 python3 -m fnet --mcp --features checkBox_10,webshell.decrypt   # 预设默认功能集
 ```
 
@@ -115,7 +120,7 @@ python3 -m fnet --mcp --features checkBox_10,webshell.decrypt   # 预设默认�
 | 工具           | 用途                                       | 入参 |
 | -------------- | ------------------------------------------ | ---- |
 | `list_features` | 列出全部功能（复选框 id、handler、标题、分类、是否默认勾选），用于先选功能再分析 | 无 |
-| `analyze`       | 同步运行一次分析任务并等待结束，返回 findings 摘要、统计与报告路径 | `pcap_path`（缺省用启动时预载的流量包）、`features`（复选框 id 或 handler 名数组）、`params`（功能参数对象，如 `{"wifi_psk": "..."}`）、`shards`（帧区间分片数，默认 1） |
+| `analyze`       | 同步运行一次分析任务并等待结束，返回 findings 摘要、统计与报告路径 | `pcap_path`（抓包或日志路径；缺省用启动时预载的文件）、`features`（复选框 id 或 handler 名数组）、`params`（功能参数对象，如 `{"wifi_psk": "..."}`）、`shards`（帧区间分片数，默认 1） |
 | `get_findings`  | 按任务 id（缺省最近一次任务）查询结构化结果 | `job_id`、`kind`（按类别过滤）、`query`（文本过滤）、`level`（info/warn/error）、`limit`（默认 5000） |
 | `get_packet`    | 返回某帧详情与前后帧上下文（对应 WebUI 的帧链接视图） | `frame`（必填）、`job_id`、`context`（前后各取多少帧，默认 2，最大 20） |
 
@@ -127,13 +132,13 @@ python3 -m fnet --mcp --features checkBox_10,webshell.decrypt   # 预设默认�
 
 * **无 token、无网络面**：stdio 传输没有 HTTP 层，通信只发生在 fnet 与
   启动它的客户端进程之间；不要把 stdio 接到多个客户端共享的管道上。
-* **路径约定**：pcap 路径只来自 MCP 调用参数或启动 `--mcp` 时的位置参数，
+* **路径约定**：输入路径只来自 MCP 调用参数或启动 `--mcp` 时的位置参数，
   服务器不写死任何绝对路径；输出目录走 `fnet.paths` / `JobManager` 的既有
   机制。客户端能传任意可读路径，等于把本机读权限交给 LLM——只在自己信任
-  的机器上接入，敏感流量包建议放在专用目录并用 `FNET_HOME` 隔离任务缓存。
+  的机器上接入，敏感抓包或日志建议放在专用目录并用 `FNET_HOME` 隔离任务缓存。
 * **权限对等**：MCP 客户端触发的是本机 Python 进程，会以运行 fnet 的账号
   调用 tshark 等外部工具；不要在服务器或高权限账号下长期挂 `--mcp`。
-* **同步阻塞**：`analyze` 等任务结束才返回，大流量包会让这一条工具调用
+* **同步阻塞**：`analyze` 等任务结束才返回，大抓包或大日志会让这一条工具调用
   持续较久，客户端侧需要可接受的超时设置。
 
 ### Claude Desktop 配置示例
