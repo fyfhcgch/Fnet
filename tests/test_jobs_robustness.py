@@ -1,8 +1,7 @@
 """Robustness regressions for job persistence and input validation.
 
-Covers the failure modes from ``docs/IMPROVEMENT_PLAN.md`` B4 (cross-process
-``--resume``), B5 (non-atomic artifact writes + unlocked ``job.json`` writes)
-and A6 (unparseable input reported as success).
+Covers cross-process ``--resume``, non-atomic artifact writes + unlocked
+``job.json`` writes, and unparseable input being reported as success.
 """
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Flag-quality policy (docs/IMPROVEMENT_PLAN.md A1).
+"""Flag-quality policy.
 
 On 44 real CTF captures the old ``FLAG_RE``-only behaviour produced 1,485
 "flag" findings of which 1,484 were CSS rules, PHP snippets or TLS

@@ -1,6 +1,6 @@
 """测试共用的隔离工具。
 
-存在的理由（见 ``AGENTS.md`` 与 ``docs/IMPROVEMENT_PLAN.md`` B7）：
+存在的理由（见 ``AGENTS.md`` 的 Testing gotchas 一节）：
 ``fnet.jobs.CACHE_DIR`` 与 ``fnet.paths.CACHE_DIR`` 是两个**独立的**名字，
 任务产物走前者、tshark 的 TSV 缓存走后者。只 patch 其中一个会让测试把
 文件写进开发者真实的 ``~/.cache/fnet/``，既污染本机也让测试之间互相影响。
