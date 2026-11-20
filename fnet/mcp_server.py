@@ -32,6 +32,9 @@ from fnet.utils.logfile import classify_input
 
 #: MCP protocol version advertised during the ``initialize`` handshake.
 PROTOCOL_VERSION = "2024-11-05"
+#: ``analyze`` 同步等待任务的超时（秒）。超时后返回 running 状态，
+#: 客户端仍可用 ``get_findings`` 轮询，而不是把整条 stdio 连接卡死。
+MCP_JOB_TIMEOUT = 900
 
 JSONRPC_VERSION = "2.0"
 
@@ -184,6 +187,11 @@ class MCPServer:
         msg_id = message.get("id")
         method = str(message.get("method") or "")
         try:
+            if is_notification:
+                # JSON-RPC 2.0：没有 "id" 就是通知，任何方法都不得回包
+                # （包括 initialize —— 正常客户端总会带 id）。
+                log(f"忽略通知: {method or '(空)'}")
+                return None
             if method == "initialize":
                 return self._result(msg_id, {
                     "protocolVersion": PROTOCOL_VERSION,
@@ -192,10 +200,6 @@ class MCPServer:
                     "instructions": "Fnet 流量分析：先 list_features 选择功能，"
                                     "再用 analyze 分析流量包，get_findings/get_packet 查看结果。",
                 })
-            if is_notification:
-                # notifications/initialized 及其它通知一律忽略，不回包。
-                log(f"忽略通知: {method or '(空)'}")
-                return None
             if method == "ping":
                 return self._result(msg_id, {})
             if method == "tools/list":
@@ -292,9 +296,10 @@ class MCPServer:
             return {"ok": False, "error": f"无法创建任务: {exc}"}
         self.last_job_id = job.id
         log(f"任务 {job.id} 开始: {path.name}（{len(job.features)} 个功能）")
-        # 同步等待：MCP 客户端拿到响应时任务已经结束。
+        # 同步等待：MCP 客户端拿到响应时任务已经结束。加超时，
+        # 避免一个卡死的 tshark 让整个 MCP 连接永久阻塞。
         if job.thread is not None:
-            job.thread.join()
+            job.thread.join(timeout=MCP_JOB_TIMEOUT)
         found = runtime.jobs.findings_for(job.id, limit=50_000) or {}
         findings = found.get("findings") or []
         summary = {

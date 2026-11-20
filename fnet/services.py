@@ -550,7 +550,7 @@ def _log_parsed(path: str) -> tuple[logfile.LogFile | None, str]:
     try:
         parsed = logfile.parse_path(path)
     except Exception as exc:  # noqa: BLE001 - never raise into the HTTP layer
-        logger.warning("日志统计解析失败 %s: %s", path, exc)
+        logger.warn(f"日志统计解析失败 {path}: {exc}")
         return None, f"日志解析失败：{exc}"
     return parsed, ""
 
@@ -753,7 +753,7 @@ def log_entity_stats(path: str, dimension: str, limit: int = 50,
             log, name, fail_re=fail_re, success_re=success_re,
             subnet_prefix=prefix)
     except Exception as exc:  # noqa: BLE001 - never raise into the HTTP layer
-        logger.warning("实体统计失败 %s/%s: %s", path, name, exc)
+        logger.warn(f"实体统计失败 {path}/{name}: {exc}")
         return _result(False, f"实体统计失败：{exc}", dimension=name,
                        dimensions=dimensions, items=[], total=0, **kind)
     if not items:

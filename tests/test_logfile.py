@@ -151,6 +151,53 @@ class LogParsingTest(unittest.TestCase):
             self.assertEqual(len(parsed.records), 3)
 
 
+class ParseCacheIsolationTest(unittest.TestCase):
+    """B10：``parse_path`` 不得把可变的 ``LogFile`` 交给两个调用方共用。
+
+    缓存只保存不可变的 ``(fmt, lines, truncated)``；每次调用重建
+    ``LogFile``/``records``。否则 ``ThreadingHTTPServer`` 下 ``logs.*`` 与
+    ``text_scan.*`` 同时读一份日志会互相污染。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "shared.log"
+        self.path.write_text(
+            "2024-01-01 00:00:00 INFO hello\n"
+            "2024-01-01 00:00:01 ERROR boom\n", encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_repeated_calls_return_distinct_objects(self):
+        first = logfile.parse_path(self.path)
+        second = logfile.parse_path(self.path)
+        self.assertIsNot(first, second)
+        self.assertIsNot(first.records, second.records)
+
+    def test_mutating_one_result_does_not_leak(self):
+        first = logfile.parse_path(self.path)
+        first.records.clear()
+        first.records.append("污染")
+        second = logfile.parse_path(self.path)
+        self.assertEqual(len(second.records), 2)
+        self.assertIn("hello", second.records[0].message)
+
+    def test_cache_key_includes_ctime(self):
+        """``tar -x``/``rsync -t`` 保留 mtime+size，ctime 变化必须使缓存失效。"""
+        first = logfile.parse_path(self.path)
+        self.assertIn("boom", first.records[1].message)
+        # 同尺寸改写内容，并把 mtime 改回原值（模拟 rsync -t）。
+        stat = self.path.stat()
+        self.path.write_text(
+            "2024-01-01 00:00:00 INFO hello\n"
+            "2024-01-01 00:00:01 ERROR pwned\n", encoding="utf-8")
+        import os
+        os.utime(self.path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        second = logfile.parse_path(self.path)
+        self.assertIn("pwned", second.records[1].message)
+
+
 class LogFeatureTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -491,7 +538,7 @@ class LogDefaultsTest(unittest.TestCase):
         expected = [feature.checkbox for feature in FEATURES
                     if feature.category == "log"]
         self.assertEqual(default_features_for("log"), expected)
-        self.assertEqual(len(expected), 4)
+        self.assertEqual(len(expected), 5)
 
     def test_pcap_defaults_unchanged(self):
         self.assertEqual(default_features_for("pcap"),
@@ -519,7 +566,7 @@ class LogJobTest(unittest.TestCase):
         job = self.manager.create(str(path), default_features_for("log"), {})
         self.assertEqual(job.kind, "log")
         self.assertEqual([feature.category for feature in job.features],
-                         ["log", "log", "log", "log"])
+                         ["log", "log", "log", "log", "log"])
         job.log.info("日志概览")
         self.manager._write_report(job, "done")
         report = (job.output_dir / "report.txt").read_text(encoding="utf-8")

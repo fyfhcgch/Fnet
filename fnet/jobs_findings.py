@@ -17,7 +17,7 @@ import datetime as _dt
 import json
 
 from fnet import findings as findings_mod
-from fnet.jobs_checkpoint import job_dir
+from fnet.jobs_checkpoint import atomic_write, job_dir
 from fnet.report import parse_report_text, select_findings
 
 #: Human annotation states for findings (empty string clears the status).
@@ -81,10 +81,8 @@ def set_annotation(manager, job_id: str, seq, status: str = "",
                       "updated": _dt.datetime.now().isoformat(timespec="seconds")}
         text = f"已保存结果 #{number} 的标注"
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(notes, ensure_ascii=False, indent=2),
-                        encoding="utf-8")
-    except OSError as exc:
+        atomic_write(path, json.dumps(notes, ensure_ascii=False, indent=2))
+    except (OSError, ValueError) as exc:
         raise ValueError(f"标注写入失败: {exc}")
     return {"ok": True, "text": text, "annotations": notes}
 
@@ -188,19 +186,20 @@ def write_findings(job) -> None:
     json_path = job.output_dir / "findings.json"
     csv_path = job.output_dir / "findings.csv"
     try:
-        json_path.write_text(
+        atomic_write(
+            json_path,
             json.dumps({"job": job.id, "count": len(job.findings),
                         "findings": job.findings},
-                       ensure_ascii=False, indent=2),
-            encoding="utf-8")
+                       ensure_ascii=False, indent=2, default=str))
         job.findings_path = str(json_path)
-    except OSError as exc:
+    except (OSError, TypeError, ValueError) as exc:
+        # ``default=str`` keeps exotic values serialisable; a malformed record
+        # must still never abort the job (it only loses findings.json).
         job.log.warn(f"结构化结果写入失败: {exc}")
     try:
-        csv_path.write_text(findings_mod.to_csv(job.findings),
-                            encoding="utf-8")
+        atomic_write(csv_path, findings_mod.to_csv(job.findings))
         job.findings_csv_path = str(csv_path)
-    except OSError as exc:
+    except (OSError, TypeError, ValueError, AttributeError) as exc:
         job.log.warn(f"结果 CSV 写入失败: {exc}")
     if job.findings:
         job.log.good(f"结构化结果 {len(job.findings)} 条，可在“分析结果”页查看")

@@ -4,16 +4,41 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from fnet.logger import logger
+
 HEX_CLEAN = re.compile(r"[^0-9a-fA-F]")
+#: ``0x`` 前缀可以出现在每个逗号分隔的多值片段前（tshark 的
+#: ``0x1301,0xc02f``），因此逐个片段剥离而不是只剥整体前缀。
+HEX_PREFIX = re.compile(r"(?i)^0x")
+HEX_SEPARATORS = re.compile(r"[:,;\-\s]")
 
 
 def hex_to_bytes(value: str) -> bytes:
-    value = HEX_CLEAN.sub("", value or "")
-    if len(value) % 2:
-        value = value[:-1]
+    """Decode a hex string, tolerating the separators tshark emits.
+
+    ``0x``/``0X`` prefixes and ``:``/``-``/``,``/whitespace separators are
+    removed before decoding, so ``"0x41"``, ``"41"``, ``"4:1"`` and ``"41 "``
+    all yield ``b"A"``; per-value prefixes such as ``"0x1301,0xc02f"`` work
+    too.  Anything that cannot be decoded — an odd number of hex digits, a
+    non-hex character, or a bare ``"0x"`` — returns ``b""`` instead of
+    silently dropping a nibble, which used to turn ``"0x41"`` into
+    ``b"\\x04"``.
+    """
+    tokens = [HEX_PREFIX.sub("", part)
+              for part in HEX_SEPARATORS.split(str(value or "").strip())]
+    text = "".join(tokens)
+    if not text:
+        return b""
+    if HEX_CLEAN.search(text):
+        logger.debug("hex_to_bytes: 含非十六进制字符，已忽略该值")
+        return b""
+    if len(text) % 2:
+        logger.debug(f"hex_to_bytes: 十六进制长度为奇数（{len(text)}），已忽略该值")
+        return b""
     try:
-        return bytes.fromhex(value)
+        return bytes.fromhex(text)
     except ValueError:
+        logger.debug("hex_to_bytes: 无法解码，已忽略该值")
         return b""
 
 

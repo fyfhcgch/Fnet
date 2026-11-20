@@ -190,7 +190,9 @@ FEATURES: list[Feature] = [
                            "SQL injection log"),
     Feature("checkBox_15", "Cobalt Strike流量分析", "cs.analyze", "c2",
             "CS beacon 元数据/任务解密（需要 .cobaltstrike.beacon_keys）",
-            False, ("cryptography",),
+            # 不声明 ``cryptography``：``fnet/utils/crypto.py`` 是纯标准库
+            # 实现（RSA 私钥解析与 AES 都在里面），``accel``/``crypto``
+            # 只是可选的加速依赖，不开也能完整解密。
             title_en="Cobalt Strike analysis",
             description_en="Decrypt CS beacon metadata and tasks (requires "
                            ".cobaltstrike.beacon_keys)"),
@@ -262,6 +264,14 @@ FEATURES: list[Feature] = [
             "TCP 流重组与内容提取",
             title_en="TCP flow analysis",
             description_en="TCP stream reassembly and content extraction"),
+    Feature("checkBox_66", "端口扫描与行为画像", "flows.scan", "flow",
+            "识别 SYN 半开扫描、全连接扫描与批量端口探测（IPv4/IPv6），"
+            "输出源→目标、端口集合、探针数、速率与置信度",
+            title_en="Port scan & host profiling",
+            description_en="Detect SYN half-open scans, connect scans and "
+                           "bulk port probes with source/target, port set, "
+                           "probe count, rate and confidence",
+            shardable=False),
     Feature("checkBox_44", "ARP协议分析", "arp.analyze", "flow",
             "ARP 流量、IP/MAC 冲突与异常字段分析",
             title_en="ARP analysis",
@@ -470,6 +480,19 @@ FEATURES: list[Feature] = [
             description_en="Extract flags, credentials, hashes, URLs, domains, "
                            "emails, key IDs and public/private IP inventory "
                            "into structured findings"),
+    Feature("checkBox_65", "跨源日志关联与执行溯源", "audit.correlate", "log",
+            "识别容器/主机高危执行命令（下载执行、管道 shell、base64 解码、"
+            "反弹 shell、nsenter/容器 socket 逃逸、持久化等），并按时间窗口与 "
+            "log_extra_paths 指定的其它日志做跨源关联，输出“执行侧实体 IP ↔ "
+            "关联侧成功记录实体 IP”的关联对（audit_timeline.csv / "
+            "audit_correlations.csv）",
+            title_en="Cross-source log correlation & exec tracing",
+            description_en="Flag risky container/host commands (download-and-"
+                           "execute, piped shells, base64 decode, reverse "
+                           "shells, nsenter/container-socket escapes, "
+                           "persistence) and correlate them by time window "
+                           "with logs from log_extra_paths, emitting "
+                           "exec-side ↔ matched-side entity IP pairs"),
 ]
 
 BY_CHECKBOX = {feature.checkbox: feature for feature in FEATURES}

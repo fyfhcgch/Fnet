@@ -79,12 +79,27 @@ def clear_detection_cache() -> None:
         _DETECT_CACHE.clear()
 
 
-def _cache_key(pcap: str) -> tuple:
+def _cache_key(pcap: str, params: dict | None = None) -> tuple:
+    """Cache key: 文件身份 + 影响检测结果的参数指纹。
+
+    早期实现只用 ``(路径, mtime, size)``，于是同一次任务里先跑
+    ``protocol_min_confidence=90`` 再跑默认值，第二次会命中第一次的结果
+    （反之亦然），``protocol_ignore`` 同理。
+    """
     try:
         stat = Path(pcap).stat()
-        return (str(Path(pcap).resolve()), stat.st_mtime_ns, stat.st_size)
+        identity = (str(Path(pcap).resolve()), stat.st_mtime_ns, stat.st_size)
     except OSError:
-        return (str(pcap), 0, 0)
+        identity = (str(pcap), 0, 0)
+    settings = params or {}
+    min_confidence = _int_param(settings.get("protocol_min_confidence"), 60)
+    ignore = tuple(_patterns(settings.get("protocol_ignore")))
+    return identity + (min_confidence, ignore)
+
+
+#: 上限：一次任务通常只有一两个抓包，``--batch`` 才会多。超出后按插入
+#: 顺序淘汰最旧的项，避免 ``--all`` 批量分析时把整份检测结果堆在内存里。
+_DETECT_CACHE_LIMIT = 4
 
 
 def detect_streams(ctx: FeatureContext, use_cache: bool = True) -> list[dict]:
@@ -96,12 +111,13 @@ def detect_streams(ctx: FeatureContext, use_cache: bool = True) -> list[dict]:
     """
     if ctx.tshark is None:
         return []
-    key = _cache_key(ctx.pcap)
+    key = _cache_key(ctx.pcap, ctx.params)
     if use_cache:
         with _DETECT_LOCK:
             cached = _DETECT_CACHE.get(key)
         if cached is not None:
-            return list(cached)
+            # 拷贝一层 dict，调用方即使就地改字段也不会污染缓存条目。
+            return [dict(item) for item in cached]
     rows = tshark_rows(
         ctx, ["frame.number", "tcp.stream", "tcp.srcport", "tcp.dstport",
               "tcp.payload"], "tcp.len > 0", limit=MAX_DETECT_ROWS)
@@ -151,7 +167,12 @@ def detect_streams(ctx: FeatureContext, use_cache: bool = True) -> list[dict]:
         ctx.check_cancel()
     if use_cache:
         with _DETECT_LOCK:
-            _DETECT_CACHE[key] = list(detections)
+            # 先删后插，让重复命中的键移到末尾（真 LRU）；存副本，
+            # 调用方**当次**拿到的列表/字典被改动不能污染缓存。
+            _DETECT_CACHE.pop(key, None)
+            _DETECT_CACHE[key] = [dict(item) for item in detections]
+            while len(_DETECT_CACHE) > _DETECT_CACHE_LIMIT:
+                _DETECT_CACHE.pop(next(iter(_DETECT_CACHE)))
     return detections
 
 

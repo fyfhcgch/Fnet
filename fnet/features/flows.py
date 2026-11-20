@@ -7,9 +7,9 @@ from pathlib import Path
 
 import re
 
-from fnet.features.common import clean_cell, table, tshark_rows
+from fnet.features.common import clean_cell, payload_lines, table, tshark_rows
 from fnet.features.registry import FeatureContext
-from fnet.utils.pcap import conversations, hex_to_bytes, payload_text, printable_ratio
+from fnet.utils.pcap import conversations, hex_to_bytes
 
 MAX_ROWS = 300
 
@@ -39,32 +39,13 @@ def _dump(ctx: FeatureContext, title: str, fields: list[str],
 
 def _payload_rows(ctx: FeatureContext, title: str, display_filter: str,
                   fields: list[str], max_lines: int = 800) -> None:
-    rows = _rows(ctx, ["frame.number"] + fields, display_filter)
-    if not rows:
-        ctx.report(f"{title}: 没有匹配的流量", "warn")
-        return
-    ctx.report(f"===== {title} ({len(rows)} 条) =====", "good")
-    count = 0
-    for row in rows:
-        row += [""] * (len(fields) + 1 - len(row))
-        frame = row[0]
-        for raw in row[1:]:
-            if not raw:
-                continue
-            data = hex_to_bytes(raw)
-            if not data or printable_ratio(data) < 0.55:
-                continue
-            text = payload_text(data).replace("\r", "")
-            for line in text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                ctx.report(f"[{frame}] {line}", "info")
-                count += 1
-                if count > max_lines:
-                    ctx.report("输出行数达到上限", "warn")
-                    return
-        ctx.check_cancel()
+    """流载荷文本摘要。
+
+    实现已收敛到 :func:`fnet.features.common.payload_lines`——两处曾是
+    逐行相同的复制（B11.7），改一处漏一处的风险很高。这里只保留 flows
+    默认的 800 行上限。
+    """
+    payload_lines(ctx, title, display_filter, fields, max_lines=max_lines)
 
 
 def _printable_text(value: str) -> bool:
@@ -1151,3 +1132,303 @@ def http_login(ctx: FeatureContext) -> None:
 
     ctx.report("专项功能：识别 HTTP 登录成功的账号密码", "good")
     http_feature.extract(ctx)
+
+
+# ---------------------------------------------------------------------------
+# 端口扫描 / 主机行为画像（A5）
+# ---------------------------------------------------------------------------
+
+#: 扫描判定的默认门槛：**不同目的端口数**。用端口数而不是 SYN 包数，
+#: 是因为 TCP 重传会把同一端口重复发几十上百次（实测有 5727 个 SYN 但只有
+#: 4 个端口，那是正常业务的超时重连，不是扫描）。
+SCAN_MIN_PORTS = 12
+#: 全连接扫描：完成三次握手但几乎没有数据。
+SCAN_EMPTY_SESSIONS = 10
+
+#: 常见端口 → 服务名，仅用于报告可读性（不参与判定）。
+_COMMON_PORTS = {
+    21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns",
+    80: "http", 110: "pop3", 111: "rpcbind", 113: "ident", 135: "msrpc",
+    139: "netbios-ssn", 143: "imap", 161: "snmp", 199: "snmp-trap",
+    256: "rap", 443: "https", 445: "smb", 554: "rtsp", 587: "submission",
+    993: "imaps", 995: "pop3s", 1025: "nfs-or-ndm", 1433: "mssql",
+    1521: "oracle", 1720: "h323", 1723: "pptp", 2049: "nfs",
+    3306: "mysql", 3389: "rdp", 5000: "upnp", 5200: "targus",
+    5432: "postgres", 5900: "vnc", 6379: "redis", 7000: "afs3",
+    8000: "http-alt", 8021: "ftp-proxy", 8080: "http-proxy",
+    8443: "https-alt", 8888: "sun-answerbook", 9000: "cslistener",
+    9200: "elasticsearch", 9593: "cba8", 27017: "mongodb",
+}
+
+
+def _port_label(port: int) -> str:
+    name = _COMMON_PORTS.get(port)
+    return f"{port}({name})" if name else str(port)
+
+
+def _port_ranges(ports: list[int], max_ranges: int = 12) -> str:
+    """``[21,22,23,80,443,1000,1001]`` → ``"21-23,80,443,1000-1001"``。"""
+    if not ports:
+        return ""
+    ordered = sorted(set(ports))
+    ranges: list[tuple[int, int]] = []
+    start = previous = ordered[0]
+    for port in ordered[1:]:
+        if port == previous + 1:
+            previous = port
+            continue
+        ranges.append((start, previous))
+        start = previous = port
+    ranges.append((start, previous))
+    parts = [f"{a}" if a == b else f"{a}-{b}" for a, b in ranges]
+    if len(parts) > max_ranges:
+        parts = parts[:max_ranges] + [f"…（共 {len(ranges)} 段）"]
+    return ",".join(parts)
+
+
+def _scan_flags(row: list[str]) -> tuple[bool, bool, bool]:
+    """把 tshark 的布尔字段解析成 ``(syn, ack, rst)``。
+
+    ``tshark`` 输出 ``True``/``False``；早期版本或 ``-E occurrence`` 变化时
+    也可能是 ``1``/``0``，两种都接受。缺列时按"未知"处理（全 ``False``）。
+    """
+    def flag(index: int) -> bool:
+        value = str(row[index]).strip().lower() if len(row) > index else ""
+        return value in ("true", "1", "yes")
+
+    return flag(5), flag(6), flag(7)
+
+
+def scan_profile(rows: list[list[str]]) -> dict:
+    """从 ``tcp`` 行推导扫描画像（纯函数，便于单测）。
+
+    ``rows`` 每行是
+    ``[frame, ip.src, ip.dst, tcp.srcport, tcp.dstport, syn, ack, rst, str, epoch, len]``，
+    可选的第 12/13 列是 ``ipv6.src``/``ipv6.dst``：IPv6 抓包里 ``ip.src`` 为空，
+    不合并就会把所有 IPv6 流量折叠成同一个 ``"" → ""`` 组。
+
+    方向处理是这里唯一的坑：扫描器的 **SYN**（无 ACK）从 ``A→B`` 发出，
+    但目标的 **SYN+ACK** 是从 ``B→A`` 回来的，其**源端口**才是被探测的端口。
+    因此 ``(A, B)`` 这一组既要收集自己发出的探针，也要接收反向回来的应答，
+    否则"开放端口"会统计成扫描器的临时端口（实测 41190/41763…）。
+
+    ``sessions``/``open_ports`` 都按**目的端口**去重计数，所以"完成握手 6 个"
+    与"开放 6 个"口径一致，不会被扫描器的多个临时端口放大。
+    """
+    flows: dict[tuple[str, str], dict] = {}
+
+    def entry_for(src: str, dst: str) -> dict:
+        return flows.setdefault((src, dst), {
+            "src": src, "dst": dst,
+            "probes": set(),         # SYN 且无 ACK 的 (sport, dport)，去重
+            "syn_packets": 0,        # 原始 SYN 包数（含重传），仅供参考
+            "open_ports": set(),     # 反向 SYN+ACK 回报的开放端口
+            "refused": set(),        # 反向 RST 拒绝的端口
+            "established": set(),    # 完成握手的目的端口
+            "data_packets": 0,
+            "first": 0.0, "last": 0.0,
+            "frames": [],
+        })
+
+    for row in rows:
+        if len(row) < 5:
+            continue
+        src = str(row[1]).strip() or (
+            str(row[11]).strip() if len(row) > 11 else "")
+        dst = str(row[2]).strip() or (
+            str(row[12]).strip() if len(row) > 12 else "")
+        try:
+            sport = int(str(row[3]).strip() or 0)
+            dport = int(str(row[4]).strip() or 0)
+        except ValueError:
+            continue
+        syn, ack, rst = _scan_flags(row)
+        try:
+            epoch = float(str(row[9]).strip()) if len(row) > 9 and row[9] else 0.0
+        except ValueError:
+            epoch = 0.0
+        try:
+            payload = int(str(row[10]).strip() or 0) if len(row) > 10 else 0
+        except ValueError:
+            payload = 0
+
+        entry = entry_for(src, dst)
+        entry["frames"].append(row[0])
+        if epoch:
+            entry["first"] = entry["first"] or epoch
+            entry["last"] = max(entry["last"], epoch)
+
+        if syn and not ack:
+            # A → B 的探针：记录 (源端口, 目的端口)。用集合去重，
+            # 否则 TCP 重传会让一次正常连接被算成几十次"扫描"。
+            entry["probes"].add((sport, dport))
+            entry["syn_packets"] += 1
+        elif syn and ack:
+            # B → A 的应答：这一行的 src 是目标，sport 才是开放端口；
+            # 归属到反向的 (dst, src) 组，即真正的"扫描器 → 目标"。
+            reverse = entry_for(dst, src)
+            reverse["open_ports"].add(sport)
+            reverse["established"].add(sport)
+            reverse["frames"].append(row[0])
+        elif rst:
+            reverse = entry_for(dst, src)
+            reverse["refused"].add(sport)
+        if payload > 0:
+            reverse = entry_for(dst, src) if (syn and ack) else entry
+            reverse["data_packets"] += 1
+
+    result = {"flows": [], "scans": []}
+    for (src, dst), entry in flows.items():
+        probed_ports = {dport for _sport, dport in entry["probes"]}
+        ports = sorted(probed_ports | entry["open_ports"] | entry["refused"])
+        sessions = len(entry["established"])
+        # 判定必须基于"主动探测"证据，而不是"被拒绝"。
+        # 正常业务被 RST 拒绝（端口关了、服务重启）很常见，实测有一组
+        # 39 个高位端口全是 RST、零 SYN——那是普通连接失败，不是扫描。
+        empty_sessions = (sessions >= SCAN_EMPTY_SESSIONS
+                          and entry["data_packets"] <= sessions // 4)
+        is_scan = (len(probed_ports) >= SCAN_MIN_PORTS
+                   or (empty_sessions and len(ports) >= SCAN_MIN_PORTS))
+        kind = ""
+        if is_scan:
+            if entry["syn_packets"] and not entry["open_ports"]:
+                kind = "SYN 半开扫描"
+            elif entry["syn_packets"]:
+                kind = "SYN 扫描（部分端口开放）"
+            elif empty_sessions:
+                kind = "全连接扫描"
+            else:
+                kind = "端口探测"
+        # 置信度：端口数上百、过半被明确拒绝、或打了 ≥20 个端口却零数据
+        # 换手，都是扫描的强特征；只有十几个端口时也可能是管理员/监控在连
+        # 多台服务，标注为"中"更诚实。
+        refused = len(entry["refused"])
+        strong = (len(ports) >= 100
+                  # 过半端口被明确拒绝（≥10 个才有统计意义）
+                  or (refused >= 10 and refused * 2 >= len(ports))
+                  # 打了 ≥20 个端口却一个字节数据都没换到（含静默丢包）
+                  or (len(probed_ports) >= 20 and entry["data_packets"] == 0))
+        confidence = "高" if strong else "中"
+        duration = round(entry["last"] - entry["first"], 3) if entry["first"] else 0.0
+        profile = {
+            "src": src,
+            "dst": dst,
+            "kind": kind,
+            "is_scan": is_scan,
+            "probes": len(entry["probes"]),
+            "syn_packets": entry["syn_packets"],
+            "open_ports": len(entry["open_ports"]),
+            "open_port_list": sorted(entry["open_ports"]),
+            "closed": refused,
+            "confidence": confidence if is_scan else "",
+            "sessions": sessions,
+            "data_packets": entry["data_packets"],
+            "ports": ports,
+            "port_ranges": _port_ranges(ports),
+            "duration": duration,
+            "rate": round(len(ports) / duration, 1) if duration > 0 else 0.0,
+            "first_frame": entry["frames"][0] if entry["frames"] else "",
+        }
+        result["flows"].append(profile)
+        if is_scan:
+            result["scans"].append(profile)
+    result["flows"].sort(key=lambda item: (-item["probes"], item["src"]))
+    result["scans"].sort(key=lambda item: (-item["probes"], item["src"]))
+    return result
+
+
+def scan(ctx: FeatureContext) -> None:
+    """识别端口扫描：SYN 半开、SYN（部分开放）、全连接与批量端口探测。
+
+    不声称能识别"端口敲门"——那需要按时间序列判断敲门序列（如 7000→8000→
+    9000 后才开放），与"端口多"是两回事，误报代价高，暂不实现。
+    """
+    rows = _rows(ctx, ["frame.number", "ip.src", "ip.dst", "tcp.srcport",
+                       "tcp.dstport", "tcp.flags.syn", "tcp.flags.ack",
+                       "tcp.flags.reset", "tcp.flags.str", "frame.time_epoch",
+                       "tcp.len", "ipv6.src", "ipv6.dst"], "tcp",
+                      limit=400_000)
+    if not rows:
+        ctx.report("端口扫描: 没有匹配的 TCP 流量", "warn")
+        return
+    ctx.check_cancel()
+    profile = scan_profile(rows)
+    flows = profile["flows"]
+    scans = profile["scans"]
+
+    ctx.report(f"===== 扫描画像（{len(flows)} 组源→目标，{len(rows)} 个 TCP 包）=====",
+               "good")
+    for item in flows[:40]:
+        ctx.check_cancel()
+        verdict = item["kind"] or "未见扫描特征"
+        ctx.report(
+            f"{item['src']} → {item['dst']}：{verdict}"
+            + (f"（置信度{item['confidence']}）" if item["confidence"] else "")
+            + f"，目的端口 {len(item['ports'])} 个"
+            + (f"（SYN {item['syn_packets']} 个）" if item["syn_packets"] else "")
+            + f"，开放 {item['open_ports']}，拒绝 {item['closed']}，"
+            f"完成握手 {item['sessions']}，耗时 {item['duration']}s"
+            # 速率只对扫描有意义：正常连接 1 个端口也能算出 250 端口/s，
+            # 摆在"未见扫描特征"后面会误导。
+            + (f"，速率 {item['rate']} 端口/s"
+               if item["is_scan"] and item["rate"] else ""),
+            "warn" if item["is_scan"] else "info")
+        if item["port_ranges"]:
+            ctx.report(f"  目的端口: {item['port_ranges']}", "debug")
+    if len(flows) > 40:
+        ctx.report(f"仅显示前 40 组（共 {len(flows)} 组）", "warn")
+
+    if not scans:
+        ctx.report("未发现达到判定门槛的端口扫描行为", "info")
+        return
+
+    for item in scans:
+        summary = (f"端口扫描 {item['src']} → {item['dst']}"
+                   f"（{item['kind']}，{len(item['ports'])} 个端口，"
+                   f"置信度{item['confidence']}）")
+        detail = (f"{item['src']} → {item['dst']}，判定 {item['kind']}；"
+                  f"不同目的端口 {len(item['ports'])} 个"
+                  f"（{item['port_ranges']}），"
+                  f"SYN 包 {item['syn_packets']} 个（去重后探针 {item['probes']} 组），"
+                  f"开放端口 {item['open_ports']} 个，"
+                  f"被拒绝 {item['closed']} 个，完成握手 {item['sessions']} 个，"
+                  f"其中带数据包 {item['data_packets']} 个；"
+                  f"持续时间 {item['duration']}s"
+                  + (f"，平均 {item['rate']} 端口/秒" if item["rate"] else ""))
+        ctx.report(f"检测到{summary}", "warn")
+        ctx.add_finding("protocol", summary, frame=item["first_frame"],
+                        detail=detail, level="warn",
+                        extra={"src": item["src"], "dst": item["dst"],
+                               "verdict": item["kind"],
+                               "confidence": item["confidence"],
+                               "probes": item["probes"],
+                               "syn_packets": item["syn_packets"],
+                               "port_count": len(item["ports"]),
+                               "open": item["open_ports"],
+                               "open_port_list": item["open_port_list"],
+                               "closed": item["closed"],
+                               "sessions": item["sessions"],
+                               "ports": item["ports"][:500],
+                               "port_ranges": item["port_ranges"],
+                               "duration": item["duration"],
+                               "rate": item["rate"]})
+
+    # 开放端口清单：扫描题的"下一个线索"往往就在这里。
+    open_ports = sorted({int(port) for item in scans
+                         for port in item.get("open_port_list") or ()})
+    if open_ports:
+        ctx.report("扫描发现的开放端口: "
+                   + ", ".join(_port_label(port) for port in open_ports), "good")
+
+    # 每行字段数必须与表头一致（源/目标是两列，不要用 "→" 拼成一列，
+    # 否则下游按 TSV 解析会整体错位）。
+    lines = [f"{item['src']}\t{item['dst']}\t{item['kind']}\t"
+             f"{len(item['ports'])}\t{item['port_ranges']}\t"
+             f"{item['syn_packets']}\t{item['open_ports']}\t{item['closed']}\t"
+             f"{item['confidence']}"
+             for item in scans]
+    ctx.write_output("scan_summary.tsv",
+                     "源\t目标\t判定\t端口数\t目的端口\tSYN包\t开放\t拒绝\t置信度\n"
+                     + "\n".join(lines) + "\n")
+
+

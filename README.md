@@ -42,7 +42,7 @@ python3 -m fnet capture.pcapng          # 启动并预选流量包
 python3 -m fnet access.log              # 启动并预选文本日志
 python3 -m fnet capture.pcapng --features checkBox_10,http.extract
 python3 -m fnet --doctor                # 检查 tshark / java / hashcat 等
-python3 -m fnet --list-features         # 列出 54 个功能与复选框编号
+python3 -m fnet --list-features         # 列出 56 个功能与复选框编号
 ```
 
 WebUI 顶栏可切换中文 / English；大文件上传显示进度并可按 `Esc` 取消，
@@ -64,12 +64,16 @@ fnet
 # 运行默认勾选的功能，日志直接打印到终端
 python3 -m fnet -C capture.pcapng
 
-# 运行全部 54 个功能
+# 运行全部 56 个功能
 python3 -m fnet -C capture.pcapng --all
 
-# 直接分析文本日志：默认选中 4 项日志功能，不需要 tshark
+# 直接分析文本日志：默认选中 5 项日志功能，不需要 tshark
 python3 -m fnet -C /var/log/auth.log
 python3 -m fnet -C ceph.log --features checkBox_61,checkBox_64
+
+# 多源日志交叉关联：docker/容器执行日志 + kube-apiserver 审计日志
+python3 -m fnet -C docker.log --features checkBox_65 \
+  --param log_extra_paths=/var/log/kube-apiserver.log,/var/log/ceph.log
 
 # 工控：Modbus 寄存器隐写检测（自动解码藏进寄存器写请求的 ASCII/flag）
 python3 -m fnet -C modbus_traffic.pcap --features checkBox_11
@@ -105,6 +109,10 @@ python3 -m fnet --mcp capture.pcapng
 python3 -m fnet --pcap-over-ip 18000 --features checkBox_10
 ```
 
+输入校验分三档：正常抓包或日志照常分析；扩展名/魔数合法但内容损坏的抓包会给出
+`⚠ 输入警告` 并继续分析能读到的部分；完全不是抓包/日志的文件直接拒绝并以退出码 2
+结束，不再把失败伪装成“分析成功”。
+
 无界面分析、PCAP-over-IP 与 MCP server 三种命令行模式的详细说明见
 [`docs/CLI.md`](docs/CLI.md)。
 
@@ -114,15 +122,20 @@ python3 -m fnet --pcap-over-ip 18000 --features checkBox_10
 
 tshark 字段提取默认启用磁盘缓存与超时重试，可通过 `config.ini` 的
 `tshark_cache`、`tshark_retry`、`tshark_timeout`、`tshark_max_field_kb`、
-`tshark_max_rows` 调整缓存与内存上限。
+`tshark_max_rows` 调整缓存与内存上限。磁盘缓存默认上限 **512 MB / 14 天**，
+超出后按最近最少使用自动淘汰，也可随时手动清理：
+
+```bash
+fnet --clean-cache
+```
 
 ## WebUI 界面
 
-![Fnet WebUI：左侧 54 个功能的勾选面板，右侧分析结果表格与统计图表](docs/images/webui.webp)
+![Fnet WebUI：左侧 56 个功能的勾选面板，右侧分析结果表格与统计图表](docs/images/webui.webp)
 
 | 区域       | 说明                                                                                                             |
 | ---------- | ---------------------------------------------------------------------------------------------------------------- |
-| 左侧功能栏 | 54 个功能按 14 个分类折叠展示，可全选/全不选                                                                 |
+| 左侧功能栏 | 56 个功能按 14 个分类折叠展示，可全选/全不选                                                                 |
 | 顶部       | 全局功能搜索、文件/统计/设置/工具菜单、tshark 状态、语言切换、主题切换                                           |
 | 主区域     | 分析日志、分析结果、产出文件、批量队列、统计图表、任务历史、文本工具、关于                                        |
 | 分析结果   | 凭据、哈希、flag、导出文件等汇总为表格：新增“时间”列、默认按时间倒序，支持筛选、搜索、分页、列显示/隐藏、批量复制、按帧号跳转与 CSV 导出 |
@@ -206,8 +219,11 @@ python3 scripts/bench.py --sizes 10,100,1000 --features default
 分类概览：
 
 - **文本 / HTTP**：关键字与编码识别、深度 flag 扫描（重组流/导出文件/二进制载荷，带来源与置信度）、HTTP 请求响应提取、登录凭据、Basic 认证。
-- **日志分析**：直接读取 `.log`/`.txt`/`.jsonl`/`.csv`，识别 Ceph、syslog、sshd、Apache 与通用 KV 格式；输出概览时间线、实体失败率、异常突增与 IOC/敏感信息，不依赖 `tshark`。
+- **日志分析**：直接读取 `.log`/`.txt`/`.jsonl`/`.csv`，识别 Ceph、syslog、sshd、Apache 与通用 KV 格式；输出概览时间线、实体失败率、异常突增与 IOC/敏感信息，不依赖 `tshark`。另有**跨源日志关联**：识别容器/主机高危执行命令（下载即执行、管道 shell、base64 解码、反弹 shell、容器逃逸），并按时间窗口与其它日志的成功记录对齐，给出“执行侧 IP ↔ 关联侧 IP”的关联对。
 - **会话 / 协议**：TCP/UDP 会话、DNS、ICMP、ARP、FTP、SMTP、Telnet、MySQL；DNS/ICMP/TCP/UDP 统一检测长度与时序隐蔽信道（载荷长度或包间隔承载数据，隧道重组另行处理）；
+  **端口扫描与主机行为画像**按“源 → 目标”识别 SYN 半开、SYN 部分开放、全连接与批量端口探测，
+  统计不同目的端口数、开放/拒绝端口、探测速率与「高/中」置信度，开放端口取反向 SYN+ACK 的
+  源端口并标注服务名，结果落盘 `scan_summary.tsv`；
   额外支持 Redis、MongoDB、PostgreSQL、LDAP、SMB2/3、WebSocket 与 HTTP/2。
   Redis/MongoDB/PostgreSQL 会先做 TCP 流重组，再解析 RESP3、OP_MSG/SCRAM/GridFS、
   扩展查询/COPY 等深层协议内容；HTTP/2 内置 HPACK 与 DATA 正文还原，SMB2/3
@@ -230,7 +246,7 @@ Fnet/
 │   ├── findings.py        结构化结果（类别、级别、筛选、CSV）
 │   ├── report.py          纯文本/Markdown/HTML 报告渲染与章节选择
 │   ├── config.py          config.ini 读写与默认值
-│   ├── features/          54 个分析功能（按主题拆分）
+│   ├── features/          56 个分析功能（按主题拆分）
 │   ├── tools/runner.py    外部工具发现与 tshark 封装
 │   ├── utils/             编解码、AES/RC4/MD4/RSA、pcap、TCP 流重组、
 │   │                      MySQL/Kerberos/邮件/隧道/WPA/规则/日志解析
@@ -252,7 +268,12 @@ node --check fnet/webui/static/app.js    # 前端语法检查
 ```
 
 测试覆盖纯 Python 加密实现（AES/GCM/MD4/RC4/RSA 向量）、编解码、功能注册表、
-WebUI API 冒烟、UI 规格完整性，以及样例抓包上的关键断言。`tests/test_roadmap.py`
+WebUI API 冒烟、UI 规格完整性，以及样例抓包上的关键断言。`tests/test_hygiene.py`
+是仓库级门禁：版本号三方同步、`fnet/` 顶层禁止第三方 import、可选依赖必须惰性导入且
+带回退、全模块导入冒烟，以及 README / `docs/FEATURES.md` / 首页与 `manual/features.md`
+的功能计数必须与 `FEATURES` 一致；`tests/test_scan_profile.py` 固定端口扫描判定
+（方向、重传、仅 RST、IPv6、置信度）与 `scan_summary.tsv` 的列一致性。
+`tests/test_roadmap.py`
 额外覆盖流式上传、自定义规则、暂停/继续、任务对比、CLI JSON 与
 `--shards`/`--resume`，以及 DNS/ICMP 隧道、SMTP、MySQL、Kerberos、WPA 的集成；`tests/test_live.py` 用桩 `tshark`
 验证实时抓包的 start/stop、单实例限制与重复停止。CI 在 Python 3.10–3.13 上

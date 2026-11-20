@@ -671,20 +671,35 @@ def parse_text(text: str, name: str = "") -> LogFile:
 
 
 def parse_path(path: str | Path, limit: int = MAX_RECORDS) -> LogFile:
-    """Parse a log file from disk (mtime/size cached, capped in memory)."""
+    """Parse a log file from disk (mtime/size cached, capped in memory).
+
+    The cache only holds the *immutable* raw material (``fmt``/``lines``/
+    ``truncated``); the :class:`LogFile` itself is rebuilt on every call so
+    callers can mutate ``records`` freely.  Handing out a shared ``LogFile``
+    used to let two concurrent jobs (``logs.*`` + ``text_scan.*``) see each
+    other's edits under ``ThreadingHTTPServer``.
+    """
     target = Path(path).expanduser()
     try:
         stat = target.stat()
     except OSError:
         return LogFile(str(target), "plain", [], size=0)
-    return _parse_path_cached(str(target), stat.st_mtime_ns, stat.st_size,
-                              max(1, int(limit)))
+    fmt, lines, truncated = _read_path_cached(
+        str(target), stat.st_mtime_ns, stat.st_size, stat.st_ctime_ns,
+        max(1, int(limit)))
+    return _parse_lines(lines, name=str(target), fmt=fmt, size=stat.st_size,
+                        limit=max(1, int(limit)), truncated=truncated)
 
 
 @lru_cache(maxsize=2)
-def _parse_path_cached(path: str, mtime_ns: int, size: int,
-                       limit: int) -> LogFile:
-    del mtime_ns  # part of the cache key only
+def _read_path_cached(path: str, mtime_ns: int, size: int, ctime_ns: int,
+                      limit: int) -> tuple[str, tuple[str, ...], bool]:
+    """Return ``(format, lines, truncated)`` — never a mutable ``LogFile``.
+
+    ``ctime_ns`` participates in the key because ``tar -x`` / ``rsync -t``
+    restore ``mtime`` and size, which used to make a stale parse look fresh.
+    """
+    del mtime_ns, ctime_ns  # part of the cache key only
     try:
         with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
             head: list[str] = []
@@ -696,7 +711,7 @@ def _parse_path_cached(path: str, mtime_ns: int, size: int,
                     break
             fmt = detect_format(head, path)
             handle.seek(0)
-            lines = []
+            lines: list[str] = []
             truncated = False
             for index, line in enumerate(handle, 1):
                 if index > limit:
@@ -704,9 +719,8 @@ def _parse_path_cached(path: str, mtime_ns: int, size: int,
                     break
                 lines.append(line.rstrip("\r\n"))
     except OSError:
-        return LogFile(path, "plain", [], size=size)
-    return _parse_lines(lines, name=path, fmt=fmt, size=size,
-                        limit=limit, truncated=truncated)
+        return "plain", (), False
+    return fmt, tuple(lines), truncated
 
 
 def _parse_lines(lines: list[str], name: str, fmt: str, size: int,

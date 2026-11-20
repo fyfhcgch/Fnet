@@ -12,6 +12,7 @@ from pathlib import Path
 from fnet.app import build
 from fnet.config import Config
 from fnet.tools.runner import find_tool
+from tests.support import patch_cache_dirs
 
 DATA = Path(__file__).resolve().parent / "data"
 TSHARK = find_tool("tshark", "")
@@ -22,15 +23,15 @@ class SampleCaptureTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
-        from unittest import mock
-
-        cls.patch = mock.patch("fnet.jobs.CACHE_DIR", Path(cls.tmp.name))
-        cls.patch.start()
+        cls.patches = patch_cache_dirs(cls.tmp.name)
+        for patch in cls.patches:
+            patch.start()
         cls.runtime = build(Config(Path(cls.tmp.name) / "config.ini"))
 
     @classmethod
     def tearDownClass(cls):
-        cls.patch.stop()
+        for patch in reversed(cls.patches):
+            patch.stop()
         cls.tmp.cleanup()
 
     def run_job(self, pcap: str, features: list[str]) -> str:

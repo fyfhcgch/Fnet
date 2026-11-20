@@ -8,6 +8,7 @@ skipped otherwise.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import tempfile
 import threading
@@ -92,11 +93,16 @@ class WaveApiTest(unittest.TestCase):
         req = urllib.request.Request(self.base + path, data=data,
                                      headers=request_headers,
                                      method=method)
+        self.last_csp = ""
         try:
             with urllib.request.urlopen(req, timeout=30) as response:
+                self.last_csp = response.headers.get(
+                    "Content-Security-Policy", "")
                 return response.status, response.read()
         except urllib.error.HTTPError as error:
             try:
+                self.last_csp = error.headers.get(
+                    "Content-Security-Policy", "") if error.headers else ""
                 return error.code, error.read()
             finally:
                 error.close()
@@ -256,6 +262,110 @@ class WaveApiTest(unittest.TestCase):
         restored = normalise(record)
         self.assertEqual(restored["capture"], "12.5")
         self.assertEqual(normalise({"summary": "x"})["capture"], "")
+
+    # -- pre-auth hardening --------------------------------------------
+    def test_non_ascii_token_is_rejected_not_500(self):
+        """非 ASCII token 必须走 403，不能把 TypeError 兜底成预认证 500。
+
+        ``secrets.compare_digest("测试", "test")`` 直接抛 TypeError，旧实现
+        会把它渲染成 500 并把异常文本回显给客户端。
+        """
+        # 头部（"é" 是 latin-1 可编码的非 ASCII 字符，能过 urllib）。
+        status, body = self.request(
+            "/api/meta", token=False, headers={"X-Fnet-Token": "é"})
+        self.assertEqual(status, 403)
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(set(payload), {"ok", "error"})
+        self.assertFalse(payload["ok"])
+        self.assertIsInstance(payload["error"], str)
+        self.assertNotIn("TypeError", payload["error"])
+
+        # 查询参数（%E6%B5%8B%E8%AF%95 解码为 "测试"，纯非 ASCII）。
+        status, body = self.request("/api/meta?token=%E6%B5%8B%E8%AF%95",
+                                    token=False)
+        self.assertEqual(status, 403)
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(set(payload), {"ok", "error"})
+        self.assertFalse(payload["ok"])
+
+        # 真正的 token 仍然有效。
+        status, body = self.request("/api/meta", token=True)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body.decode("utf-8"))["token"])
+
+    def test_static_does_not_serve_prefix_sibling_directory(self):
+        """同前缀兄弟目录（``staticX/``）不能被当成 ``static/`` 的子路径。"""
+        import http.client
+
+        from fnet.webui import server as server_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            static = root / "static"
+            static.mkdir()
+            (static / "app.js").write_text("// ok", encoding="utf-8")
+            sibling = root / "staticX"
+            sibling.mkdir()
+            (sibling / "evil.js").write_text("// evil", encoding="utf-8")
+
+            def raw(path: str):
+                # http.client 不会规范化 ``..``，这样才真正走到前缀校验。
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1", self.server.server_address[1], timeout=30)
+                try:
+                    connection.request("GET", path)
+                    response = connection.getresponse()
+                    return response.status, response.read()
+                finally:
+                    connection.close()
+
+            with mock.patch.object(server_mod, "STATIC_DIR", static):
+                status, body = raw("/static/app.js")
+                self.assertEqual(status, 200)
+                self.assertEqual(body, b"// ok")
+                status, body = raw("/static/../staticX/evil.js")
+                self.assertEqual(status, 404)
+                self.assertFalse(json.loads(body.decode("utf-8"))["ok"])
+                status, _ = raw("/static/%2e%2e/staticX/evil.js")
+                self.assertEqual(status, 404)
+
+    def test_index_csp_has_no_unsafe_inline_scripts(self):
+        """首页 CSP 只放行带 nonce 的那一段内联脚本。"""
+        status, body = self.request("/", token=False)
+        self.assertEqual(status, 200)
+        html = body.decode("utf-8")
+        self.assertIn('window.FNET_TOKEN = "', html)
+        match = re.search(r'<script nonce="([^"]+)">', html)
+        self.assertIsNotNone(match, html[-400:])
+        nonce = match.group(1)
+        self.assertIn(f"'nonce-{nonce}'", self.last_csp)
+        self.assertNotIn("script-src 'self' 'unsafe-inline'", self.last_csp)
+        self.assertNotIn("__NONCE__", html)
+        # app.js 仍然以普通 src 加载（'self' 覆盖它）。
+        self.assertIn('<script src="/static/app.js"></script>', html)
+
+    def test_internal_error_does_not_leak_details(self):
+        """500 只回通用中文文案，异常细节进日志。"""
+        secret = "/very/secret/path/capture.pcap argv=['tshark', '-r']"
+        with mock.patch.object(self.runtime.app.jobs, "list",
+                               side_effect=RuntimeError(secret)):
+            status, body = self.request("/api/jobs")
+        self.assertEqual(status, 500)
+        payload = json.loads(body.decode("utf-8"))
+        self.assertFalse(payload["ok"])
+        self.assertNotIn("secret", payload["error"])
+        self.assertNotIn("tshark", payload["error"])
+        self.assertTrue(payload["error"])
+
+    def test_batch_report_html_carries_csp(self):
+        """合并报告与 /api/report 一样带 ``default-src 'none'``。"""
+        status, body = self.request(
+            f"/api/batch/report?jobs={JOB_ID}&format=html")
+        self.assertEqual(status, 200)
+        self.assertTrue(body.decode("utf-8").startswith("<!doctype html>"))
+        self.assertEqual(self.last_csp,
+                         "default-src 'none'; style-src 'unsafe-inline'; "
+                         "img-src data:")
 
 
 if __name__ == "__main__":

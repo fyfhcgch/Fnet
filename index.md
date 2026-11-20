@@ -15,7 +15,7 @@ description: 把 pcap 或文本日志拖进浏览器，勾选需要的检查项�
   <p class="cta-row">
     <a class="btn" href="{{ '/manual/tutorial/' | relative_url }}">开始实战</a>
     <a class="btn ghost" href="{{ '/manual/install/' | relative_url }}">安装与启动</a>
-    <a class="btn ghost" href="{{ '/manual/features/' | relative_url }}">浏览 54 项功能</a>
+    <a class="btn ghost" href="{{ '/manual/features/' | relative_url }}">浏览 56 项功能</a>
     <a class="btn ghost" href="https://github.com/fyfhcgch/Fnet">GitHub 仓库</a>
     {%- if site.version %}
     <span class="badge version-badge">v{{ site.version }}</span>
@@ -26,7 +26,7 @@ description: 把 pcap 或文本日志拖进浏览器，勾选需要的检查项�
 ## 2.21.3 更新
 
 - **文本日志直接分析**：`.log` / `.txt` / `.jsonl` / `.csv` 可直接作为输入，内置解析器
-  识别 Ceph、syslog、sshd、Apache 与通用 KV 等格式，新增“日志分析”分类（4 项功能），
+  识别 Ceph、syslog、sshd、Apache 与通用 KV 等格式，新增“日志分析”分类（5 项功能），
   输出概览时间线、实体画像、失败异常与 IOC/敏感信息；日志分析不依赖 tshark。
 - **Python 3.10 兼容**：日志证据时间戳解析统一处理 `+0000`/`+00`/`Z` 偏移，并保留非 UTC 时区的原始偏移，修复 CI 上时间窗关联失效。
 - **测试可移植性**：路径契约测试不再依赖本机才存在的 `/tmp/opencode` 临时目录。
@@ -92,7 +92,7 @@ description: 把 pcap 或文本日志拖进浏览器，勾选需要的检查项�
 
 <p class="shot">
   <img src="{{ '/assets/images/webui.webp' | relative_url }}"
-       alt="Fnet WebUI：左侧 54 个功能的勾选面板，右侧分析结果表格">
+       alt="Fnet WebUI：左侧 56 个功能的勾选面板，右侧分析结果表格">
 </p>
 <p class="shot-caption">真实界面截图：暖夜主题下的分析结果页</p>
 
@@ -105,7 +105,7 @@ description: 把 pcap 或文本日志拖进浏览器，勾选需要的检查项�
   </div>
   <div class="card">
     <h3>按赛题组织功能</h3>
-    <p>54 个分析功能分成 14 类：从 flag 扫描、文本日志、HTTP 与 Webshell，到工控、无线、TLS 解密。</p>
+    <p>56 个分析功能分成 14 类：从 flag 扫描、文本日志、HTTP 与 Webshell，到工控、无线、TLS 解密。</p>
   </div>
   <div class="card">
     <h3>结果能带走</h3>
@@ -186,7 +186,7 @@ python3 -m fnet</code></pre>
 
 <div class="feature-grid">
   <div class="card">
-    <span class="badge">4 项</span>
+    <span class="badge">5 项</span>
     <h3>日志分析</h3>
     <p>Ceph / syslog / sshd / Apache / JSONL / CSV 等文本日志：格式识别、时间线、实体失败率、异常突增与 IOC 提取，无需 tshark。</p>
   </div>
@@ -211,7 +211,7 @@ python3 -m fnet</code></pre>
     <p>布尔、时间与二分盲注的字符还原，也能从已保存的盲注日志回推内容。</p>
   </div>
   <div class="card">
-    <span class="badge">2 项</span>
+    <span class="badge">4 项</span>
     <h3>C2 / 远控</h3>
     <p>Cobalt Strike beacon 解密与 WinRM 凭据还原。</p>
   </div>
@@ -221,7 +221,7 @@ python3 -m fnet</code></pre>
     <p>NTLM 哈希与 Kerberos 票据；keytab/口令/原始密钥解密、PAC 与用户时间线，输出 hashcat 格式；无 hashcat 时也可离线验证 NetNTLMv2 密码并派生 SMB 密码候选。</p>
   </div>
   <div class="card">
-    <span class="badge">17 项</span>
+    <span class="badge">18 项</span>
     <h3>协议流量</h3>
     <p>TCP / UDP / DNS / ICMP / FTP / SMTP / Telnet / MySQL / ARP / GTP / LDAP / SMB / MongoDB / PostgreSQL / Redis / SSH；DNS/ICMP 隧道重组、邮件附件、MySQL 结果集与 LOAD，数据库与 SSH 会话凭据还原；SMB 加密链路智能串联。</p>
   </div>
@@ -241,12 +241,12 @@ python3 -m fnet</code></pre>
     <p>WPA/WPA2 握手与 PMKID；已知 PSK 时解密数据帧，把明文送回 HTTP/DNS/凭据分析。</p>
   </div>
   <div class="card">
-    <span class="badge">1 项</span>
+    <span class="badge">2 项</span>
     <h3>TLS / 加密</h3>
     <p>keylog 与私钥解密 TLS/QUIC，继续还原 HTTP/2、WebSocket、HTTP/3 与明文凭据。</p>
   </div>
   <div class="card">
-    <span class="badge">2 项</span>
+    <span class="badge">3 项</span>
     <h3>杂项</h3>
     <p>SCSI 传输数据提取与 IP ID 隐蔽信道分析。</p>
   </div>
@@ -283,7 +283,7 @@ python3 -m fnet</code></pre>
   <li>
     <a href="{{ '/manual/features/' | relative_url }}">
       <strong>功能清单</strong>
-      <span>54 项功能的作用、复选框编号与所需工具</span>
+      <span>56 项功能的作用、复选框编号与所需工具</span>
     </a>
   </li>
   <li>

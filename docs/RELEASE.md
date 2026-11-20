@@ -85,7 +85,10 @@ git push origin v2.20.0
 - [ ] `node --check fnet/webui/static/app.js` 通过
 - [ ] `python3 scripts/bench.py --sizes 10,100,1000 --features default` 更新
       `docs/PERFORMANCE.md`
-- [ ] README / docs/FEATURES.md 与 `FEATURES` 的 54 个功能一致
+- [ ] 功能计数与文档一致：`tests/test_registry.py`（总数/默认数/`needs`）、
+      `tests/test_api.py`（`/api/meta` 条数）、`tests/test_site.py`（首页卡片数字）、
+      `tests/test_hygiene.py`（`manual/features.md` 分类标题）已自动校验，
+      全量通过即满足
 - [x] `pyproject.toml` 与 `fnet/__init__.py` 版本一致
 - [x] `twine check dist/*` 通过（2.19.0 已验证）
 - [ ] 干净环境中 `fnet --version` 与 WebUI `/api/health` 正常

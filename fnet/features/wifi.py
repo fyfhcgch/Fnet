@@ -103,7 +103,8 @@ def _decrypted_feedback(ctx: FeatureContext, path: Path) -> None:
     fields = ["frame.number", "http.request.method", "http.host",
               "http.request.uri", "http.response.code",
               "http.authorization", "dns.qry.name"]
-    rows = ctx.tshark.fields(str(path), fields, "http or dns", limit=5_000)
+    rows = ctx.tshark.fields(str(path), fields, "http or dns")
+    rows = rows[:5_000]
     http_rows = [row for row in rows if len(row) > 1 and row[1]]
     dns_rows = [row for row in rows if len(row) > 6 and row[6]]
     if http_rows:

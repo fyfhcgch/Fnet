@@ -240,7 +240,14 @@ class Handler(BaseHTTPRequestHandler):
     def _token_ok(self) -> bool:
         supplied = (self.headers.get("X-Fnet-Token")
                     or (self._query().get("token") or [""])[0])
-        return secrets.compare_digest(supplied, self.app.token)
+        # ``secrets.compare_digest`` raises TypeError on non-ASCII ``str``
+        # ("comparing strings with non-ASCII characters is not supported"),
+        # which used to surface as a *pre-auth* 500 that echoed the exception
+        # text.  Comparing UTF-8 bytes keeps the timing-safe comparison while
+        # letting any attacker-controlled input simply fail the check.
+        return secrets.compare_digest(
+            str(supplied).encode("utf-8", "replace"),
+            str(self.app.token).encode("utf-8", "replace"))
 
     def _declared_body(self) -> int:
         try:
@@ -359,8 +366,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._log_tail()
             return self._error("未找到", 404)
         except Exception as exc:  # noqa: BLE001 - return a clean API error
+            # The detail (absolute paths, argv, tool stderr) stays in the log:
+            # echoing it would leak local layout to anyone holding the token.
             logger.error(f"HTTP GET {path} 失败: {exc}")
-            return self._error(str(exc), 500)
+            return self._error("服务器内部错误，详情见日志", 500)
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
@@ -478,23 +487,33 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(str(exc), 400)
         except Exception as exc:  # noqa: BLE001
             logger.error(f"HTTP POST {path} 失败: {exc}")
-            return self._error(str(exc), 500)
+            return self._error("服务器内部错误，详情见日志", 500)
         finally:
             self._drain_body()
 
     # -- static --------------------------------------------------------
     def _index(self) -> None:
         template = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        # A fresh nonce per response: the one inline <script> that carries the
+        # token gets it, and only that script.  ``'unsafe-inline'`` is gone from
+        # ``script-src``, so a capture-derived string that slips past one of
+        # app.js's innerHTML escapes can no longer inject a <script> tag.
+        nonce = secrets.token_urlsafe(18)
         html = (template
+                .replace("__NONCE__", nonce)
                 .replace("__TOKEN__", self.app.token)
                 .replace("__VERSION__", __version__)
                 .replace("__APP__", APP_DISPLAY_NAME))
         self._send(200, html.encode("utf-8"), "text/html; charset=utf-8",
                    {"Cache-Control": "no-store",
                     "Content-Security-Policy":
-                        "default-src 'self'; style-src 'self' 'unsafe-inline'; "
-                        "script-src 'self' 'unsafe-inline'; img-src 'self' data:; "
-                        "connect-src 'self'"})
+                        "default-src 'self'; "
+                        # Inline ``style="..."`` attributes are written by
+                        # app.js (progress bars, topology colours), so styles
+                        # keep 'unsafe-inline'; scripts do not.
+                        "style-src 'self' 'unsafe-inline'; "
+                        f"script-src 'self' 'nonce-{nonce}'; "
+                        "img-src 'self' data:; connect-src 'self'"})
 
     def _favicon(self) -> None:
         for candidate in (STATIC_DIR / "favicon.ico",):
@@ -504,8 +523,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _static(self, relative: str) -> None:
         relative = urllib.parse.unquote(relative)
+        base = STATIC_DIR.resolve()
         target = (STATIC_DIR / relative).resolve()
-        if not str(target).startswith(str(STATIC_DIR.resolve())) or not target.is_file():
+        # ``startswith(str(base))`` would also accept a sibling directory that
+        # merely shares the prefix (``.../staticX/evil``); ``is_relative_to``
+        # compares whole path components.
+        if not target.is_relative_to(base) or not target.is_file():
             return self._error("未找到", 404)
         ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         self._send(200, target.read_bytes(), ctype,
@@ -831,11 +854,17 @@ class Handler(BaseHTTPRequestHandler):
         if result is None:
             return self._error("没有可用于合并报告的任务", 404)
         filename = urllib.parse.quote(result["filename"])
+        extra = {
+            "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
+            "Cache-Control": "no-store",
+        }
+        if result["content_type"].startswith("text/html"):
+            # Same hardening as /api/report: a rendered report is a document,
+            # not an app, so it must not run scripts or fetch remote resources.
+            extra["Content-Security-Policy"] = (
+                "default-src 'none'; style-src 'unsafe-inline'; img-src data:")
         self._send(200, result["content"].encode("utf-8"),
-                   result["content_type"],
-                   {"Content-Disposition":
-                    f"attachment; filename*=UTF-8''{filename}",
-                    "Cache-Control": "no-store"})
+                   result["content_type"], extra)
 
     @staticmethod
     def _log_stats(sub: str, path: str, data: dict) -> dict:

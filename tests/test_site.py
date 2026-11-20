@@ -43,6 +43,30 @@ class SiteVersionTest(unittest.TestCase):
         self.assertIn(f"{len(FEATURES)} 项功能", index)
         self.assertIn(f"{len(CATEGORIES)} 类", index)
 
+    def test_index_category_badges_match_registry(self):
+        """首页「功能一览」每张卡片的「N 项」必须等于该分类的真实功能数。
+
+        这些数字曾经漂移得很厉害（协议流量写 17 实际 18、C2 写 2 实际 4），
+        因为没有门禁。按分类名匹配，避免依赖卡片顺序。
+        """
+        from collections import Counter
+
+        counts = Counter(feature.category for feature in FEATURES)
+        names = {item["name"]: item["key"] for item in CATEGORIES}
+        index = SITE_INDEX.read_text(encoding="utf-8")
+        badges = re.findall(
+            r'<span class="badge">(\d+) 项</span>\s*<h3>([^<]+)</h3>', index)
+        self.assertEqual(len(badges), len(CATEGORIES),
+                         "功能一览应有且仅有一个卡片对应每个分类")
+        seen = set()
+        for declared, name in badges:
+            key = names.get(name)
+            self.assertIsNotNone(key, f"未知分类名: {name}")
+            self.assertEqual(int(declared), counts[key],
+                             f"分类「{name}」的卡片数字与 FEATURES 不一致")
+            seen.add(key)
+        self.assertEqual(seen, set(counts), "有分类没有出现在功能一览里")
+
     def test_pages_source_excludes_developer_files(self):
         config = SITE_CONFIG.read_text(encoding="utf-8")
         for name in ("README.md", "tests", "fnet"):

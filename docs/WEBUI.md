@@ -26,7 +26,7 @@ python3 -m fnet access.log --features checkBox_61,checkBox_64
 ├──────────┬──────────────────────────────────────────────────┤
 │ 功能侧栏 │  日志 / 结果 / 产出 / 批量 / 图表 / 历史 / 文本 / 关于 │
 │ 14 组    │  （胶囊 Tab 切换）                                │
-│ 54 功能  │                                                  │
+│ 56 功能  │                                                  │
 │ 全选/清空│  进度条 + 开始/取消按钮                            │
 └──────────┴──────────────────────────────────────────────────┘
 ```
@@ -107,14 +107,19 @@ python3 -m fnet access.log --features checkBox_61,checkBox_64
 - 默认只绑定 `127.0.0.1`，不监听公网。
 - 每次启动生成随机 token，注入 `index.html` 的 `window.FNET_TOKEN`；
   除 `/api/health` 外所有 API 都要求 `X-Fnet-Token` 或 `?token=`。
-- 静态文件路径经过 `resolve()` 与根目录前缀校验，阻止目录穿越。
+- 静态文件路径用 `Path.is_relative_to()` 校验，阻止目录穿越与同前缀兄弟目录。
 - 上传大小由 `max_upload_mb` 控制（默认 1024），只接受
   `.pcap/.pcapng/.cap/.dmp/.etl` 抓包与 `.log/.txt/.out/.jsonl/.ndjson/.json/
   .csv/.tsv` 文本日志；TLS 密钥上传（`X-Kind`）额外限制为 8 MiB，并校验
   keylog 标签或 PEM 私钥头。
 - 响应带 `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`；
-  首页 CSP 把脚本、样式与连接限制在 `self`，只额外放行注入 token 的内联脚本。
-- 服务没有“执行任意命令”的公开接口；菜单动作是固定枚举。
+  首页 CSP 为 `script-src 'self' 'nonce-<每响应随机>'`——只有内联注入 token 的
+  那一段脚本带 nonce，`'unsafe-inline'` 已移除；`style-src` 仍保留
+  `'unsafe-inline'`，因为进度条等位置使用内联 `style=`。
+- token 比较前统一编码为字节，非 ASCII 输入只会得到 401，不会触发预认证异常；
+  500 响应只返回通用文案，异常详情写日志。
+- 服务没有 shell 执行接口：菜单动作是固定枚举，外部工具一律以 argv 数组启动；
+  但 `plugin_add`/`plugin_run` 允许用户登记自己的工具命令（见 `docs/PLUGINS.md`）。
 
 ## API 一览
 
@@ -182,7 +187,7 @@ curl -H "X-Fnet-Token: $TOKEN" -H 'Content-Type: application/json' \
 ```
 
 `pcap` 字段是通用输入路径：填 `.log`/`.txt`/`.jsonl`/`.csv` 时会创建日志任务，
-`features` 可传日志复选框（如 `checkBox_61`），省略时自动使用 4 项日志功能。
+`features` 可传日志复选框（如 `checkBox_61`），省略时自动使用 5 项日志功能。
 `features` 也可以传 handler（`text_scan.keyword_scan`），或使用
 `handlers` 字段。返回：
 

@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from fnet.utils.pcap import hex_to_bytes
+
 __all__ = [
     "Chunk", "decode_chunk", "byte_profile", "decode_assembled",
     "parse_sequence", "reassemble", "group_sessions",
@@ -106,15 +108,8 @@ def _plausible(data: bytes) -> bool:
 
 
 def _hex_bytes(value: str) -> bytes:
-    cleaned = re.sub(r"(?i)0x|[\s:,.-]", "", value or "")
-    if len(cleaned) % 2:
-        cleaned = cleaned[:-1]
-    if not cleaned or not _HEX.fullmatch(cleaned):
-        return b""
-    try:
-        return bytes.fromhex(cleaned)
-    except ValueError:
-        return b""
+    """解析十六进制串，语义统一到 :func:`fnet.utils.pcap.hex_to_bytes`。"""
+    return hex_to_bytes(value)
 
 
 def _as_float(value: Any) -> float:

@@ -26,8 +26,8 @@ Text files
 
     注意 ``name = regex`` 的拆分规则：在第一个 ``=`` / ``:`` 处切开，左侧是
     规则名、右侧是正则表达式。想匹配字面量 ``password=`` 时必须转义等号，
-    写成 ``password\=``（或 ``password[=]``）；直接写 ``password=\w+`` 得到的
-    是名为 ``password``、正则为 ``\w+`` 的规则（几乎匹配一切），这是本语法
+    写成 ``password\\=``（或 ``password[=]``）；直接写 ``password=\\w+`` 得到的
+    是名为 ``password``、正则为 ``\\w+`` 的规则（几乎匹配一切），这是本语法
     最常见的误用。
 
 Supported conditions: ``any of them``, ``all of them``, ``N of them`` and

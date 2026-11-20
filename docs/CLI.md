@@ -9,17 +9,30 @@ Fnet 除了本地 WebUI（见 [docs/WEBUI.md](WEBUI.md)），还提供三种命�
 
 ```bash
 python3 -m fnet -C capture.pcapng                          # 默认勾选项
-python3 -m fnet -C access.log                              # 日志默认 4 项
+python3 -m fnet -C access.log                              # 日志默认 5 项
 python3 -m fnet -C capture.pcapng --features checkBox_10,http.extract
 python3 -m fnet -C capture.pcapng --json                   # 机器可读输出
 ```
 
 `-C` 的输入既可以是 pcap/pcapng 抓包，也可以是 `.log`/`.txt`/`.out`/`.jsonl`/
 `.ndjson`/`.json`/`.csv`/`.tsv` 文本日志。日志任务使用内置解析器并默认选中
-“日志分析”分类的 4 项功能，不依赖 `tshark`。
+“日志分析”分类的 5 项功能，不依赖 `tshark`。
 
 完整参数见 `python3 -m fnet --help` 与 README 的「无界面分析」一节；
 `--shards` 分片与 `--resume` 断点续跑见 [docs/ARCHITECTURE.md](ARCHITECTURE.md)。
+
+## tshark 结果缓存
+
+tshark 字段提取按「命令 + 抓包大小/mtime」缓存成 TSV，默认上限 **512 MB /
+14 天**，超出后按最近最少使用淘汰（命中时会刷新访问时间，常用条目不会被误删）。
+上限可用 `config.ini` 的 `tshark_cache_max_mb` / `tshark_cache_ttl_days` 调整，
+填 `0` 关闭对应限制；也可以随时手动清理：
+
+```bash
+python3 -m fnet --clean-cache
+```
+
+缓存只影响速度，删掉不会丢任何分析结果。
 
 ## 实时抓包与 PCAP-over-IP
 

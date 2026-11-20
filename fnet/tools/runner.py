@@ -29,17 +29,47 @@ IS_WINDOWS = sys.platform.startswith("win")
 IS_MACOS = sys.platform == "darwin"
 
 #: ``tshark -G fields`` is expensive, cache the valid names per binary.
+#: A missing entry means "unknown"; ``set()`` means "probed, tshark knows
+#: nothing" and is a valid cache entry.
 _FIELD_CACHE: dict[str, set[str]] = {}
+
+#: Appended to a field value cut down to ``TShark.max_field_bytes``.
+TRUNCATION_MARKER = "…[已截断]"
+
+#: Diagnostic lines tshark/dumpcap print on stderr.  :func:`run` merges stderr
+#: into its output so callers can show the tail of a failure, therefore the
+#: parsers must not mistake these for data rows.
+_TOOL_NOISE_PREFIXES = (
+    "Running as user ",
+    "tshark: ",
+    "wireshark: ",
+    "dumpcap: ",
+)
 
 
 def _exe(name: str) -> str:
     return name + ".exe" if IS_WINDOWS else name
 
 
+def _is_executable(path: Path) -> bool:
+    """True when ``path`` is a file we are allowed to execute.
+
+    Windows has no execute bit, so a regular file is enough there; on POSIX an
+    unreadable/executable-less decoy must never shadow a real install.
+    """
+    try:
+        if not path.is_file():
+            return False
+    except OSError:
+        return False
+    if os.name == "nt":
+        return True
+    return os.access(path, os.X_OK)
+
+
 def _candidates(name: str) -> list[Path]:
     exe = _exe(name)
     paths = [
-        Path(name),
         TOOLS_DIR / exe,
         TOOLS_DIR / name / exe,
         PROJECT_ROOT / "plugins" / name / exe,
@@ -60,6 +90,10 @@ def _candidates(name: str) -> list[Path]:
         paths += [
             Path("/usr/bin") / exe,
             Path("/usr/local/bin") / exe,
+            # tshark 在 Debian/Ubuntu 上装在 /usr/sbin；用户 $PATH 不含该目录时
+            # 需要这里兜底。
+            Path("/usr/sbin") / exe,
+            Path("/usr/local/sbin") / exe,
             Path("/snap/bin") / exe,
             Path("/var/lib/flatpak/exports/bin") / exe,
         ]
@@ -67,15 +101,22 @@ def _candidates(name: str) -> list[Path]:
 
 
 def find_tool(name: str, configured: str = "") -> str | None:
+    """Resolve an external tool, preferring trustworthy locations.
+
+    Order: the configured override, then ``$PATH``, then the bundled/portable
+    and per-platform directories.  A same-named file in the *current working
+    directory* is never picked up implicitly (that used to shadow
+    ``/usr/bin/tshark``), and every candidate must be executable.
+    """
     if configured:
         candidate = Path(configured).expanduser()
-        if candidate.is_file() and os.access(candidate, os.X_OK):
+        if _is_executable(candidate):
             return str(candidate)
     found = shutil.which(name)
     if found:
         return found
     for path in _candidates(name):
-        if path.is_file():
+        if _is_executable(path):
             return str(path)
     return None
 
@@ -131,6 +172,18 @@ def run(cmd: list[str], timeout: int = 600, stdin: bytes | None = None,
 
     ``cancel`` is polled while the child runs so long jobs (aircrack-ng,
     hashcat, pyrdp) can be aborted from the WebUI.
+
+    ``stderr`` is merged into the returned text on purpose: callers show the
+    tail of the output when a tool fails, and tshark's diagnostics would
+    otherwise disappear.  Parsers that expect tab-separated data rows must
+    therefore ignore :data:`_TOOL_NOISE_PREFIXES` lines (see
+    :meth:`TShark.fields`).
+
+    ``stdin`` is handed to the *first* ``communicate`` call only; the
+    following polls pass ``None`` because re-sending the payload raised
+    ``ValueError: Cannot send input after starting communication`` while it
+    was still being flushed.  ``timeout <= 0`` disables the watchdog, and the
+    child is always killed on timeout/cancel so no orphan survives.
     """
     if echo:
         logger.info("执行: " + " ".join(str(c) for c in cmd))
@@ -151,28 +204,84 @@ def run(cmd: list[str], timeout: int = 600, stdin: bytes | None = None,
     except OSError as exc:
         return 126, f"无法执行 {cmd[0]}: {exc}"
 
-    timer = threading.Timer(timeout, proc.kill)
-    timer.daemon = True
-    timer.start()
+    expired = threading.Event()
+
+    def _kill_on_timeout() -> None:
+        expired.set()
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+    timer = None
+    if timeout and timeout > 0:
+        timer = threading.Timer(timeout, _kill_on_timeout)
+        timer.daemon = True
+        timer.start()
+    out: bytes | None = b""
+    # ``communicate`` writes the payload incrementally from its selector loop,
+    # so the first poll gets ``stdin`` and later polls must pass ``None``:
+    # re-sending it raised ``ValueError: Cannot send input after starting
+    # communication`` while the payload was still being flushed.
+    pending: bytes | None = stdin
     try:
         while True:
             try:
-                out, _ = proc.communicate(stdin, timeout=0.25)
+                out, _ = proc.communicate(pending, timeout=0.25)
                 break
             except subprocess.TimeoutExpired:
+                pending = None
                 if cancel is not None and cancel.is_set():
                     proc.kill()
-                    out, _ = proc.communicate()
-                    return 130, _decode(out) + "\n[已取消]"
-                if timeout and proc.poll() is None:
-                    continue
-                out, _ = proc.communicate()
-                break
+                    return 130, _decode(_drain(proc)) + "\n[已取消]"
+                if expired.is_set() or proc.poll() is not None:
+                    out = _drain(proc)
+                    break
     finally:
-        timer.cancel()
-    if proc.returncode == -9 and timeout:
+        if timer is not None:
+            timer.cancel()
+        if proc.poll() is None:
+            # 任何异常路径都不留下仍在运行的子进程。
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            _drain(proc)
+    out = out or b""
+    if proc.returncode is None:
+        # 兜底 kill 后仍未回收：绝不把这种情况报告成成功。
+        if expired.is_set():
+            return 124, _decode(out) + "\n[命令执行超时]"
+        return 1, _decode(out)
+    if proc.returncode == -9 and expired.is_set():
         return 124, _decode(out) + "\n[命令执行超时]"
     return proc.returncode or 0, _decode(out)
+
+
+def _drain(proc: subprocess.Popen, timeout: float = 5.0) -> bytes | None:
+    """Read what is left of ``proc``'s output without ever blocking forever.
+
+    A killed child whose grandchildren still hold the pipe would make a bare
+    ``communicate()`` hang, so the read is bounded and the pipes are closed
+    afterwards.  Returns the collected bytes (``None`` when unavailable).
+    """
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+        return out
+    except subprocess.TimeoutExpired:
+        for stream in (proc.stdout, proc.stderr, proc.stdin):
+            try:
+                if stream is not None:
+                    stream.close()
+            except (OSError, ValueError):
+                pass
+        try:
+            proc.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return None
+    except (OSError, ValueError):
+        return None
 
 
 def _decode(data: bytes | None) -> str:
@@ -193,6 +302,129 @@ def _decode_field(value: str) -> str:
     return value
 
 
+def _first_diagnostic(text: str) -> str:
+    """First non-empty, non-noise line of a failed tool run."""
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith(_TOOL_NOISE_PREFIXES):
+            return stripped
+    return ""
+
+
+def _truncate_bytes(value: str, limit: int) -> str:
+    """Cut ``value`` to at most ``limit`` UTF-8 bytes, keeping text intact.
+
+    Slicing by characters (``value[:limit]``) let a CJK cell occupy up to
+    three bytes per character and blow past the byte cap, so the cut is done
+    on the encoded form and backed off to a character boundary.  Values that
+    already fit are returned unchanged; cut values get
+    :data:`TRUNCATION_MARKER` appended.
+    """
+    if limit <= 0:
+        return value
+    encoded = value.encode("utf-8", "replace")
+    if len(encoded) <= limit:
+        return value
+    clipped = encoded[:limit]
+    while clipped:
+        try:
+            return clipped.decode("utf-8") + TRUNCATION_MARKER
+        except UnicodeDecodeError:
+            clipped = clipped[:-1]
+    return TRUNCATION_MARKER
+
+
+#: 默认缓存上限。``tshark`` 每个唯一命令写一个 TSV，长时间使用会无限增长
+#: （实测单机积累到 967 MB / 1489 文件），因此写入后按 LRU 修剪。
+DEFAULT_CACHE_MAX_MB = 512
+DEFAULT_CACHE_TTL_DAYS = 14
+
+
+def prune_cache(directory: Path, max_bytes: int = 0,
+                ttl_seconds: float = 0, now: float | None = None
+                ) -> tuple[int, int]:
+    """Evict old/oversized files from ``directory``; return ``(count, bytes)``.
+
+    Two independent limits are applied:
+
+    * **TTL** — anything untouched for longer than ``ttl_seconds`` goes first,
+      because a stale TSV is useless: the cache key already contains the
+      source ``mtime``/``size``.
+    * **size cap** — if the survivors still exceed ``max_bytes``, the least
+      recently used ones are dropped until the total fits.
+
+    Both limits are opt-in (``0`` disables one), so callers can run a pure TTL
+    sweep or a pure size sweep.  Errors are swallowed: cache maintenance must
+    never break an analysis.
+    """
+    removed = freed = 0
+    try:
+        entries = [entry for entry in directory.iterdir()
+                   if entry.is_file() and entry.suffix == ".tsv"]
+    except OSError:
+        return 0, 0
+    reference = time.time() if now is None else now
+
+    kept: list[tuple[float, int, Path]] = []
+    for entry in entries:
+        try:
+            stat = entry.stat()
+        except OSError:
+            continue
+        if ttl_seconds > 0 and reference - stat.st_mtime > ttl_seconds:
+            try:
+                entry.unlink()
+                removed += 1
+                freed += stat.st_size
+            except OSError:
+                pass
+            continue
+        kept.append((stat.st_mtime, stat.st_size, entry))
+
+    if max_bytes > 0:
+        total = sum(size for _, size, _ in kept)
+        if total > max_bytes:
+            for _, size, entry in sorted(kept):  # oldest first
+                if total <= max_bytes:
+                    break
+                try:
+                    entry.unlink()
+                    removed += 1
+                    freed += size
+                    total -= size
+                except OSError:
+                    pass
+    return removed, freed
+
+
+#: 缓存维护的节流状态：``{目录: 上次修剪的 monotonic 时间}``。
+#: 每次写缓存都全目录 ``stat`` 在 1489 文件时约 3 ms，但没必要；每 5 分钟
+#: 修剪一次足够，也避免多个 worker 线程同时扫目录。
+_CACHE_MAINTENANCE_LOCK = threading.Lock()
+_CACHE_LAST_PRUNE: dict[str, float] = {}
+_CACHE_PRUNE_INTERVAL = 300.0
+
+
+def _schedule_cache_maintenance(directory: Path, max_bytes: int = 0,
+                                ttl_seconds: float = 0) -> None:
+    """按节流间隔修剪缓存目录；永不抛异常。"""
+    key = str(directory)
+    now = time.monotonic()
+    with _CACHE_MAINTENANCE_LOCK:
+        last = _CACHE_LAST_PRUNE.get(key)
+        if last is not None and now - last < _CACHE_PRUNE_INTERVAL:
+            return
+        _CACHE_LAST_PRUNE[key] = now
+    try:
+        removed, freed = prune_cache(directory, max_bytes=max_bytes,
+                                     ttl_seconds=ttl_seconds)
+    except Exception:  # noqa: BLE001 - 缓存维护绝不影响分析
+        return
+    if removed:
+        logger.debug(f"tshark 缓存清理: 删除 {removed} 个文件，"
+                     f"释放 {freed / 1024 / 1024:.1f} MB")
+
+
 @dataclass
 class TShark:
     path: str
@@ -201,6 +433,8 @@ class TShark:
     timeout: int = 600
     max_field_bytes: int = 262_144
     max_rows: int = 2_000_000
+    cache_max_bytes: int = DEFAULT_CACHE_MAX_MB * 1024 * 1024
+    cache_ttl_seconds: float = DEFAULT_CACHE_TTL_DAYS * 86_400
 
     def _cache_dir(self) -> Path:
         # Resolve at call time so tests can patch fnet.paths.CACHE_DIR.
@@ -224,14 +458,20 @@ class TShark:
     @staticmethod
     def _read_cache(path: Path) -> str | None:
         try:
-            if path.is_file() and path.stat().st_size >= 0:
-                return path.read_text(encoding="utf-8", errors="replace")
+            if path.is_file():
+                text = path.read_text(encoding="utf-8", errors="replace")
+                # 命中即"使用"：刷新 mtime，让 TTL/LRU 按最后访问时间淘汰，
+                # 而不是按写入时间（同一份抓包反复分析是常态）。
+                try:
+                    os.utime(path, None)
+                except OSError:
+                    pass
+                return text
         except OSError:
             return None
         return None
 
-    @staticmethod
-    def _write_cache(path: Path, text: str) -> None:
+    def _write_cache(self, path: Path, text: str) -> None:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             handle, name = tempfile.mkstemp(prefix=path.name, dir=path.parent)
@@ -244,6 +484,9 @@ class TShark:
                     os.unlink(name)
             except OSError:
                 pass
+        else:
+            _schedule_cache_maintenance(path.parent, self.cache_max_bytes,
+                                        self.cache_ttl_seconds)
 
     def _run_tshark(self, cmd: list[str],
                     cancel: threading.Event | None) -> tuple[int, str]:
@@ -264,24 +507,31 @@ class TShark:
                 time.sleep(min(0.5 * (attempt + 1), 2.0))
         return code, out
 
-    def known_fields(self) -> set[str]:
+    def known_fields(self) -> set[str] | None:
         """Field names this tshark understands (cached, one spawn per run).
 
         Requesting an unknown ``-e`` field makes tshark abort without any
         output, which used to silently disable a whole analysis.  The field
         list is therefore filtered and the dropped columns are re-inserted as
         empty strings so callers keep positional alignment.
+
+        Returns ``None`` when the probe failed, i.e. "unknown".  A failure is
+        never cached: caching the empty set made ``fields()`` query every
+        field, tshark abort and the analysis stay empty for the rest of the
+        process.  ``set()`` therefore means "probed successfully, tshark
+        knows no fields" and must not be confused with ``None``.
         """
-        cached = _FIELD_CACHE.get(self.path)
-        if cached is not None:
-            return cached
-        names: set[str] = set()
+        if self.path in _FIELD_CACHE:
+            return _FIELD_CACHE[self.path]
         code, out = run([self.path, "-G", "fields"], timeout=120, echo=False)
-        if code == 0:
-            for line in out.splitlines():
-                parts = line.split("\t")
-                if len(parts) > 2 and parts[0] == "F":
-                    names.add(parts[2])
+        if code != 0:
+            logger.debug(f"tshark -G fields 失败（退出码 {code}），字段列表未知")
+            return None
+        names: set[str] = set()
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) > 2 and parts[0] == "F":
+                names.add(parts[2])
         _FIELD_CACHE[self.path] = names
         return names
 
@@ -290,7 +540,7 @@ class TShark:
                cancel: threading.Event | None = None,
                two_pass: bool = False) -> list[list[str]]:
         known = self.known_fields()
-        queried = [name for name in fields if not known or name in known]
+        queried = [name for name in fields if known is None or name in known]
         dropped = [name for name in fields if name not in queried]
         if dropped:
             logger.debug("tshark 不支持字段，已忽略: " + ", ".join(dropped))
@@ -320,19 +570,23 @@ class TShark:
                 self._write_cache(cache_path, out)
 
         if code != 0 and not out.strip():
-            logger.error(out.strip() or f"tshark 退出码 {code}")
+            logger.error(f"tshark 退出码 {code}")
             return []
         if code != 0:
             # tshark failed (bad filter/field, unreadable file).  Its error
             # text must never leak into the tab-separated data rows, so log
             # it and treat the whole run as empty instead of parsing it.
-            logger.error(out.strip().splitlines()[0]
-                         or f"tshark 退出码 {code}")
+            logger.error(_first_diagnostic(out) or f"tshark 退出码 {code}")
             return []
         rows = []
         truncated = 0
         for line in out.splitlines():
             if not line.strip():
+                continue
+            if line.startswith(_TOOL_NOISE_PREFIXES) and not line.startswith('"'):
+                # tshark/dumpcap 的诊断行（root 警告等）不是数据记录。
+                # 真正的数据行被 -E quote=d 包成 "..."，不会被误伤。
+                logger.debug("忽略工具诊断行: " + line)
                 continue
             values = [_decode_field(v) for v in line.split("\t")]
             if dropped:
@@ -348,10 +602,10 @@ class TShark:
             if self.max_field_bytes:
                 limited: list[str] = []
                 for value in values:
-                    if len(value.encode("utf-8", "replace")) > self.max_field_bytes:
-                        value = value[:self.max_field_bytes] + "…[已截断]"
+                    clipped = _truncate_bytes(value, self.max_field_bytes)
+                    if clipped != value:
                         truncated += 1
-                    limited.append(value)
+                    limited.append(clipped)
                 values = limited
             rows.append(values)
             if self.max_rows and len(rows) >= self.max_rows:
@@ -428,6 +682,13 @@ class ToolBox:
                 0, self.config.get_int("tshark_max_field_kb", fallback=256) * 1024),
             max_rows=max(
                 0, self.config.get_int("tshark_max_rows", fallback=2_000_000)),
+            cache_max_bytes=max(
+                0, self.config.get_int("tshark_cache_max_mb",
+                                       fallback=DEFAULT_CACHE_MAX_MB)) * 1024 * 1024,
+            cache_ttl_seconds=max(
+                0.0, float(self.config.get_int(
+                    "tshark_cache_ttl_days",
+                    fallback=DEFAULT_CACHE_TTL_DAYS))) * 86_400,
         )
 
     def javapath(self) -> str:

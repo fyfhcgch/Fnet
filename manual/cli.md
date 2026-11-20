@@ -13,14 +13,14 @@ description: Fnet 无界面用法：参数、功能选择、参数传递、批�
 
 ```bash
 python3 -m fnet -C capture.pcapng                    # 抓包：只跑默认勾选项
-python3 -m fnet -C access.log                        # 日志：默认跑 4 项日志功能
-python3 -m fnet -C capture.pcapng --all              # 全部 54 个功能
+python3 -m fnet -C access.log                        # 日志：默认跑 5 项日志功能
+python3 -m fnet -C capture.pcapng --all              # 全部 56 个功能
 python3 -m fnet -C capture.pcapng --features checkBox_10,http.extract
 ```
 
 `-C` 接受 pcap / pcapng 抓包，也接受 `.log` / `.txt` / `.jsonl` / `.csv` 文本
 日志。不带 `--features` 时，抓包默认勾选 2 项（关键字检测、HTTP 数据提取），
-日志默认勾选“日志分析”分类的 4 项；显式 `--features` / `--all` 会覆盖默认值。
+日志默认勾选“日志分析”分类的 5 项；显式 `--features` / `--all` 会覆盖默认值。
 日志分析使用内置解析器，不需要 `tshark`。
 
 输出结构：
@@ -47,7 +47,7 @@ HTML 报告: .../report.html
 | `capture` | 要分析的抓包（pcap / pcapng / cap / dmp / etl）或文本日志（.log / .txt / .jsonl / .csv） |
 | `-C`, `--cli` | 不启动 WebUI，直接在终端运行 |
 | `--features a,b` | 逗号分隔的功能，可写复选框编号或功能名 |
-| `--all` | 运行全部 54 个功能 |
+| `--all` | 运行全部 56 个功能 |
 | `--param KEY=VALUE` | 传给功能的参数，可重复 |
 | `--json` | 结束后只向 stdout 输出 JSON（任务、findings、统计与产出） |
 | `--rules PATH` | 导入正则 / YARA 子集规则文件，命中写入 findings |
@@ -62,6 +62,7 @@ HTML 报告: .../report.html
 | `--list-features` | 列出全部功能（`*` 为默认勾选） |
 | `--list-tools` | 列出依赖的外部工具 |
 | `--doctor` | 检查 tshark / java / hashcat 等环境 |
+| `--clean-cache` | 按 TTL 与容量上限清理 tshark 结果缓存后退出 |
 | `--version` | 显示版本 |
 | `--host` / `--port` | 仅 WebUI 模式：监听地址与端口 |
 | `--no-browser` | 仅 WebUI 模式：不自动打开浏览器 |
@@ -95,6 +96,10 @@ HTML 报告: .../report.html
 | `log_fail_ratio` | 日志异常检测 | 实体失败率阈值（默认 0.5） |
 | `log_success_regex` | 日志实体统计 | 自定义“成功”口径正则（IGNORECASE），命中即计一次成功，如 `--param log_success_regex="Key: key_"` |
 | `log_subnet_prefix` | 日志实体统计 | 网段维度的 IPv4 前缀，8–32，默认 24，非法时回退 24；IPv6 固定 /64，如 `--param log_subnet_prefix=16` |
+| `log_extra_paths` | 跨源日志关联 | 要一起关联的其它日志，逗号/分号/换行分隔，最多 8 个，如 `--param log_extra_paths=/var/log/kube-apiserver.log` |
+| `log_correlate_window` | 跨源日志关联 | 关联时间窗口（秒），默认 5，范围 0–3600 |
+| `log_cluster_gap` | 跨源日志关联 | 高危执行聚成同一活动簇的最大间隔（秒），默认 60 |
+| `log_risk_threshold` | 跨源日志关联 | 命令风险分阈值，默认 45，范围 1–100 |
 | `wordlist` | 字典类功能 | 自定义字典路径 |
 
 `--param` 的值写成 `true` / `false` 会被解析为布尔值。

@@ -13,7 +13,9 @@ from __future__ import annotations
 import datetime as _dt
 import html
 import json
+import os
 import re
+import tempfile
 from pathlib import Path
 
 from fnet.utils import codec
@@ -499,7 +501,19 @@ def _trim_logs(logs) -> list[dict]:
 # Markdown
 # ---------------------------------------------------------------------------
 def _md_cell(value) -> str:
-    return str(value).replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
+    """Escape one table cell so capture-derived text cannot become markup.
+
+    The Markdown report is meant to be read by third-party renderers (pandoc,
+    VS Code preview, a wiki), so raw ``<img src=x onerror=...>`` must not
+    survive: ``<``/``>``/``&`` are escaped alongside the table delimiters.
+    ``&`` has to go first, otherwise the entities introduced for ``<``/``>``
+    would be escaped a second time.
+    """
+    return (str(value)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\\", "\\\\").replace("|", "\\|").replace("\n", " "))
 
 
 def _md_fence(text: str) -> str:
@@ -885,6 +899,41 @@ def render_html(meta: dict, logs, artifacts=None, sections=None,
     return "".join(parts)
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` without ever leaving a truncated file.
+
+    ``report.html`` is served straight from the job directory by
+    ``/api/download``; an in-place ``write_text`` interrupted mid-render (or
+    racing a concurrent read) would publish a half-written document.  The
+    temp file is created in the same directory so ``os.replace`` stays atomic
+    on the same filesystem.
+    """
+    path = Path(path)
+    handle, temp = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        # ``mkstemp`` creates 0600.  Keep the previous mode when replacing an
+        # existing report, else use the usual 0644 -- deriving it from the old
+        # file avoids flipping the process-wide umask, which would be a race
+        # between the worker thread and HTTP threads.
+        try:
+            mode = path.stat().st_mode & 0o777
+        except OSError:
+            mode = 0o644
+        os.chmod(temp, mode)
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
 def write_reports(job, logs, artifacts=None, sections=None,
                   findings=None, status=None) -> dict[str, Path]:
     """Render ``report.md`` / ``report.html`` next to a job's ``report.txt``.
@@ -913,10 +962,10 @@ def write_reports(job, logs, artifacts=None, sections=None,
     for suffix, renderer in (("md", render_markdown), ("html", render_html)):
         path = output / f"report.{suffix}"
         try:
-            path.write_text(
+            _atomic_write(
+                path,
                 renderer(meta, logs, artifacts, sections, generated=generated,
-                         findings=findings),
-                encoding="utf-8")
+                         findings=findings))
             written[suffix] = path
         except OSError:
             continue

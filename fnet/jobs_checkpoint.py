@@ -12,10 +12,68 @@ attribute keep working.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 
 from fnet.features.registry import BY_CHECKBOX, BY_HANDLER
 from fnet.report import parse_report_text
+
+#: Statuses that only make sense while a worker process is alive.
+ACTIVE_STATUSES = ("queued", "running")
+
+
+def normalise_status(status, active: bool = False) -> str:
+    """Normalise a persisted status for a job that is no longer live.
+
+    ``queued``/``running`` are only meaningful while a worker owns the job, so
+    a ``job.json`` left behind by a crashed process must be reported as
+    ``interrupted`` (that is what :attr:`fnet.jobs.Job.can_resume` accepts).
+    ``active`` keeps the raw status for jobs still owned by this process.
+    """
+    value = str(status or "interrupted")
+    if not active and value in ACTIVE_STATUSES:
+        return "interrupted"
+    return value
+
+
+def atomic_write(path: Path, text: str, encoding: str = "utf-8") -> None:
+    """Write ``text`` to ``path`` atomically (temp file + ``os.replace``).
+
+    A crash or a concurrent writer can otherwise leave a truncated JSON file
+    behind, and every reader treats ``ValueError`` as "job does not exist" —
+    which silently deletes the job from the history.  The temporary file lives
+    in the destination directory so ``os.replace`` stays on one filesystem.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle, temp_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp")
+    os.close(handle)
+    temp = Path(temp_name)
+    try:
+        # ``mkstemp`` creates 0600; keep the previous mode when replacing an
+        # existing file instead of flipping the process-wide umask.
+        try:
+            mode = target.stat().st_mode & 0o777
+        except OSError:
+            mode = 0o644
+        os.chmod(temp_name, mode)
+        temp.write_text(text, encoding=encoding)
+        # Flush to the OS before the rename: a machine crash otherwise leaves
+        # an empty file under the final name (the rename itself is atomic).
+        try:
+            with temp.open("rb+") as stream:
+                os.fsync(stream.fileno())
+        except OSError:
+            pass  # fsync is a durability nicety, not a correctness requirement
+        os.replace(temp, target)
+    except BaseException:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def cache_dir() -> Path:
@@ -72,12 +130,10 @@ def snapshot(job) -> dict:
 def write_history(job) -> None:
     """Best-effort ``job.json`` snapshot; history must never fail a job."""
     try:
-        job.output_dir.mkdir(parents=True, exist_ok=True)
-        (job.output_dir / "job.json").write_text(
-            json.dumps(snapshot(job), ensure_ascii=False, indent=2,
-                       default=str),
-            encoding="utf-8")
-    except OSError as exc:
+        atomic_write(job.output_dir / "job.json",
+                     json.dumps(snapshot(job), ensure_ascii=False, indent=2,
+                                default=str))
+    except Exception as exc:  # noqa: BLE001 - a checkpoint is never fatal
         job.log.warn(f"任务历史写入失败: {exc}")
 
 
@@ -101,9 +157,9 @@ def load_disk_entries(active_ids: set[str]) -> dict[str, dict]:
             job_id = str(data["id"])
             if not path.parent.name == job_id:
                 continue
-            if job_id not in active_ids and data.get("status") in ("queued", "running"):
+            if job_id not in active_ids:
                 # The process exited before the job could finish.
-                data["status"] = "interrupted"
+                data["status"] = normalise_status(data.get("status"))
             entries[job_id] = data
     return entries
 
@@ -144,7 +200,10 @@ def load_from_history(job_id: str):
     job = Job(job_id, pcap, features, dict(data.get("params") or {}),
               output, created=str(data.get("created") or ""), shards=shards,
               kind=str(data.get("kind") or "pcap"))
-    job.status = str(data.get("status") or "interrupted")
+    # ``load_from_history`` has no active-id context: a persisted queued/running
+    # status always means the owning process is gone, so normalise it the same
+    # way ``load_disk_entries`` does (``Job.can_resume`` requires it).
+    job.status = normalise_status(data.get("status"))
     job.progress = int(data.get("progress") or 0)
     job.started = data.get("started")
     job.finished = data.get("finished")

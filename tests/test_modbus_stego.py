@@ -19,6 +19,7 @@ from fnet.app import build
 from fnet.config import Config
 from fnet.features import ics
 from fnet.tools.runner import find_tool
+from tests.support import patch_cache_dirs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pcap_build  # noqa: E402  (tests/pcap_build.py，纯 stdlib pcap 构造辅助)
@@ -240,14 +241,15 @@ class ModbusStegoIntegrationTest(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(prefix="fnet-modbus-it-")
         cls.pcap = Path(cls.tmp.name) / "modbus_stego.pcap"
         _write_modbus_stego_pcap(cls.pcap)
-        from unittest import mock
-        cls.patch = mock.patch("fnet.jobs.CACHE_DIR", Path(cls.tmp.name))
-        cls.patch.start()
+        cls.patches = patch_cache_dirs(cls.tmp.name)
+        for patch in cls.patches:
+            patch.start()
         cls.runtime = build(Config(Path(cls.tmp.name) / "config.ini"))
 
     @classmethod
     def tearDownClass(cls):
-        cls.patch.stop()
+        for patch in reversed(cls.patches):
+            patch.stop()
         cls.tmp.cleanup()
 
     def test_modbus_stego_end_to_end(self):

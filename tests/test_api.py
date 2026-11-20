@@ -107,7 +107,7 @@ class ApiTest(unittest.TestCase):
     def test_meta_payload(self):
         status, meta = self.json_request("/api/meta")
         self.assertEqual(status, 200)
-        self.assertEqual(len(meta["features"]), 54)
+        self.assertEqual(len(meta["features"]), 56)
         self.assertEqual(len(meta["categories"]), 14)
         self.assertEqual(meta["initial"], {"pcap": "", "features": []})
         self.assertIn("tshark", meta["tools"])

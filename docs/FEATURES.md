@@ -1,12 +1,12 @@
 # 功能说明
 
-Fnet 共 **54 个分析功能**、**14 个分类**。WebUI 侧栏按分类折叠展示；CLI 用
+Fnet 共 **56 个分析功能**、**14 个分类**。WebUI 侧栏按分类折叠展示；CLI 用
 复选框编号（`checkBox_10`）或 handler（`text_scan.keyword_scan`）选择。
 
 ```bash
 python3 -m fnet --list-features          # 带 * 的是默认勾选
 python3 -m fnet -C x.pcap --features checkBox_10,http.extract
-python3 -m fnet -C access.log            # 日志输入默认运行 4 项日志功能
+python3 -m fnet -C access.log            # 日志输入默认运行 5 项日志功能
 ```
 
 输入分为两类：**抓包**（pcap/pcapng，协议解析交给 `tshark`）与**文本日志**
@@ -16,11 +16,13 @@ python3 -m fnet -C access.log            # 日志输入默认运行 4 项日志�
 
 ## 日志分析
 
-日志任务默认选中本分类的 4 项功能；也可以显式指定：
+日志任务默认选中本分类的 5 项功能；也可以显式指定：
 
 ```bash
 python3 -m fnet -C ceph.log
 python3 -m fnet -C access.log --features checkBox_61,checkBox_63
+python3 -m fnet -C docker.log --features checkBox_65 \
+  --param log_extra_paths=/var/log/kube-apiserver.log
 ```
 
 | 复选框 | Handler | 功能 | 说明 |
@@ -29,6 +31,7 @@ python3 -m fnet -C access.log --features checkBox_61,checkBox_63
 | `checkBox_62` | `logs.entities` | 日志字段与实体统计 | 按客户端、账号、IP、网段、主机等维度统计活动量、成功次数/成功率、失败次数/失败率与活跃时段；网段维度 IPv4 默认按 /24（`log_subnet_prefix` 可调 8–32，IPv6 固定 /64）聚合，并在网段数 ≥ 2 时输出“网段成功统计”汇总 finding（`log_entities.csv`） |
 | `checkBox_63` | `logs.anomalies` | 日志失败与异常检测 | 失败/认证错误关键字、失败率异常实体、事件突增时间桶与低频异常字段值（`log_anomalies.csv`） |
 | `checkBox_64` | `logs.iocs` | 日志IOC与敏感信息 | 提取 flag、凭据、哈希、URL、域名、邮箱、密钥标识与公网/内网 IP 清单并写入结构化结果（`log_iocs.csv`） |
+| `checkBox_65` | `audit.correlate` | 跨源日志关联与执行溯源 | 从 `command`/`cmd`/`cmdline`/`argv` 等字段还原完整命令（含被通用 KV 解析器在管道符处截断的管道命令），按加权特征识别下载即执行、管道 shell、base64 解码执行、反弹 shell、nsenter/容器 socket 逃逸、集群凭据读取、持久化与痕迹清理等；只读前缀（`ls`/`cat`/`ps`…）在无强特征时自动降级。高危执行按时间间隔聚簇，再到 `log_extra_paths` 指定的其它日志里检索同窗口的**成功**记录，按“该窗口内该日志的成功记录数 + 实体 IP 稀有度”排序，输出“执行侧实体 IP ↔ 关联侧实体 IP”关联对（`audit_timeline.csv` / `audit_correlations.csv`）。兼容 Kubernetes 审计 JSON Lines 的嵌套字段（`requestObject.command` 数组、`responseStatus.code`、`sourceIPs`、`requestReceivedTimestamp`） |
 
 日志参数：`log_fail_regex`（自定义失败关键字正则）、`log_fail_threshold`
 （实体失败次数阈值）、`log_fail_ratio`（失败率阈值）、`log_success_regex`
@@ -40,6 +43,14 @@ python3 -m fnet -C access.log --features checkBox_61,checkBox_63
 参与网段统计。`log_entities.csv` 在原列末尾追加了 `成功次数`、`成功率` 两列。
 关键字检测（`checkBox_10`）在日志输入上会自动改用内置扫描，只保留 flag/编码
 规则与用户自定义关键字，避免把日志中常见的 `Key:` 字段误报为凭据。
+
+`checkBox_65` 另有 4 个参数：`log_extra_paths`（要一起关联的其它日志，逗号 /
+分号 / 换行分隔，最多 8 个；主输入始终参与，重复路径按解析后的真实路径去重，
+不存在 / 目录 / 非文本日志的文件告警后跳过）、`log_correlate_window`（关联时间
+窗口，秒，默认 5，范围 0–3600）、`log_cluster_gap`（把高危执行聚成同一“活动簇”
+的最大间隔，秒，默认 60）、`log_risk_threshold`（命令风险分阈值，默认 45，
+范围 1–100）。只给一份日志时仅做高危命令识别，并在日志中提示跨源关联需要
+`log_extra_paths`。
 
 ## 文本与关键字
 
@@ -99,7 +110,7 @@ python3 -m fnet -C x.pcap --features webshell.decrypt \
 
 | 复选框 | Handler | 功能 | 需要 | 说明 |
 | --- | --- | --- | --- | --- |
-| `checkBox_15` | `cs.analyze` | Cobalt Strike流量分析 | `cryptography` | 解析 beacon 元数据/任务，使用 `.cobaltstrike.beacon_keys` 解密 |
+| `checkBox_15` | `cs.analyze` | Cobalt Strike流量分析 | `.cobaltstrike.beacon_keys` | 解析 beacon 元数据/任务；RSA 与 AES 均为纯标准库实现，无需第三方包 |
 | `checkBox_43` | `winrm.decrypt` | WINRM流量解密 | — | 从 NTLM 认证还原 WinRM 凭据；支持 hash 或明文密码 |
 | `checkBox_55` | `meterpreter.analyze` | Meterpreter会话分析 | — | Meterpreter/metsvc TCP TLV 会话识别：命令 ID、字符串参数、异常与命令时间线；不认识的 TLV type 显示 hex |
 | `checkBox_56` | `c2ext.analyze` | Sliver/meterpreter C2扩展 | — | Sliver HTTP/DNS/mTLS beacon 识别（v1.6 ChaCha20-Poly1305 与签名前缀/gzip、v1.5/旧版 AES-GCM 回退、密钥交换、流量编码器）与 meterpreter staging/AES-128/256-CBC wire 分析；有会话密钥时解密会话载荷 |
@@ -145,6 +156,7 @@ hashcat -m 5500 ntlm_hashes.txt wordlist.txt   # NetNTLMv1
 | `checkBox_41` | `flows.gtp` | 4G/5G通信协议分析 | GTP 隧道、TEID 与异常检测 |
 | `checkBox_35` | `flows.udp` | UDP流分析 | UDP 会话与载荷；按五元组方向检测**载荷长度/包间隔隐蔽信道**；输出可能较多 |
 | `checkBox_33` | `flows.tcp` | TCP流分析 | TCP 流重组、会话统计与内容提取；按五元组方向检测**载荷长度/包间隔隐蔽信道** |
+| `checkBox_66` | `flows.scan` | 端口扫描与行为画像 | 识别 SYN 半开扫描、SYN 扫描（部分端口开放）、全连接扫描与批量端口探测（IPv4/IPv6 均可）：按「源 → 目标」聚合半开探针数、开放/拒绝端口、完成握手数、目的端口集合（压缩成区间）与探测速率；开放端口取反向 SYN+ACK 的源端口（而非扫描器临时端口），按端口数/拒绝比例/零数据换手给出「高/中」置信度，并列出命中的常见服务名，结果落盘 `scan_summary.tsv` |
 | `checkBox_44` | `arp.analyze` | ARP协议分析 | IP/MAC 冲突、免费 ARP 与异常字段 |
 | `checkBox_48` | `ldap.analyze` | LDAP流量分析 | LDAP 绑定凭据/SASL 机制、查询 base/filter、条目属性（AD 账号等）与 StartTLS 告警 |
 | `checkBox_49` | `smb.analyze` | SMB流量分析 | SMB2/3 共享与会话、NTLM 身份、文件读写还原落盘、加密/压缩告警、解密 SMB3 加密流量（会话密钥写入 `smb3_keys.txt`） |
@@ -328,7 +340,7 @@ WebUI 的“文件 → 导出分析报告…”可以勾选章节（`summary`、
 - `findings.csv`：UTF-8 CSV，可直接用表格软件打开。
 
 当前会产出结果的功能包括关键字检测、HTTP 提取与文件导出、NTLM、Kerberos、
-SQL 盲注、DNS、FTP/MySQL、Shiro 与 Webshell 解密等。WebUI 的“分析结果”
+SQL 盲注、DNS、FTP/MySQL、Shiro 与 Webshell 解密、跨源日志关联等。WebUI 的“分析结果”
 页支持按类别/级别筛选、关键字搜索、点击表头排序、复制与导出 CSV；
 `GET /api/findings?job=<id>` 返回同样的数据，报告中的“关键发现”章节也会
 优先使用这张表。

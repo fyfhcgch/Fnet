@@ -226,6 +226,14 @@
       </details>
 
       <details class="settings">
+        <summary data-i18n="settings_log">日志关联设置</summary>
+        <div class="field"><label>关联日志路径（逗号分隔）</label><input id="log_extra_paths" placeholder="/var/log/kube-apiserver.log,/var/log/ceph.log" spellcheck="false"></div>
+        <div class="field"><label>关联时间窗口（秒）</label><input id="log_correlate_window" value="5" inputmode="numeric"></div>
+        <div class="field"><label>活动簇间隔（秒）</label><input id="log_cluster_gap" value="60" inputmode="numeric"></div>
+        <div class="field"><label>命令风险阈值（1–100）</label><input id="log_risk_threshold" value="45" inputmode="numeric"></div>
+      </details>
+
+      <details class="settings">
         <summary data-i18n="settings_general">通用分析设置</summary>
         <div class="field"><label>自定义关键字（分号分隔）</label><input id="keywords" placeholder="flag{;ctf;key;504b0304" spellcheck="false"></div>
         <div class="field"><label>字典路径</label><input id="wordlist" spellcheck="false"></div>
@@ -483,13 +491,30 @@
         <div class="about">
           <h3>Fnet <span id="about-version"></span></h3>
           <p>Fnet 是一个面向 CTF 与流量取证的开源工具箱，把协议解析、凭据提取、
-            文件还原与解密流程集中到一个本地 WebUI 和对应的命令行里。分析全部
-            在本机完成，不执行抓包或日志中的代码。</p>
+            文件还原、隐写/隐蔽信道检测与解密流程集中到一个本地 WebUI 和对应的
+            命令行里。输入既可以是 pcap / pcapng 抓包，也可以是
+            <code>.log</code> / <code>.txt</code> / <code>.jsonl</code> /
+            <code>.csv</code> 文本日志；抓包解析交给 tshark，日志由内置解析器
+            处理，运行时不需要任何第三方 Python 包。</p>
+          <p>分析全部在本机完成，不上传任何文件，也不执行抓包或日志中的代码。</p>
           <div class="about-grid">
+            <div class="card">
+              <h4>能做什么</h4>
+              <ul>
+                <li>HTTP / DNS / ICMP / TCP / UDP 等常规流量与会话梳理</li>
+                <li>Redis / MongoDB / PostgreSQL / LDAP / SMB2 / WebSocket / HTTP2 深层解析</li>
+                <li>凭据与哈希提取（NTLM / Kerberos / Basic / 明文口令）</li>
+                <li>文件还原，以及 Webshell / Shiro / TLS / RDP 解密</li>
+                <li>端口扫描与主机行为画像、隐写与隐蔽信道检测</li>
+                <li>日志时间线、实体失败率、异常突增与跨源关联</li>
+              </ul>
+            </div>
             <div class="card">
               <h4>开源与许可</h4>
               <p>本项目以 Apache-2.0 许可发布。你可以自由修改、分发，但请保留来源说明与许可证文本。</p>
-              <p><a href="https://github.com/fyfhcgch/Fnet" target="_blank" rel="noreferrer noopener">github.com/fyfhcgch/Fnet</a></p>
+              <p><a href="https://github.com/fyfhcgch/Fnet" target="_blank" rel="noreferrer noopener">github.com/fyfhcgch/Fnet</a><br>
+                <a href="https://fyfhcgch.github.io/Fnet/" target="_blank" rel="noreferrer noopener">在线教程与功能介绍</a><br>
+                <a href="https://github.com/fyfhcgch/Fnet/tree/master/docs" target="_blank" rel="noreferrer noopener">使用文档（CLI / 功能 / WebUI）</a></p>
             </div>
             <div class="card">
               <h4>运行时信息</h4>
@@ -558,7 +583,7 @@
   </div>
 </div>
 
-<script>
+<script nonce="__NONCE__">
   window.FNET_TOKEN = "__TOKEN__";
   window.FNET_VERSION = "__VERSION__";
   window.FNET_APP = "__APP__";

@@ -7,7 +7,6 @@ instance passed in.
 """
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 
@@ -38,19 +37,25 @@ def frame_count(pcap: str, tshark) -> int:
 
 
 def clip_shard(job, tshark, start: int, end: int,
-               shard_index: int) -> Path | None:
-    """Write frames ``start..end`` to a temporary pcapng for one shard."""
+               shard_index: int, cancel=None) -> Path | None:
+    """Write frames ``start..end`` to a temporary pcapng for one shard.
+
+    走 :func:`fnet.tools.runner.run` 而不是裸 ``subprocess.run``，这样切片
+    与其它 tshark 调用共享超时/重试语义，并且能被用户的"取消"打断。
+    """
     if tshark is None:
         return None
+    from fnet.tools.runner import run
+
     target = job.output_dir / "shards" / f"shard-{shard_index}-{start}-{end}.pcapng"
-    target.parent.mkdir(parents=True, exist_ok=True)
     try:
-        code, out = subprocess.run(
-            [tshark.path, "-r", job.pcap, "-Y",
-             f"frame >= {start} && frame <= {end}", "-w", str(target)],
-            capture_output=True, text=True, timeout=3600).returncode, ""
-    except (OSError, subprocess.SubprocessError):
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
         return None
+    code, _out = run(
+        [tshark.path, "-r", job.pcap, "-Y",
+         f"frame >= {start} && frame <= {end}", "-w", str(target)],
+        timeout=getattr(tshark, "timeout", 3600), cancel=cancel, echo=False)
     if code != 0 or not target.is_file():
         return None
     return target

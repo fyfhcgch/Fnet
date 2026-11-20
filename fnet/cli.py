@@ -26,17 +26,35 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
 from fnet import APP_DISPLAY_NAME, __version__
 from fnet.app import build, describe_environment
 from fnet.features.registry import (
-    CATEGORIES, BY_CHECKBOX, BY_HANDLER, FEATURES, default_features_for,
+    CATEGORIES, BY_CHECKBOX, BY_HANDLER, FEATURES, default_features_for, resolve,
 )
 from fnet.logger import logger
 from fnet.paths import USER_CONFIG
 from fnet.utils.logfile import classify_input
+
+
+class FeatureSelectionError(SystemExit, ValueError):
+    """``--features`` 里有无法解析的条目；CLI 统一映射为退出码 2。
+
+    同时继承 :class:`SystemExit`（历史上 ``select_features`` 就是这么失败的，
+    第三方脚本用 ``except SystemExit`` 兼容）和 :class:`ValueError`，让所有
+    调用方都能用同一种异常映射到退出码 2。
+    """
+
+    def __init__(self, message: str) -> None:
+        # 只走 SystemExit.__init__，避免 ValueError 的参数元组覆盖 ``code``。
+        SystemExit.__init__(self, message)
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
 
 
 def _ensure_utf8_streams() -> None:
@@ -71,7 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-browser", action="store_true", help="启动后不自动打开浏览器")
     parser.add_argument("--config", default=None, help="使用指定的 config.ini")
     parser.add_argument("--features", default="",
-                        help="逗号分隔的功能（checkBox_10 或 http.extract）；缺省按输入类型选择（抓包 2 项、日志 4 项）")
+                        help="逗号分隔的功能（checkBox_10 或 http.extract）；缺省按输入类型选择（抓包 2 项、日志 5 项）")
     parser.add_argument("--all", action="store_true", help=f"运行全部 {len(FEATURES)} 个功能")
     parser.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
                         help="传给分析功能的额外参数，可重复")
@@ -100,6 +118,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Kerberos 账号密码，用于派生密钥并解密响应")
     parser.add_argument("--kerberos-key", default="",
                         help="Kerberos 原始密钥（hex），优先级最高")
+    parser.add_argument("--clean-cache", action="store_true",
+                        help="清理 tshark 结果缓存（按 TTL 与容量上限）后退出")
     parser.add_argument("--list-features", action="store_true", help="列出全部功能后退出")
     parser.add_argument("--list-tools", action="store_true", help="列出依赖的外部工具后退出")
     parser.add_argument("--doctor", action="store_true", help="检查运行环境后退出")
@@ -144,11 +164,40 @@ def list_features() -> None:
                   f"{feature.handler:<26s} {feature.title}")
             if feature.needs:
                 print(f"{'':<14s} 需要: {', '.join(feature.needs)}")
-    print("\n* = 默认勾选（抓包）；日志输入默认勾选 checkBox_61–checkBox_64")
+    print("\n* = 默认勾选（抓包）；日志输入默认勾选 checkBox_61–checkBox_65")
+
+
+def clean_cache() -> int:
+    """``--clean-cache``：按 TTL 与容量上限清理 tshark 结果缓存。"""
+    from fnet import paths as fnet_paths
+    from fnet.tools.runner import (DEFAULT_CACHE_MAX_MB, DEFAULT_CACHE_TTL_DAYS,
+                                   prune_cache)
+
+    directory = Path(fnet_paths.CACHE_DIR) / "tshark"
+    if not directory.is_dir():
+        print(f"缓存目录为空: {directory}")
+        return 0
+    before = sum(entry.stat().st_size for entry in directory.glob("*.tsv")
+                 if entry.is_file())
+    removed, freed = prune_cache(
+        directory, max_bytes=DEFAULT_CACHE_MAX_MB * 1024 * 1024,
+        ttl_seconds=DEFAULT_CACHE_TTL_DAYS * 86_400)
+    after = before - freed
+    print(f"缓存目录: {directory}")
+    print(f"删除 {removed} 个文件，释放 {freed / 1024 / 1024:.1f} MB；"
+          f"剩余 {max(0, after) / 1024 / 1024:.1f} MB"
+          f"（上限 {DEFAULT_CACHE_MAX_MB} MB / {DEFAULT_CACHE_TTL_DAYS} 天）")
+    return 0
 
 
 def select_features(spec: str, run_all: bool,
                     kind: str = "pcap") -> list[str]:
+    """把 ``--features`` 解析为复选框/处理器 ID 列表。
+
+    任何无法解析的 token（包括 ``foo.bar`` 这类点号处理器）都会抛
+    :class:`FeatureSelectionError`，让 CLI 在创建任务前就以退出码 2 失败，
+    而不是等运行时才炸。
+    """
     if run_all:
         return [feature.checkbox for feature in FEATURES]
     if not spec:
@@ -160,7 +209,15 @@ def select_features(spec: str, run_all: bool,
         feature = BY_CHECKBOX.get(token) or BY_HANDLER.get(token)
         if feature is None:
             if "." not in token:
-                raise SystemExit(f"未知功能: {token}（用 --list-features 查看）")
+                raise FeatureSelectionError(
+                    f"未知功能: {token}（用 --list-features 查看）")
+            # 没有复选框的真实处理器（如 webshell.decrypt / flows.http_login）
+            # 允许直接写处理器名，但必须先确认它真的能被解析。
+            try:
+                resolve(token)
+            except AttributeError:
+                raise FeatureSelectionError(
+                    f"未知功能: {token}（用 --list-features 查看）") from None
             selected.append(token)
             continue
         if feature.checkbox not in selected:
@@ -219,7 +276,11 @@ def run_headless(args, runtime) -> int:
         print(f"不支持的输入文件类型: {capture.suffix or capture.name}",
               file=sys.stderr)
         return 2
-    checkboxes = select_features(args.features, args.all, kind=kind)
+    try:
+        checkboxes = select_features(args.features, args.all, kind=kind)
+    except FeatureSelectionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     if not checkboxes:
         print("没有选择任何功能", file=sys.stderr)
         return 2
@@ -324,8 +385,6 @@ def serve(args, runtime) -> int:
     host = args.host or runtime.config.get("host") or "127.0.0.1"
     port = args.port or runtime.config.get_int("port", fallback=8765)
     open_browser = not args.no_browser and runtime.config.get_bool("open_browser", fallback=True)
-    if args.no_browser:
-        open_browser = False
 
     if args.capture:
         capture = Path(args.capture).expanduser()
@@ -340,8 +399,8 @@ def serve(args, runtime) -> int:
     if args.features or args.all:
         try:
             runtime.app.initial_features = select_features(args.features, args.all)
-        except SystemExit as exc:
-            print(str(exc.code), file=sys.stderr)
+        except FeatureSelectionError as exc:
+            print(str(exc), file=sys.stderr)
             return 2
 
     try:
@@ -372,8 +431,8 @@ def run_mcp(args, runtime) -> int:
         try:
             default_features = select_features(args.features, args.all,
                                                kind=input_kind)
-        except SystemExit as exc:
-            print(str(exc.code), file=sys.stderr)
+        except FeatureSelectionError as exc:
+            print(str(exc), file=sys.stderr)
             return 2
     server = MCPServer(runtime=runtime, default_pcap=default_pcap,
                        default_features=default_features)
@@ -385,7 +444,11 @@ def run_pcapoip(args, runtime) -> int:
     """``--pcap-over-ip PORT``：监听 TCP 接收 pcap 字节流并自动分析。"""
     from fnet.pcapoip import PcapOverIPServer
 
-    checkboxes = select_features(args.features, args.all)
+    try:
+        checkboxes = select_features(args.features, args.all)
+    except FeatureSelectionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     if not checkboxes:
         print("没有选择任何功能", file=sys.stderr)
         return 2
@@ -406,8 +469,11 @@ def run_pcapoip(args, runtime) -> int:
     print(f"收到 pcap 后自动分析 {len(checkboxes)} 个功能；Ctrl+C 退出",
           file=sys.stderr)
     try:
-        while True:
-            time.sleep(0.2)
+        # 可中断等待：Event.wait 在收到 Ctrl+C 时立刻抛 KeyboardInterrupt，
+        # 不必像 while True: time.sleep() 那样在两个 sleep 之间轮询。
+        stop = threading.Event()
+        while not stop.wait(0.5):
+            pass
     except KeyboardInterrupt:
         print("\n正在停止 PCAP-over-IP 监听…", file=sys.stderr)
     finally:
@@ -433,12 +499,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_features:
         list_features()
         return 0
+    if args.clean_cache:
+        return clean_cache()
 
-    runtime = build()
     if args.config:
         from fnet.config import Config
 
-        runtime = build(Config(Path(args.config).expanduser()))
+        config = Config(Path(args.config).expanduser())
+        if config.load_error:
+            print(config.load_error, file=sys.stderr)
+            return 2
+    else:
+        config = None
+    # 只 build 一次：WebUI/CLI/测试共用同一份 wiring（AGENTS.md 禁止并行接线）。
+    runtime = build(config)
 
     if args.list_tools:
         print(describe_environment(runtime))

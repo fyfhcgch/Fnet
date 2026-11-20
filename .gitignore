@@ -26,3 +26,8 @@ htmlcov/
 # Local captures (sample captures under tests/data are tracked on purpose)
 *.pcap.local
 *.pcapng.local
+
+# Jekyll / GitHub Pages build output
+.jekyll-cache/
+_site/
+.sass-cache/

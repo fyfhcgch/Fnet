@@ -12,7 +12,7 @@
 ```bash
 python3 -m fnet --no-browser                     # 启动 WebUI
 FNET_HOME=/tmp/fnet-dev python3 -m fnet          # 用临时目录隔离配置/日志
-python3 -m fnet --list-features                  # 查看 54 个功能的复选框编号
+python3 -m fnet --list-features                  # 查看 56 个功能的复选框编号
 python3 -m fnet --doctor                         # 检查 tshark/java/hashcat 等
 python3 -m unittest discover -s tests -v         # 全量测试
 python3 -m unittest tests.test_codec.CodecTest.test_base64 -v   # 单个用例
@@ -26,7 +26,7 @@ python3 -m unittest tests.test_codec.CodecTest.test_base64 -v   # 单个用例
 | 路径 | 作用 |
 | --- | --- |
 | `fnet/app.py` | 对象图组装，WebUI/CLI/测试共用 |
-| `fnet/features/registry.py` | 唯一的 54 个功能清单（含复选框编号） |
+| `fnet/features/registry.py` | 唯一的 56 个功能清单（含复选框编号） |
 | `fnet/features/` | 各分析功能，按主题分模块 |
 | `fnet/tools/runner.py` | 外部工具与 `tshark` 封装 |
 | `fnet/webui/` | HTTP 服务与前端静态页 |
@@ -43,7 +43,7 @@ python3 -m unittest tests.test_codec.CodecTest.test_base64 -v   # 单个用例
 4. 在 `fnet/features/registry.py:FEATURES` 注册，复选框 ID 是历史遗留的稀疏编号，
    **不要重编号**。
 5. 同步更新 `docs/FEATURES.md`、README 中的功能统计，以及
-   `tests/test_registry.py`、`tests/test_api.py`、`tests/test_uispec.py` 里的断言。
+   `tests/test_registry.py`、`tests/test_api.py`、`tests/test_site.py` 里的断言。
 6. 为新增协议补充 `tests/data/` 样例与端到端断言。
 
 ## 代码约定

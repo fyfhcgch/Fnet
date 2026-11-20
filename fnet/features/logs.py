@@ -77,7 +77,7 @@ IOC_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
 
 _MAX_IOC_VALUES = 5_000
 _MAX_FINDINGS_PER_IOC = 30
-#: 单个日志任务的 findings 软上限；四个日志功能共享 job.findings，
+#: 单个日志任务的 findings 软上限；日志功能共享 job.findings，
 #: 因此每个发射循环前检查剩余额度即可控制总量。
 _MAX_FINDINGS_TOTAL = 80
 #: 实体画像最多下钻的维度数与每个维度的实体数。

@@ -2,10 +2,18 @@
 from __future__ import annotations
 
 import configparser
+import os
 import shutil
+import tempfile
+import threading
 from pathlib import Path
 
+from fnet.logger import logger
 from fnet.paths import DEFAULT_CONFIG, USER_CONFIG, ensure_dirs
+
+#: 序列化 ``Config.save()``：``crack.start`` 等请求线程与 WebUI 主线程会同时
+#: 写同一个文件，缺少锁时后写者可能覆盖前写者。
+_SAVE_LOCK = threading.Lock()
 
 #: Built-in keyword set.  It covers the encodings CTF players expect to be
 #: recognised out of the box.
@@ -49,6 +57,9 @@ DEFAULTS = {
         "sql_success": "",
         "sql_time_threshold": "1.0",
         "tshark_cache": "1",
+        # tshark 结果缓存上限：512 MB / 14 天，0 表示不限制该项。
+        "tshark_cache_max_mb": "512",
+        "tshark_cache_ttl_days": "14",
         "tshark_retry": "1",
         "tshark_timeout": "600",
         "tshark_max_field_kb": "256",
@@ -93,24 +104,63 @@ class Config:
     """Small typed wrapper around :class:`configparser.ConfigParser`."""
 
     def __init__(self, path: Path | None = None) -> None:
-        self.path = path or USER_CONFIG
+        self.path = Path(path) if path else USER_CONFIG
         self._cp = configparser.ConfigParser(interpolation=None)
+        #: 最近一次 ``load()`` 的中文错误信息（空字符串表示成功）。
+        self.load_error = ""
+        #: 最近一次 ``save()`` 的中文错误信息（空字符串表示成功）。
+        self.save_error = ""
         for section, values in DEFAULTS.items():
             self._cp[section] = dict(values)
         self.load()
 
     # -- persistence ---------------------------------------------------
-    def load(self) -> None:
-        ensure_dirs()
-        if not self.path.exists() and DEFAULT_CONFIG.exists():
-            shutil.copy(DEFAULT_CONFIG, self.path)
-        if self.path.exists():
-            self._cp.read(self.path, encoding="utf-8")
+    def load(self) -> str:
+        """读取配置文件，返回中文错误信息（成功时返回空字符串）。
 
-    def save(self) -> None:
+        调用方（CLI）负责把错误信息打印出来并退出码 2；WebUI 的
+        ``reload_config`` 只记录日志，不让异常冒泡成 500。
+        """
+        self.load_error = ""
         ensure_dirs()
-        with self.path.open("w", encoding="utf-8") as fh:
-            self._cp.write(fh)
+        try:
+            if not self.path.exists() and DEFAULT_CONFIG.exists():
+                shutil.copy(DEFAULT_CONFIG, self.path)
+            if self.path.exists():
+                self._cp.read(self.path, encoding="utf-8")
+        except OSError as exc:
+            self.load_error = (
+                f"无法读取配置文件 {self.path}：{exc}"
+                "（请检查路径是否存在、是否有读写权限）")
+            logger.warn(self.load_error)
+        except configparser.Error as exc:
+            self.load_error = f"配置文件格式错误 {self.path}：{exc}"
+            logger.warn(self.load_error)
+        return self.load_error
+
+    def save(self) -> bool:
+        """原子写回配置文件（同目录临时文件 + ``os.replace``），失败返回 False。"""
+        self.save_error = ""
+        ensure_dirs()
+        with _SAVE_LOCK:
+            name = ""
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                handle, name = tempfile.mkstemp(prefix=self.path.name,
+                                               dir=self.path.parent)
+                with os.fdopen(handle, "w", encoding="utf-8") as fh:
+                    self._cp.write(fh)
+                os.replace(name, self.path)
+            except OSError as exc:
+                try:
+                    if name:
+                        os.unlink(name)
+                except OSError:
+                    pass
+                self.save_error = f"无法保存配置文件 {self.path}：{exc}"
+                logger.warn(self.save_error)
+                return False
+        return True
 
     # -- accessors -----------------------------------------------------
     def get(self, key: str, section: str = "config", fallback: str = "") -> str:

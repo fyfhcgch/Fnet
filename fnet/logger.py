@@ -91,6 +91,10 @@ class Logger:
     def warn(self, text: str) -> None:
         self.log(text, "warn")
 
+    #: 兼容 ``logging`` 风格的别名；``fnet/services.py`` 等调用方历史上用过
+    #: ``warning``，缺少别名会抛 ``AttributeError`` 把正常诊断路径变成 500。
+    warning = warn
+
     def error(self, text: str) -> None:
         self.log(text, "error")
 

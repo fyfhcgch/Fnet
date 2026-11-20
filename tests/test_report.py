@@ -221,7 +221,28 @@ class StructuredFindingsTest(unittest.TestCase):
         self.assertIn("| 类别 | 级别 | 帧 | 功能 | 摘要 | 详情 |", text)
         self.assertIn("哈希", text)
         self.assertIn("flag{report_table}", text)
-        self.assertIn(r"<script>alert(1)</script>", text)
+        # 抓包派生文本里的 HTML 必须转义，第三方 md→HTML 渲染器才安全。
+        self.assertIn(r"&lt;script&gt;alert(1)&lt;/script&gt;", text)
+        self.assertNotIn("<script>alert(1)</script>", text)
+
+    def test_markdown_escapes_html_payloads(self):
+        findings = [{
+            "kind": "file", "level": "info", "frame": "3",
+            "feature": "HTTP数据提取",
+            "summary": "<img src=x onerror=alert(1)>",
+            "detail": "a & b <b>bold</b>",
+        }]
+        text = render_markdown(sample_meta(), LOGS, [], findings=findings)
+        self.assertNotIn("<img src=x onerror=alert(1)>", text)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", text)
+        self.assertIn("a &amp; b &lt;b&gt;bold&lt;/b&gt;", text)
+        # 双重转义会写成 &amp;lt;，这里必须只有一个实体。
+        self.assertNotIn("&amp;lt;", text)
+        # 表格分隔符与反斜杠仍然转义。
+        cell = render_markdown(
+            {**sample_meta(), "pcap": "a|b\\c"},
+            LOGS, [], sections=["summary"])
+        self.assertIn(r"a\|b\\c", cell)
 
     def test_html_table_escapes_and_marks_flags(self):
         page = render_html(sample_meta(), LOGS, [], findings=self.FINDINGS)
@@ -333,7 +354,9 @@ class AnnotationRenderTest(unittest.TestCase):
     def test_markdown_annotation_column(self):
         text = render_markdown(sample_meta(), LOGS, [], findings=self.FINDINGS)
         self.assertIn("| 类别 | 级别 | 帧 | 功能 | 摘要 | 详情 | 标注 |", text)
-        self.assertIn("误报 · 误报 <b>x</b>", text)
+        # 标注文本同样来自人工/抓包输入，Markdown 侧必须转义 HTML。
+        self.assertIn("误报 · 误报 &lt;b&gt;x&lt;/b&gt;", text)
+        self.assertNotIn("误报 · 误报 <b>x</b>", text)
         self.assertIn(r"已人工核对 \| 保留", text)
 
     def test_markdown_without_annotations_is_unchanged(self):
@@ -408,7 +431,8 @@ class AnnotationReportTest(unittest.TestCase):
         self.assertIn("误报 <script>alert(1)</script>", text)
         self.assertIn("已人工核对", text)
         self.assertIn("| 标注 |", markdown)
-        self.assertIn("误报 · 误报 <script>alert(1)</script>", markdown)
+        self.assertIn("误报 · 误报 &lt;script&gt;alert(1)&lt;/script&gt;", markdown)
+        self.assertNotIn("误报 · 误报 <script>alert(1)</script>", markdown)
         self.assertIn("<th>标注</th>", page)
         self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", page)
         self.assertNotIn("<script>alert(1)</script>", page)
@@ -494,6 +518,42 @@ class ParseTest(unittest.TestCase):
             self.assertEqual(set(written), {"md", "html"})
             self.assertTrue((Path(tmp) / "report.md").is_file())
             self.assertTrue((Path(tmp) / "report.html").is_file())
+            # 原子写入：目录里不应留下任何临时文件。
+            self.assertEqual(
+                sorted(item.name for item in Path(tmp).iterdir()),
+                ["report.html", "report.md"])
+
+    def test_write_reports_is_atomic_on_crash(self):
+        """渲染中途崩溃不能把 report.html 截断（/api/download 会直接下发）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            (output / "report.html").write_text("旧报告", encoding="utf-8")
+            job = SimpleNamespace(
+                id="0123456789abcdef", pcap="/tmp/example.pcap",
+                features=[], params={}, status="done", created="now",
+                started="now", finished="now", output_dir=output,
+            )
+            with mock.patch("fnet.report.render_html",
+                            side_effect=OSError("boom")):
+                written = write_reports(job, LOGS, [])
+            self.assertNotIn("html", written)
+            # 旧文件原样保留，且没有半截临时文件。
+            self.assertEqual((output / "report.html").read_text(encoding="utf-8"),
+                             "旧报告")
+            self.assertEqual(
+                sorted(item.name for item in output.iterdir()),
+                ["report.html", "report.md"])
+
+    def test_atomic_write_replaces_in_one_step(self):
+        from fnet.report import _atomic_write
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "report.html"
+            target.write_text("old", encoding="utf-8")
+            _atomic_write(target, "new")
+            self.assertEqual(target.read_text(encoding="utf-8"), "new")
+            self.assertEqual([item.name for item in Path(tmp).iterdir()],
+                             ["report.html"])
 
 
 if __name__ == "__main__":

@@ -43,9 +43,13 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e .
       - name: Byte-compile
-        run: python -m compileall -q fnet scripts
+        # -W error::SyntaxWarning 让 ``\=`` 这类无效转义直接失败，
+        # 避免 Python 3.12+ 才暴露的隐性语法问题。
+        run: python -W error::SyntaxWarning -m compileall -q fnet scripts
       - name: JavaScript syntax check
         run: node --check fnet/webui/static/app.js
+      - name: Repo invariants (version sync / stdlib-only / import smoke)
+        run: python -m unittest tests.test_hygiene -v
       - name: Unit tests
         run: python -m unittest discover -s tests -v
 

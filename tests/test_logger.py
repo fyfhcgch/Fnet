@@ -107,6 +107,20 @@ class LoggerTest(unittest.TestCase):
         self.assertEqual([r.text for r in tiny.records_since(0)],
                          ["line-3", "line-4", "line-5"])
 
+    def test_warning_alias_matches_warn(self):
+        self.assertIs(Logger.warning, Logger.warn)
+        self.logger.warning("兼容别名")
+        record = self.logger.records_since(0)[0]
+        self.assertEqual(record.level, "warn")
+        self.assertEqual(record.tag, "[!]")
+        self.assertEqual(record.text, "兼容别名")
+        self.assertIn("[!] 兼容别名", self.path.read_text("utf-8"))
+
+    def test_log_does_not_interpolate_percent_placeholders(self):
+        # Logger.log 内部是 str(text)，%s 占位符必须原样保留，不做 % 格式化。
+        self.logger.warn("失败 %s: %s")
+        self.assertEqual(self.logger.records_since(0)[0].text, "失败 %s: %s")
+
 
 class JobLogTest(unittest.TestCase):
     def setUp(self):

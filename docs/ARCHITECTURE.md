@@ -56,7 +56,7 @@ JobManager ─────────────►  worker thread
   写入 `Job.kind`（`"pcap"` / `"log"`）并传给 `FeatureContext.input_kind`。
   日志分析功能由内置解析器读取记录，不启动 `tshark`，因此 `--doctor` 报缺
   tshark 时仍可完成默认的日志分析；默认功能也按 kind 选择（抓包 2 项、
-  日志 4 项）。若在日志任务上显式选择抓包功能，这些功能仍会按各自逻辑跳过或
+  日志 5 项）。若在日志任务上显式选择抓包功能，这些功能仍会按各自逻辑跳过或
   报错。
 - **断点与分片**：`Job` 在 `job.json` 中记录 `completed`、`feature_status`、
   `succeeded`、`failed`，任务只在功能边界暂停；`/api/jobs/<id>/pause` 设置
@@ -86,7 +86,7 @@ JobManager ─────────────►  worker thread
 | 实时抓包 | `fnet/live.py` | tshark 网卡枚举与单实例抓包控制 |
 | 结果 | `fnet/findings.py` | 结构化结果的格式、筛选、CSV 导出 |
 | 报告 | `fnet/report.py` | Markdown/HTML 报告渲染、章节选择、旧报告反解 |
-| 功能 | `fnet/features/` | 54 个分析功能，按主题拆文件；`logs.py` 处理文本日志 |
+| 功能 | `fnet/features/` | 56 个分析功能，按主题拆文件；`logs.py` 处理文本日志 |
 | 外部工具 | `fnet/tools/runner.py` | 工具发现、子进程、tshark 字段校验 |
 | 工具库 | `fnet/utils/` | 编解码、AES/RC4/MD4/RSA/GCM、pcap 辅助、TCP 流重组、RESP/PostgreSQL/BSON-MongoDB/WebSocket/MySQL 解析、Kerberos 原语、DNS/ICMP 隧道、邮件 MIME、WPA CCMP 解密、规则解析、文本日志格式识别（`logfile.py`） |
 | 配置 | `fnet/config.py` | `config.ini` 默认值、读写、最近文件 |

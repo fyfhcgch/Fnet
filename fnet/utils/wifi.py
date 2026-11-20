@@ -18,6 +18,8 @@ import re
 import struct
 from dataclasses import dataclass, field
 
+from fnet.utils.pcap import hex_to_bytes
+
 EAPOL_TYPE_KEY = 3
 BROADCAST = {"ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00", ""}
 
@@ -72,13 +74,12 @@ def normalize_pmkid(value: str) -> str:
 
 
 def _hex_bytes(value: str) -> bytes:
-    text = re.sub(r"(?i)[^0-9a-f]", "", value or "")
-    if len(text) % 2:
-        text = text[:-1]
-    try:
-        return bytes.fromhex(text)
-    except ValueError:
-        return b""
+    """解析十六进制串，语义统一到 :func:`fnet.utils.pcap.hex_to_bytes`。
+
+    历史上这里自行剥离非十六进制字符并在奇数长度时截断最后一个半字节，
+    导致 ``"0x41"`` 被解析成 ``b"\x04"``（与其它模块不一致）。
+    """
+    return hex_to_bytes(value)
 
 
 def _int(value: str, default: int = 0) -> int:

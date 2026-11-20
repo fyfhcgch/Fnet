@@ -4,11 +4,14 @@ from __future__ import annotations
 import contextlib
 import io
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from fnet import __version__
 from fnet.cli import (
+    FeatureSelectionError,
     _collect_params,
     _ensure_utf8_streams,
     build_parser,
@@ -65,9 +68,21 @@ class SelectFeaturesTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             select_features("no_such_feature", False)
 
+    def test_unknown_dotted_handler_raises(self):
+        # ``foo.bar`` 曾经被无条件放行，只在运行时才失败。
+        with self.assertRaises(FeatureSelectionError):
+            select_features("foo.bar", False)
+        # 同一个异常类型也是 ValueError，所有调用方都能映射到退出码 2。
+        with self.assertRaises(ValueError):
+            select_features("foo.bar", False)
+
     def test_unregistered_handler_name_is_kept(self):
         self.assertEqual(select_features("webshell.decrypt", False),
                          ["webshell.decrypt"])
+
+    def test_other_checkboxless_handlers_still_resolve(self):
+        self.assertEqual(select_features("flows.http_login", False),
+                         ["flows.http_login"])
 
 
 class BuildParserTest(unittest.TestCase):
@@ -168,6 +183,79 @@ class MainEarlyExitTest(unittest.TestCase):
         with contextlib.redirect_stdout(buffer):
             self.assertEqual(main(["--list-features"]), 0)
         self.assertIn("checkBox_10", buffer.getvalue())
+
+
+class ConfigSafetyTest(unittest.TestCase):
+    """``Config`` 的原子保存与坏路径诊断。
+
+    归属限制下这里只改 ``tests/test_cli.py``；这两个用例逻辑上属于
+    ``tests/test_config.py``，后续可平移过去。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="fnet-config-"))
+        self.path = self.tmp / "config.ini"
+
+    def test_save_is_atomic_and_leaves_no_temp_files(self):
+        from fnet.config import Config
+
+        config = Config(self.path)
+        config.set("port", "9123")
+        self.assertTrue(config.save())
+        self.assertEqual(config.save_error, "")
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()),
+                         ["config.ini"])
+        self.assertEqual(Config(self.path).get("port"), "9123")
+
+    def test_unreadable_path_reports_load_error(self):
+        from fnet.config import Config
+
+        config = Config(Path("/nonexistent/dir/config.ini"))
+        self.assertIn("无法读取配置文件", config.load_error)
+
+    def test_unwritable_path_reports_save_error(self):
+        from fnet.config import Config
+
+        config = Config(self.path)
+        config.path = Path("/nonexistent/dir/config.ini")
+        self.assertFalse(config.save())
+        self.assertIn("无法保存配置文件", config.save_error)
+
+
+class BadConfigTest(unittest.TestCase):
+    def test_unwritable_config_path_exits_2_with_chinese_message(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            code = main(["--config", "/nonexistent/x.ini", "--doctor"])
+        self.assertEqual(code, 2)
+        text = buffer.getvalue()
+        self.assertIn("无法读取配置文件", text)
+        self.assertIn("/nonexistent/x.ini", text)
+
+    def test_config_path_is_expanded(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            code = main(["--config", "~/fnet-no-such-dir/x.ini", "--doctor"])
+        self.assertEqual(code, 2)
+        self.assertNotIn("~", buffer.getvalue())
+        self.assertIn("fnet-no-such-dir", buffer.getvalue())
+
+
+class BuildOnceTest(unittest.TestCase):
+    def test_doctor_builds_once_and_passes_config(self):
+        tmp = Path(tempfile.mkdtemp(prefix="fnet-cli-"))
+        path = tmp / "config.ini"
+        with mock.patch("fnet.cli.build") as fake_build:
+            runtime = mock.Mock()
+            runtime.config.path = path
+            runtime.toolbox.TOOL_NAMES = []
+            fake_build.return_value = runtime
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["--config", str(path), "--doctor"]), 0)
+        self.assertEqual(fake_build.call_count, 1)
+        config = fake_build.call_args.args[0]
+        self.assertIsNotNone(config)
+        self.assertEqual(config.path, path)
 
 
 if __name__ == "__main__":

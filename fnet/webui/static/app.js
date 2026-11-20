@@ -69,6 +69,7 @@
       live: "实时抓包", compare: "对比两个任务",
       settings_webshell: "Webshell 解密设置", settings_shiro: "Shiro 解密设置",
       settings_winrm: "WinRM 解密设置", settings_sql: "SQL 盲注设置",
+      settings_log: "日志关联设置",
       settings_general: "通用分析设置",
       status_idle: "空闲", status_running: "运行中", status_paused: "已暂停",
       status_done: "完成", status_cancelled: "已取消", status_error: "错误",
@@ -194,6 +195,7 @@
       live: "Live capture", compare: "Compare jobs",
       settings_webshell: "Webshell decryption", settings_shiro: "Shiro decryption",
       settings_winrm: "WinRM decryption", settings_sql: "Blind SQL injection",
+      settings_log: "Log correlation",
       settings_general: "General analysis",
       status_idle: "Idle", status_running: "Running", status_paused: "Paused",
       status_done: "Done", status_cancelled: "Cancelled", status_error: "Error",
@@ -578,6 +580,7 @@
       aircrack: "aircrack-ng", hashcat: "hashcat", john: "John",
       foremost: "foremost", binwalk: "binwalk", pcapfix: "pcapfix",
       etl2pcapng: "etl2pcapng", pyrdp_player: "pyrdp-player",
+      openssl: "openssl",
     };
     box.innerHTML = Object.entries(tools).map(([key, info]) => `
       <div class="tool-item" title="${esc(info.path || "未找到")}">
@@ -591,8 +594,11 @@
     const box = $("#about-runtime");
     if (!box) return;
     const p = state.meta.paths;
+    const features = (state.meta.features || []).length;
+    const categories = (state.meta.categories || []).length;
     box.innerHTML = `
       <dt>版本</dt><dd>${esc(state.meta.version)}</dd>
+      <dt>功能</dt><dd>${features} 项 · ${categories} 类</dd>
       <dt>用户目录</dt><dd>${esc(p.user)}</dd>
       <dt>日志目录</dt><dd>${esc(p.logs)}</dd>
       <dt>缓存目录</dt><dd>${esc(p.cache)}</dd>
@@ -738,6 +744,10 @@
       sql_char: checked("sql_char"),
       sql_reverse: checked("sql_reverse"),
       sql_log: val("sql_log"),
+      log_extra_paths: val("log_extra_paths"),
+      log_correlate_window: val("log_correlate_window"),
+      log_cluster_gap: val("log_cluster_gap"),
+      log_risk_threshold: val("log_risk_threshold"),
       wordlist: val("wordlist"),
     };
   }
@@ -1019,7 +1029,7 @@
     state.inputKind = kind;
     // Keep the historical pcap workflow intact: a user may tick extra
     // features before dropping the first capture.  Log inputs are a new path
-    // and always start from the four log features.
+    // and always start from every ``log``-category feature.
     if (kind !== "log" && !previous) return;
     const boxes = $$("#features input[type=checkbox]");
     if (!boxes.length) return;

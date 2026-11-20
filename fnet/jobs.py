@@ -48,6 +48,15 @@ from fnet.report import (
 from fnet.tools.runner import ToolBox
 from fnet.utils.logfile import classify_input
 
+#: First bytes of every capture format ``tshark`` reads natively (classic
+#: libpcap both endiannesses, nanosecond variants and pcapng).  Mirrors
+#: ``fnet.utils.logfile._PCAP_MAGIC``; kept local so the check stays readable.
+CAPTURE_MAGIC = (b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\x4d\x3c\xb2\xa1",
+                 b"\xa1\xb2\x3c\x4d", b"\x0a\x0d\x0d\x0a")
+
+#: ``_capture_problem`` 用它区分"硬错误（拒绝任务）"与"软警告（照常运行）"。
+WARN_PREFIX = "WARN:"
+
 
 @dataclass
 class Job:
@@ -67,6 +76,9 @@ class Job:
     progress: int = 0
     current: str = ""
     error: str = ""
+    #: 非致命输入问题（例如抓包损坏但部分可读）。写入报告顶部横幅，
+    #: 不影响 ``status``：任务照常完成，但用户能看到"已读取的帧可能不完整"。
+    input_warning: str = ""
     report_path: str = ""
     report_markdown_path: str = ""
     report_html_path: str = ""
@@ -91,6 +103,10 @@ class Job:
     #: True for jobs created by :meth:`JobManager.submit_batch`; only those
     #: participate in the queue's active-slot accounting.
     batch: bool = False
+    #: Serialises ``job.json`` writes: the worker thread checkpoints after
+    #: every feature while ``JobManager.cancel`` writes from the HTTP thread.
+    history_lock: threading.Lock = field(default_factory=threading.Lock,
+                                         repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.log = JobLog(logger, prefix=self.id[:6])
@@ -115,6 +131,7 @@ class Job:
             "progress": self.progress,
             "current": self.current,
             "error": self.error,
+            "input_warning": self.input_warning,
             "created": self.created,
             "started": self.started,
             "finished": self.finished,
@@ -154,7 +171,11 @@ class JobManager:
         return _ckpt.snapshot(job)
 
     def _write_history(self, job: Job) -> None:
-        _ckpt.write_history(job)
+        # The worker checkpoints after each feature while ``cancel`` writes from
+        # the HTTP thread; a per-job lock keeps the two writes from interleaving
+        # (and ``atomic_write`` keeps a torn file off disk in any case).
+        with job.history_lock:
+            _ckpt.write_history(job)
 
     def history(self, limit: int = 100) -> list[dict]:
         """Return on-disk job history merged with the live in-memory jobs."""
@@ -346,7 +367,7 @@ class JobManager:
                     lines.extend(["", "人工标注:", *notes])
                 if body:
                     lines.extend([""] + body)
-                path.write_text("\n".join(lines), encoding="utf-8")
+                _ckpt.atomic_write(path, "\n".join(lines))
         except Exception:  # noqa: BLE001 - never fail the annotation request
             return
 
@@ -499,6 +520,69 @@ class JobManager:
         return True
 
     # -- lifecycle -----------------------------------------------------
+    def _capture_problem(self, source: Path, tshark=None) -> str:
+        """Return why ``source`` is unreadable as a capture, or ``""``.
+
+        ``classify_input`` trusts the suffix, so a text file renamed to
+        ``.pcap`` (or any garbage) used to produce a "successful" job with no
+        findings.  A capture must either start with a known magic (so a
+        truncated-but-real capture still runs) or be parsed by ``tshark -c 1``.
+        """
+        try:
+            with source.open("rb") as handle:
+                head = handle.read(8)
+        except OSError as exc:
+            return f"无法读取输入文件: {exc}"
+        trusted = head[:4] in CAPTURE_MAGIC
+        problem = self._probe_capture(source, tshark)
+        if problem.startswith(WARN_PREFIX):
+            # 魔数正确说明"这确实是一个抓包"，只是损坏/截断：降级为
+            # 非致命警告，任务照常运行（部分帧仍可读）。
+            return problem if trusted else problem[len(WARN_PREFIX):]
+        return problem
+
+    def _probe_capture(self, source: Path, tshark=None) -> str:
+        """用 ``tshark -c 1`` 判断能否读出至少一个协议层。
+
+        返回空串表示可解析；``WARN_PREFIX`` 开头的字符串表示"是抓包但读不出
+        帧"（损坏/截断），调用方据此设置非致命横幅而不是拒绝任务。
+        """
+        if tshark is None and self.toolbox is not None:
+            # ``ToolBox.path`` is quiet, unlike ``tshark()`` which logs an error
+            # when the binary is missing (we only need a path to probe with).
+            # ``getattr`` keeps minimal test stubs (``SimpleNamespace``) working.
+            lookup = getattr(self.toolbox, "path", None)
+            path = lookup("tshark") if callable(lookup) else None
+            tshark = getattr(path, "path", path) or None
+        if not tshark:
+            # Without tshark there is nothing to validate against; the
+            # per-feature "tshark 不可用" warning covers this case.
+            return ""
+        from fnet.tools.runner import run
+
+        # ``tshark`` guesses a file format for short garbage (``garbage`` is
+        # read as one 7-byte "MP4" frame), so a zero exit code alone is not
+        # enough: the first frame must also expose at least one protocol layer.
+        code, out = run([str(tshark), "-r", str(source), "-c", "1",
+                         "-T", "fields", "-e", "frame.number",
+                         "-e", "frame.protocols"],
+                        timeout=30, echo=False)
+        if code == 0:
+            row = str(out or "").strip().splitlines()
+            columns = row[0].split("\t") if row else []
+            if len(columns) > 1 and columns[1].strip():
+                return ""
+            return "无法识别链路层协议（可能不是抓包文件）"
+        if code in (124, 130):
+            # The probe timed out / was interrupted: inconclusive, so never
+            # reject an input we could not actually inspect.
+            return ""
+        detail = " ".join(str(out or "").split())[:200]
+        # 有合法魔数却读不出帧：抓包损坏或截断。任务仍可运行（部分帧可能
+        # 可读），但必须在报告里说明，避免"零发现"被误读成"没有问题"。
+        reason = detail or f"tshark 退出码 {code}"
+        return WARN_PREFIX + reason
+
     def create(self, pcap: str, checkboxes: list[str], params: dict | None = None,
                shards: int = 1) -> Job:
         source = Path(pcap).expanduser()
@@ -509,6 +593,19 @@ class JobManager:
             raise ValueError(
                 "仅支持 pcap / pcapng / cap / dmp / etl 流量包，"
                 "或 log / txt / out / jsonl / ndjson / json / csv / tsv 日志文件")
+        input_warning = ""
+        if kind == "pcap":
+            problem = self._capture_problem(source)
+            if problem.startswith(WARN_PREFIX):
+                # 抓包损坏/截断但仍可能读出部分帧：不拒绝任务，只记警告。
+                input_warning = (
+                    f"抓包可能损坏或截断，已读取的帧可能不完整（{problem[len(WARN_PREFIX):]}）")
+            elif problem:
+                hint = ""
+                if source.suffix.lower() in (".etl", ".dmp"):
+                    hint = "；ETL/内存转储请先在 WebUI 中转换为 pcapng"
+                raise ValueError(
+                    f"无法解析抓包: {source.name}（{problem}）{hint}")
         features: list[Feature] = []
         seen: set[str] = set()
         for item in checkboxes:
@@ -529,7 +626,7 @@ class JobManager:
         except (TypeError, ValueError):
             shards = 1
         job = Job(job_id, str(source.resolve()), features, params or {}, output,
-                  kind=kind, shards=shards)
+                  kind=kind, shards=shards, input_warning=input_warning)
         for feature in features:
             job.feature_status[feature.checkbox] = "pending"
         with self._lock:
@@ -803,6 +900,25 @@ class JobManager:
     def _run(self, job: Job) -> None:
         try:
             self._run_job(job)
+        except Exception as exc:  # noqa: BLE001 - a worker crash must not wedge the job
+            # ``_run_job`` normally swallows handler errors, but an unexpected
+            # failure (serialisation, disk, ...) used to escape this thread and
+            # leave ``status="running"`` forever, making the CLI poll forever.
+            job.failed += 1
+            job.error = f"任务执行失败: {exc}"
+            job.status = "error"
+            job.current = ""
+            job.finished = job.finished or _dt.datetime.now().isoformat(
+                timespec="seconds")
+            job.log.error(job.error)
+            job.log.debug(traceback.format_exc())
+            for write in (lambda: self._write_findings(job),
+                          lambda: self._write_report(job, "error"),
+                          lambda: self._write_history(job)):
+                try:
+                    write()
+                except Exception:  # noqa: BLE001 - artifacts are best effort
+                    job.log.debug(traceback.format_exc())
         finally:
             if job.batch:
                 with self._lock:
@@ -1076,7 +1192,8 @@ class JobManager:
     def _clip_shard(self, job: Job, tshark, start: int, end: int,
                     shard_index: int) -> Path | None:
         """Write frames ``start..end`` to a temporary pcapng for one shard."""
-        return _shards.clip_shard(job, tshark, start, end, shard_index)
+        return _shards.clip_shard(job, tshark, start, end, shard_index,
+                                  cancel=job.cancel_event)
 
     def _enrich_intel(self, job: Job) -> int:
         """Optional online IOC enrichment of ``job.findings`` (in place).
@@ -1122,6 +1239,10 @@ class JobManager:
             f"开始时间: {job.started}",
             f"结束时间: {job.finished}",
             f"状态: {status or job.status}",
+        ]
+        if job.input_warning:
+            lines.append(f"⚠ 输入警告: {job.input_warning}")
+        lines += [
             "功能: " + "、".join(f.title for f in job.features),
             "=" * 60,
             "",
@@ -1140,9 +1261,9 @@ class JobManager:
             lines.append("")
         lines.extend(record.line for record in records)
         try:
-            report.write_text("\n".join(lines), encoding="utf-8")
+            _ckpt.atomic_write(report, "\n".join(lines))
             job.report_path = str(report)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             job.log.warn(f"报告写入失败: {exc}")
         written = {}
         try:

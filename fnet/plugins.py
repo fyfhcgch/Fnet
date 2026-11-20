@@ -7,6 +7,7 @@ the backend can run them.  User added tools are persisted in
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import threading
 from dataclasses import dataclass, field
@@ -64,14 +65,14 @@ class PluginManager:
         if isinstance(data, dict):
             for name, spec in data.items():
                 if isinstance(spec, str):
-                    result[name] = shlex.split(spec)
+                    result[name] = shlex.split(spec, posix=os.name != "nt")
                 elif isinstance(spec, list):
                     result[name] = [str(x) for x in spec]
         return result
 
     def add(self, name: str, command: str) -> None:
         tools = self.user_tools()
-        tools[name] = shlex.split(command)
+        tools[name] = shlex.split(command, posix=os.name != "nt")
         self.config.set("execute_cmd", json.dumps(tools, ensure_ascii=False),
                         "plugins")
         self.config.save()
